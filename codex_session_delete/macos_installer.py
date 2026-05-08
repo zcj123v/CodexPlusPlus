@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from codex_session_delete.app_paths import find_macos_codex_app
+
 if TYPE_CHECKING:
     from codex_session_delete.installers import InstallOptions
 
@@ -42,6 +44,8 @@ def install_macos_app(options: "InstallOptions") -> None:
         "CFBundleShortVersionString": "0.1.0",
         "CFBundlePackageType": "APPL",
         "CFBundleExecutable": EXECUTABLE_NAME,
+        "CFBundleIconFile": "electron.icns",
+        "LSUIElement": True,
         "LSMinimumSystemVersion": "12.0",
     }
     (contents / "Info.plist").write_bytes(plistlib.dumps(plist))
@@ -50,8 +54,19 @@ def install_macos_app(options: "InstallOptions") -> None:
     executable.write_text(f"#!/bin/sh\nexec {_launcher_command(options)}\n", encoding="utf-8")
     executable.chmod(executable.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
+    _copy_codex_icon(resources)
+
 
 def uninstall_macos_app(options: "InstallOptions") -> None:
     app = _app_root(options)
     if app.exists():
         shutil.rmtree(app)
+
+
+def _copy_codex_icon(resources: Path) -> None:
+    codex_app = find_macos_codex_app()
+    if codex_app is None:
+        return
+    icon_src = codex_app / "Contents" / "Resources" / "electron.icns"
+    if icon_src.is_file():
+        shutil.copy2(icon_src, resources / "electron.icns")

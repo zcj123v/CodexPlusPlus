@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import traceback
-import time
 from pathlib import Path
 
 from codex_session_delete.helper_server import HelperServer
@@ -56,23 +55,33 @@ def log_launch_failure(exc: BaseException) -> None:
     path.write_text("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)), encoding="utf-8")
 
 
-def wait_for_shutdown(server: HelperServer) -> None:
+def wait_for_shutdown(server: HelperServer, codex_proc) -> None:
     try:
-        while True:
-            time.sleep(3600)
+        if codex_proc is None:
+            import subprocess as _sp
+            import time as _time
+            while True:
+                result = _sp.run(["pgrep", "-f", "^/Applications/Codex\\.app/Contents/MacOS/Codex"], capture_output=True)
+                if result.returncode != 0:
+                    break
+                _time.sleep(2)
+        else:
+            codex_proc.wait()
     except KeyboardInterrupt:
+        pass
+    finally:
         server.shutdown()
 
 
 def run_launch(args: argparse.Namespace) -> int:
     try:
-        server = launch_and_inject(args.app_dir, args.db, args.backup_dir, args.debug_port, args.helper_port)
+        server, codex_proc = launch_and_inject(args.app_dir, args.db, args.backup_dir, args.debug_port, args.helper_port)
     except Exception as exc:
         log_launch_failure(exc)
         raise
     print(f"Codex session delete helper running on http://127.0.0.1:{server.port}")
     print("Keep this terminal open while using the delete buttons. Press Ctrl+C to stop.")
-    wait_for_shutdown(server)
+    wait_for_shutdown(server, codex_proc)
     return 0
 
 

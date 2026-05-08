@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -38,17 +39,20 @@ class InjectedHelperServer(HelperServer):
     bridge_socket: Any = None
 
 
-def build_codex_command(app_dir: Path, debug_port: int) -> list[str]:
+def launch_codex(app_dir: Path, debug_port: int) -> subprocess.Popen | None:
     if app_dir.suffix == ".app":
-        exe = app_dir / "Contents" / "MacOS" / "Codex"
-    else:
-        candidates = [app_dir / "Codex.exe", app_dir / "codex.exe"]
-        exe = next((path for path in candidates if path.exists()), candidates[-1])
-    return [
+        subprocess.run(
+            ["open", "-a", str(app_dir), "--args", f"--remote-debugging-port={debug_port}", f"--remote-allow-origins=http://127.0.0.1:{debug_port}"],
+            check=True,
+        )
+        return None
+    candidates = [app_dir / "Codex.exe", app_dir / "codex.exe"]
+    exe = next((path for path in candidates if path.exists()), candidates[-1])
+    return subprocess.Popen([
         str(exe),
         f"--remote-debugging-port={debug_port}",
         f"--remote-allow-origins=http://127.0.0.1:{debug_port}",
-    ]
+    ])
 
 
 def start_helper(service, host: str = "127.0.0.1", port: int = 57321) -> HelperServer:
@@ -71,16 +75,16 @@ def inject_with_retry(debug_port: int, script_path: Path, helper_port: int, serv
     raise RuntimeError("Codex injection failed")
 
 
-def launch_and_inject(app_dir: Path | None, db_path: Path | None, backup_dir: Path, debug_port: int, helper_port: int) -> HelperServer:
+def launch_and_inject(app_dir: Path | None, db_path: Path | None, backup_dir: Path, debug_port: int, helper_port: int) -> tuple[HelperServer, subprocess.Popen | None]:
     resolved_app_dir = resolve_codex_app_dir(app_dir)
     if resolved_app_dir is None:
         raise RuntimeError("Codex App directory not found")
     service = ApiFirstDeleteService(UnavailableApiAdapter(), db_path, backup_dir)
     server = start_helper(service, port=helper_port)
-    subprocess.Popen(build_codex_command(resolved_app_dir, debug_port))
+    codex_proc = launch_codex(resolved_app_dir, debug_port)
     script_path = Path(__file__).parent / "inject" / "renderer-inject.js"
     server.bridge_socket = inject_with_retry(debug_port, script_path, server.port, service)
-    return server
+    return server, codex_proc
 
 
 def handle_bridge_request(service: ApiFirstDeleteService, path: str, payload: dict[str, object]) -> dict[str, object]:
