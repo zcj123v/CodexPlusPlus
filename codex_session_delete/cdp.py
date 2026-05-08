@@ -10,6 +10,7 @@ import websocket
 
 
 BridgeHandler = Callable[[str, dict[str, object]], dict[str, object]]
+BRIDGE_BINDING_NAME = "codexSessionDeleteV2"
 
 
 def list_targets(port: int) -> list[dict[str, object]]:
@@ -90,7 +91,7 @@ def inject_file(port: int, script_path: Path, helper_port: int, handler: BridgeH
     targets = list_targets(port)
     target = pick_page_target(targets)
     websocket_url = str(target["webSocketDebuggerUrl"])
-    bridge_socket = install_bridge(websocket_url, "codexSessionDelete", handler) if handler else None
+    bridge_socket = install_bridge(websocket_url, BRIDGE_BINDING_NAME, handler) if handler else None
     script = script_path.read_text(encoding="utf-8")
     prefix = f"window.__CODEX_SESSION_DELETE_HELPER__ = 'http://127.0.0.1:{helper_port}';\n"
     result = evaluate_script(websocket_url, prefix + script)

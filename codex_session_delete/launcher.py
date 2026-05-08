@@ -34,6 +34,11 @@ class ApiFirstDeleteService:
             return DeleteResult(DeleteStatus.FAILED, "", "No local backup adapter configured", undo_token=token)
         return self.local_adapter.undo(token)
 
+    def find_archived_thread_by_title(self, title: str) -> SessionRef | None:
+        if self.local_adapter is None:
+            return None
+        return self.local_adapter.find_archived_thread_by_title(title)
+
 
 class InjectedHelperServer(HelperServer):
     bridge_socket: Any = None
@@ -93,4 +98,7 @@ def handle_bridge_request(service: ApiFirstDeleteService, path: str, payload: di
         return service.delete(session).to_dict()
     if path == "/undo":
         return service.undo(str(payload.get("undo_token", ""))).to_dict()
+    if path == "/archived-thread":
+        session = service.find_archived_thread_by_title(str(payload.get("title", "")))
+        return {"session_id": session.session_id, "title": session.title} if session else {"session_id": "", "title": ""}
     return {"status": DeleteStatus.FAILED.value, "session_id": str(payload.get("session_id", "")), "message": "Unknown bridge path"}

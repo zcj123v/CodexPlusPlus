@@ -25,5 +25,13 @@ def test_backup_store_rejects_unknown_token(tmp_path):
         store.read_backup("missing")
     except FileNotFoundError as exc:
         assert "missing" in str(exc)
-    else:
-        raise AssertionError("missing backup token was accepted")
+
+
+def test_write_backup_recreates_missing_backup_directory(tmp_path):
+    backup_dir = tmp_path / "backups"
+    store = BackupStore(backup_dir)
+    backup_dir.rmdir()
+
+    token = store.write_backup("s1", "db.sqlite", {"sessions": []})
+
+    assert store.path_for(token).exists()

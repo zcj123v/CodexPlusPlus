@@ -10,6 +10,7 @@ from codex_session_delete.models import DeleteResult, DeleteStatus, SessionRef
 class DeleteService(Protocol):
     def delete(self, session: SessionRef) -> DeleteResult: ...
     def undo(self, token: str) -> DeleteResult: ...
+    def find_archived_thread_by_title(self, title: str) -> SessionRef | None: ...
 
 
 class HelperServer(ThreadingHTTPServer):
@@ -44,6 +45,10 @@ class _Handler(BaseHTTPRequestHandler):
             if self.path == "/undo":
                 token = str(payload.get("undo_token", ""))
                 self._send_json(self.server.service.undo(token).to_dict())
+                return
+            if self.path == "/archived-thread":
+                session = self.server.service.find_archived_thread_by_title(str(payload.get("title", "")))
+                self._send_json({"session_id": session.session_id, "title": session.title} if session else {"session_id": "", "title": ""})
                 return
             self._send_json({"error": "not found"}, status=404)
         except Exception as exc:

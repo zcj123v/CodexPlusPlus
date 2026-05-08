@@ -14,6 +14,7 @@ class BackupStore:
 
     def write_backup(self, session_id: str, source_db: str, tables: dict[str, list[dict[str, Any]]]) -> str:
         token = f"{int(time.time())}-{uuid.uuid4().hex}"
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
         path = self.path_for(token)
         payload = {
             "token": token,

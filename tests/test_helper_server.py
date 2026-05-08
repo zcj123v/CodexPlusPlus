@@ -10,6 +10,7 @@ class FakeDeleteService:
     def __init__(self):
         self.deleted = []
         self.undone = []
+        self.archived_title_queries = []
 
     def delete(self, session: SessionRef):
         self.deleted.append(session)
@@ -18,6 +19,10 @@ class FakeDeleteService:
     def undo(self, token: str):
         self.undone.append(token)
         return DeleteResult(DeleteStatus.UNDONE, "s1", "Restored", undo_token=token)
+
+    def find_archived_thread_by_title(self, title: str):
+        self.archived_title_queries.append(title)
+        return SessionRef(session_id="archived-t1", title=title)
 
 
 def post_json(url, payload):
@@ -45,6 +50,22 @@ def test_helper_server_delete_and_undo():
     assert undone["status"] == "undone"
     assert service.deleted[0].session_id == "s1"
     assert service.undone == ["u1"]
+
+
+def test_helper_server_resolves_archived_thread_by_title():
+    service = FakeDeleteService()
+    server = HelperServer("127.0.0.1", 0, service)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{server.port}"
+        resolved = post_json(base + "/archived-thread", {"title": "Codex Thread"})
+    finally:
+        server.shutdown()
+        thread.join(timeout=3)
+
+    assert resolved == {"session_id": "archived-t1", "title": "Codex Thread"}
+    assert service.archived_title_queries == ["Codex Thread"]
 
 
 def test_helper_server_allows_private_network_preflight():

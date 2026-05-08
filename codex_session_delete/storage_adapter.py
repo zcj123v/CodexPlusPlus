@@ -47,6 +47,19 @@ class SQLiteStorageAdapter:
             path.write_bytes(base64.b64decode(file_backup["content_b64"]))
         return DeleteResult(DeleteStatus.UNDONE, session_id, "Local session restored from backup", undo_token=token)
 
+    def find_archived_thread_by_title(self, title: str) -> SessionRef | None:
+        if not self.db_path.exists():
+            return None
+        with sqlite3.connect(self.db_path) as db:
+            db.row_factory = sqlite3.Row
+            if self._schema_kind(db) != "codex_threads" or not self._has_columns(db, "threads", {"archived"}):
+                return None
+            row = db.execute(
+                "SELECT id, title FROM threads WHERE archived = 1 AND title = ? ORDER BY archived_at DESC LIMIT 1",
+                (title,),
+            ).fetchone()
+            return SessionRef(session_id=str(row["id"]), title=str(row["title"] or title)) if row else None
+
     def _delete_generic_session(self, db: sqlite3.Connection, session: SessionRef) -> DeleteResult:
         session_rows = self._select_dicts(db, "SELECT * FROM sessions WHERE id = ?", (session.session_id,))
         if not session_rows:

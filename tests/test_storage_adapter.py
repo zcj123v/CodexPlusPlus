@@ -116,6 +116,30 @@ def test_delete_codex_thread_schema_accepts_local_prefixed_thread_id(tmp_path):
         assert db.execute("SELECT COUNT(*) FROM threads WHERE id = 't1'").fetchone()[0] == 0
 
 
+def test_find_archived_codex_thread_by_title(tmp_path):
+    db_path = tmp_path / "state_5.sqlite"
+    rollout_path = tmp_path / "archived.jsonl"
+    create_codex_thread_db(db_path, rollout_path)
+    with sqlite3.connect(db_path) as db:
+        db.execute("UPDATE threads SET archived = 1, archived_at = 123 WHERE id = 't1'")
+    adapter = SQLiteStorageAdapter(db_path, BackupStore(tmp_path / "backups"))
+
+    session = adapter.find_archived_thread_by_title("Codex Thread")
+
+    assert session == SessionRef(session_id="t1", title="Codex Thread")
+
+
+def test_find_archived_codex_thread_by_title_ignores_active_threads(tmp_path):
+    db_path = tmp_path / "state_5.sqlite"
+    rollout_path = tmp_path / "active.jsonl"
+    create_codex_thread_db(db_path, rollout_path)
+    adapter = SQLiteStorageAdapter(db_path, BackupStore(tmp_path / "backups"))
+
+    session = adapter.find_archived_thread_by_title("Codex Thread")
+
+    assert session is None
+
+
     db_path = tmp_path / "unknown.sqlite"
     with sqlite3.connect(db_path) as db:
         db.execute("CREATE TABLE unrelated (id TEXT PRIMARY KEY)")

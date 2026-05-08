@@ -1,7 +1,7 @@
 import json
 import websocket
 
-from codex_session_delete.cdp import _bridge_loop, build_bridge_script, pick_page_target
+from codex_session_delete.cdp import BRIDGE_BINDING_NAME, _bridge_loop, build_bridge_script, pick_page_target
 
 
 class TimeoutThenMessageSocket:
@@ -48,6 +48,10 @@ def test_build_bridge_script_installs_binding_callbacks():
     assert "window.codexSessionDelete" in script
     assert "window.__codexSessionDeleteResolve" in script
     assert "window.__codexSessionDeleteReject" in script
+
+
+def test_bridge_binding_name_is_versioned_for_reinjection():
+    assert BRIDGE_BINDING_NAME == "codexSessionDeleteV2"
 
 
 def test_bridge_loop_continues_after_idle_timeout():
