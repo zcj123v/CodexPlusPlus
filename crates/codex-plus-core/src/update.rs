@@ -181,16 +181,32 @@ pub async fn fetch_latest_release(latest_json_url: &str) -> anyhow::Result<Relea
 }
 
 pub async fn check_for_update(current_version: &str) -> anyhow::Result<UpdateCheck> {
-    let release = fetch_latest_release(DEFAULT_LATEST_JSON_URL).await?;
-    let update_available = is_newer_version(&release.version, current_version)?;
-    Ok(UpdateCheck {
-        current_version: current_version.to_string(),
-        latest_version: Some(release.version),
-        release_summary: release.body,
-        asset_name: release.asset_name,
-        asset_url: release.asset_url,
-        update_available,
-    })
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        // Upstream releases only ship Windows/macOS assets; there is nothing
+        // to download on other platforms, so skip the update check entirely.
+        return Ok(UpdateCheck {
+            current_version: current_version.to_string(),
+            latest_version: None,
+            release_summary: String::new(),
+            asset_name: None,
+            asset_url: None,
+            update_available: false,
+        });
+    }
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let release = fetch_latest_release(DEFAULT_LATEST_JSON_URL).await?;
+        let update_available = is_newer_version(&release.version, current_version)?;
+        Ok(UpdateCheck {
+            current_version: current_version.to_string(),
+            latest_version: Some(release.version),
+            release_summary: release.body,
+            asset_name: release.asset_name,
+            asset_url: release.asset_url,
+            update_available,
+        })
+    }
 }
 
 pub async fn perform_update(

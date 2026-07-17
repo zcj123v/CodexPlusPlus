@@ -285,12 +285,40 @@ pub fn find_session_index_cleanup_blocking_processes() -> Vec<u32> {
     find_codex_processes()
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+pub fn find_codex_processes() -> Vec<u32> {
+    // Community Linux builds name the Electron binary `codex` / `codex-desktop`,
+    // which collides with the Codex CLI process name, so match the /proc exe
+    // link target (the install directory) instead of the process name.
+    let mut ids = std::fs::read_dir("/proc")
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| {
+                    let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
+                    let target = std::fs::read_link(entry.path().join("exe")).ok()?;
+                    let text = target.to_string_lossy();
+                    (text.contains("codex-desktop") || text.contains("openai-codex")).then_some(pid)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+#[cfg(target_os = "linux")]
+pub fn find_session_index_cleanup_blocking_processes() -> Vec<u32> {
+    find_codex_processes()
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub fn find_codex_processes() -> Vec<u32> {
     Vec::new()
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub fn find_session_index_cleanup_blocking_processes() -> Vec<u32> {
     Vec::new()
 }
@@ -346,7 +374,16 @@ pub fn stop_codex_processes() {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn stop_codex_processes() {
+    for process_id in find_codex_processes() {
+        let _ = std::process::Command::new("kill")
+            .arg(process_id.to_string())
+            .status();
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn stop_codex_processes() {}
 
 #[cfg(windows)]
@@ -358,7 +395,24 @@ pub fn stop_codex_processes_and_wait() {
     );
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn stop_codex_processes_and_wait() {
+    let process_ids = find_codex_processes();
+    if process_ids.is_empty() {
+        return;
+    }
+    stop_codex_processes();
+    let deadline = std::time::Instant::now() + Duration::from_millis(RESTART_STOP_WAIT_TIMEOUT_MS);
+    loop {
+        let remaining = process_ids_still_running(&process_ids, find_codex_processes());
+        if remaining.is_empty() || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(RESTART_STOP_WAIT_INTERVAL_MS));
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn stop_codex_processes_and_wait() {}
 
 #[cfg(windows)]

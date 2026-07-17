@@ -151,15 +151,65 @@ pub fn find_macos_codex_app_default() -> Option<PathBuf> {
     find_macos_codex_app(&roots)
 }
 
+/// Well-known install roots of community Linux builds of the Codex desktop app
+/// (AUR package, deb/rpm layouts, portable installs).
+#[cfg(target_os = "linux")]
+fn linux_codex_app_roots() -> Vec<PathBuf> {
+    let mut roots = vec![
+        PathBuf::from("/usr/lib/openai-codex-desktop"),
+        PathBuf::from("/opt/codex-desktop"),
+        PathBuf::from("/opt/openai-codex-desktop"),
+    ];
+    if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
+        roots.push(home.join(".local/share/codex-desktop"));
+        roots.push(home.join(".local/share/openai-codex-desktop"));
+    }
+    roots
+}
+
+#[cfg(target_os = "linux")]
+pub fn find_linux_codex_app_default() -> Option<PathBuf> {
+    linux_codex_app_roots()
+        .into_iter()
+        .find(|root| executable_in_dir(root).is_some())
+}
+
+/// Wrapper scripts shipped by Linux packages of the Codex desktop app. They
+/// start the local webview server and set ELECTRON_RENDERER_URL before
+/// exec'ing Electron, so launching them is required for the app to render.
+#[cfg(target_os = "linux")]
+fn linux_codex_wrapper_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![
+        PathBuf::from("/usr/bin/codex-desktop"),
+        PathBuf::from("/usr/local/bin/codex-desktop"),
+    ];
+    if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
+        candidates.push(home.join(".local/bin/codex-desktop"));
+    }
+    candidates
+}
+
 pub fn resolve_codex_app_dir(app_dir: Option<&Path>) -> Option<PathBuf> {
     if let Some(app_dir) = app_dir {
         return normalize_codex_app_path(app_dir);
     }
-    if cfg!(target_os = "macos") {
-        return find_macos_codex_app_default();
+    #[cfg(target_os = "macos")]
+    {
+        find_macos_codex_app_default()
     }
-    // Windows: try MS Store version first, then standalone install
-    find_latest_codex_app_dir_default().or_else(|| find_standalone_codex_app_dir())
+    #[cfg(target_os = "linux")]
+    {
+        find_linux_codex_app_default()
+    }
+    #[cfg(windows)]
+    {
+        // Windows: try MS Store version first, then standalone install
+        find_latest_codex_app_dir_default().or_else(find_standalone_codex_app_dir)
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
 }
 
 /// Search for standalone Codex installations (non-MS Store).
@@ -293,6 +343,19 @@ fn is_codex_store_package_dir(path: &Path) -> bool {
 }
 
 pub fn build_codex_executable(app_dir: &Path) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        // Prefer the distro wrapper script over the raw Electron binary: the
+        // wrapper prepares the webview server and renderer URL at startup.
+        for wrapper in linux_codex_wrapper_candidates() {
+            if wrapper.is_file() {
+                return wrapper;
+            }
+        }
+        if let Some(executable) = executable_in_dir(app_dir) {
+            return executable;
+        }
+    }
     if app_dir.extension() == Some(OsStr::new("app")) {
         let macos_dir = app_dir.join("Contents").join("MacOS");
         if let Some(executable) = macos_app_plist_value(app_dir, "CFBundleExecutable")
@@ -472,7 +535,11 @@ pub(crate) fn is_supported_windows_app_package_name(package_name: &str) -> bool 
 }
 
 pub(crate) fn is_supported_app_executable_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case("Codex.exe") || name.eq_ignore_ascii_case("ChatGPT.exe")
+    if name.eq_ignore_ascii_case("Codex.exe") || name.eq_ignore_ascii_case("ChatGPT.exe") {
+        return true;
+    }
+    // Community Linux builds ship the Electron binary as `codex` / `codex-desktop`.
+    cfg!(target_os = "linux") && (name == "codex" || name == "codex-desktop")
 }
 
 fn package_spec_from_path(path: &Path) -> Option<AppPackageSpec> {
@@ -516,9 +583,13 @@ fn package_entry_dir(package_dir: &Path, spec: AppPackageSpec) -> Option<PathBuf
 }
 
 fn executable_in_dir(dir: &Path) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    const FALLBACK_EXECUTABLES: &[&str] = &["codex", "codex-desktop"];
+    #[cfg(not(target_os = "linux"))]
+    const FALLBACK_EXECUTABLES: &[&str] = STANDALONE_CODEX_EXECUTABLES;
     let names = package_spec_from_path(dir)
         .map(|spec| spec.executable_names)
-        .unwrap_or(STANDALONE_CODEX_EXECUTABLES);
+        .unwrap_or(FALLBACK_EXECUTABLES);
     for name in names {
         let candidate = dir.join(name);
         if candidate.exists() {
