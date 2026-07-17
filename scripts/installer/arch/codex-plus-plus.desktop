@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Codex++
+GenericName=Codex Launcher
+Comment=Launch Codex with Codex++ enhancements
+Exec=codex-plus-plus
+Icon=codexplusplus
+Terminal=false
+Categories=Development;IDE;
+Keywords=codex;ai;
+StartupNotify=true
