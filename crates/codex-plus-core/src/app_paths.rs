@@ -295,6 +295,38 @@ pub fn find_macos_codex_app_default() -> Option<PathBuf> {
     find_macos_codex_app(&roots)
 }
 
+/// Well-known install roots of Linux desktop app packages: the official
+/// openai-codex-desktop package (`/usr/lib/chatgpt`) first, then the community
+/// build (ilysenko/codex-desktop-linux native packages). These packages ship a
+/// wrapper script rather than a directly launchable Electron binary, so their
+/// roots are probed explicitly instead of relying on the generic directory scan
+/// (which would miss a root named `codex-desktop`).
+#[cfg(target_os = "linux")]
+fn linux_codex_app_roots() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from("/usr/lib/chatgpt"),
+        PathBuf::from("/opt/codex-desktop"),
+    ]
+}
+
+/// Wrapper scripts shipped by Linux packages of the desktop app. 发行版桌面包
+/// 不直接暴露 Electron 二进制：社区包（ilysenko/codex-desktop-linux）的 wrapper
+/// 会拉起本地 webview server 并设置 ELECTRON_RENDERER_URL；官方包的 wrapper
+/// （/usr/bin/chatgpt，同时软链为 /usr/bin/codex-desktop）会补上 Wayland/ozone
+/// 参数。因此这些根目录下的应用必须经 wrapper 启动才能正常渲染。
+#[cfg(target_os = "linux")]
+fn linux_codex_wrapper_candidates(app_dir: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if app_dir == Path::new("/usr/lib/chatgpt") {
+        candidates.push(PathBuf::from("/usr/bin/chatgpt"));
+    }
+    candidates.push(PathBuf::from("/usr/bin/codex-desktop"));
+    candidates.push(PathBuf::from("/usr/local/bin/codex-desktop"));
+    if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
+        candidates.push(home.join(".local/bin/codex-desktop"));
+    }
+    candidates
+}
 
 pub fn find_linux_codex_app(search_roots: &[PathBuf]) -> Option<PathBuf> {
     for root in search_roots {
@@ -350,7 +382,19 @@ fn linux_app_candidates(root: &Path) -> Vec<PathBuf> {
     candidates
 }
 
+/// Linux 探测包装：发行版包的根目录（/usr/lib/chatgpt、/opt/codex-desktop）本身
+/// 名字就可能撞上可执行文件名，通用扫描会漏掉，故先按已知根目录精确探测，再回退
+/// 到通用扫描。
+#[cfg(target_os = "linux")]
 pub fn find_linux_codex_app_default() -> Option<PathBuf> {
+    linux_codex_app_roots()
+        .into_iter()
+        .find(|root| executable_in_dir(root).is_some())
+        .or_else(find_linux_codex_app_scan)
+}
+
+#[cfg(target_os = "linux")]
+fn find_linux_codex_app_scan() -> Option<PathBuf> {
     let home = directories::BaseDirs::new();
     let mut roots = Vec::new();
     // 系统级（官方 deb 默认安装在 /usr/lib/chatgpt）
@@ -537,6 +581,20 @@ pub fn build_codex_executable(app_dir: &Path) -> PathBuf {
             return macos_dir.join(executable);
         }
         return macos_dir.join("Codex");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // 发行版包（官方 openai-codex-desktop、社区 ilysenko/codex-desktop-linux）
+        // 装进已知根目录并附带 wrapper 脚本；这些根目录下的应用必须经 wrapper
+        // 启动，否则 webview server / ELECTRON_RENDERER_URL 未就绪会导致无法渲染。
+        if linux_codex_app_roots().iter().any(|root| root == app_dir) {
+            if let Some(wrapper) = linux_codex_wrapper_candidates(app_dir)
+                .into_iter()
+                .find(|wrapper| wrapper.is_file())
+            {
+                return wrapper;
+            }
+        }
     }
     if let Some(executable) = executable_in_dir(app_dir) {
         return executable;
