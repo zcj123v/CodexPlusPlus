@@ -1,0 +1,43 @@
+# Arch Linux package for Codex++ (Linux port).
+# Packages prebuilt release binaries staged next to this PKGBUILD by
+# scripts/installer/arch/build-package.sh (or the arch-package CI workflow).
+pkgname=codexplusplus
+pkgver=1.2.38
+pkgrel=1
+pkgdesc='External enhancement launcher and manager for the Codex desktop app (Linux port)'
+arch=('x86_64')
+url='https://github.com/zcj123v/CodexPlusPlus'
+license=('AGPL-3.0-only')
+depends=(
+  'webkit2gtk-4.1'
+  'libayatana-appindicator'
+  'gtk3'
+  'glib2'
+  'libsoup3'
+  'gdk-pixbuf2'
+  'cairo'
+  'pango'
+  'gcc-libs'
+  'hicolor-icon-theme'
+)
+# Binaries are produced by the local/CI build, so checksums are skipped here
+# and integrity is guaranteed by the build pipeline itself.
+source=(
+  'codex-plus-plus'
+  'codex-plus-plus-manager'
+  'codex-plus-plus.desktop'
+  'codex-plus-plus-manager.desktop'
+  'codexplusplus.png'
+)
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
+
+package() {
+  install -Dm755 "$srcdir/codex-plus-plus" "$pkgdir/usr/bin/codex-plus-plus"
+  install -Dm755 "$srcdir/codex-plus-plus-manager" "$pkgdir/usr/bin/codex-plus-plus-manager"
+  install -Dm644 "$srcdir/codex-plus-plus.desktop" \
+    "$pkgdir/usr/share/applications/codex-plus-plus.desktop"
+  install -Dm644 "$srcdir/codex-plus-plus-manager.desktop" \
+    "$pkgdir/usr/share/applications/codex-plus-plus-manager.desktop"
+  install -Dm644 "$srcdir/codexplusplus.png" \
+    "$pkgdir/usr/share/icons/hicolor/256x256/apps/codexplusplus.png"
+}

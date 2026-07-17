@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Codex++ 管理工具
+Name[en]=Codex++ Manager
+GenericName=Codex++ Manager
+Comment=Manage Codex++ enhancements, providers and user scripts
+Exec=codex-plus-plus-manager
+Icon=codexplusplus
+Terminal=false
+Categories=Development;Settings;
+Keywords=codex;ai;
+StartupNotify=true
