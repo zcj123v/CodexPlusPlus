@@ -3,7 +3,7 @@
 # scripts/installer/arch/build-package.sh (or the arch-package CI workflow).
 pkgname=codexplusplus
 pkgver=1.2.38
-pkgrel=1
+pkgrel=2
 pkgdesc='External enhancement launcher and manager for the Codex desktop app (Linux port)'
 arch=('x86_64')
 url='https://github.com/zcj123v/CodexPlusPlus'

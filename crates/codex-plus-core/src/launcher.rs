@@ -666,6 +666,16 @@ impl LaunchHooks for DefaultLaunchHooks {
                 "launcher.prelaunch",
             );
         }
+        #[cfg(target_os = "linux")]
+        {
+            // A Codex instance started without our debug port would swallow this
+            // launch through its single-instance handoff; restart it first.
+            if !crate::watcher::find_codex_processes().is_empty()
+                && !crate::watcher::cdp_listening(debug_port)
+            {
+                crate::watcher::stop_codex_processes_and_wait();
+            }
+        }
         let native_menu_localization_enabled = settings.codex_app_native_menu_localization;
         let native_menu_inspector_port =
             native_menu_localization_enabled.then(|| select_native_menu_inspector_port(debug_port));

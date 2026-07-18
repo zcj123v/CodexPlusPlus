@@ -286,19 +286,34 @@ pub fn find_session_index_cleanup_blocking_processes() -> Vec<u32> {
 }
 
 #[cfg(target_os = "linux")]
+fn linux_process_matches_codex_desktop(exe_target: &str, cmdline: &str) -> bool {
+    if exe_target.contains("codex-desktop") || exe_target.contains("openai-codex") {
+        return true;
+    }
+    // Distro packages symlink the app binary to a shared Electron runtime
+    // (e.g. /usr/lib/electron42/electron), so the exe link alone cannot
+    // identify the app — match the app.asar argument in the command line.
+    cmdline.contains("app.asar")
+        && (cmdline.contains("codex-desktop") || cmdline.contains("openai-codex"))
+}
+
+#[cfg(target_os = "linux")]
 pub fn find_codex_processes() -> Vec<u32> {
     // Community Linux builds name the Electron binary `codex` / `codex-desktop`,
     // which collides with the Codex CLI process name, so match the /proc exe
-    // link target (the install directory) instead of the process name.
+    // link target and command line instead of the process name.
     let mut ids = std::fs::read_dir("/proc")
         .map(|entries| {
             entries
                 .flatten()
                 .filter_map(|entry| {
                     let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
-                    let target = std::fs::read_link(entry.path().join("exe")).ok()?;
-                    let text = target.to_string_lossy();
-                    (text.contains("codex-desktop") || text.contains("openai-codex")).then_some(pid)
+                    let exe_target = std::fs::read_link(entry.path().join("exe"))
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let cmdline = std::fs::read_to_string(entry.path().join("cmdline"))
+                        .unwrap_or_default();
+                    linux_process_matches_codex_desktop(&exe_target, &cmdline).then_some(pid)
                 })
                 .collect::<Vec<_>>()
         })
