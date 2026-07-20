@@ -6189,9 +6189,14 @@ mod tests {
 
         let state: Value =
             serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+        let expected_workspace_roots = if cfg!(windows) {
+            json!(["D:\\fresh\\app", "C:\\work\\app"])
+        } else {
+            json!(["D:/fresh/app", "C:/work/app"])
+        };
         assert_eq!(
             state["electron-saved-workspace-roots"],
-            json!(["D:\\fresh\\app", "C:\\work\\app"])
+            expected_workspace_roots
         );
         assert_eq!(
             state["thread-writable-roots"]["thread-1"],
