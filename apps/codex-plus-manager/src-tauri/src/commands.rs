@@ -1381,11 +1381,17 @@ pub fn list_local_sessions(
     let mut seen_session_ids = std::collections::HashSet::new();
     sessions.retain(|session| seen_session_ids.insert(session.id.clone()));
     let has_more = sessions.len() > offset.saturating_add(limit);
-    let sessions = sessions.into_iter().skip(offset).take(limit).collect();
+    let sessions: Vec<_> = sessions.into_iter().skip(offset).take(limit).collect();
     let payload = LocalSessionsPayload {
-        db_path: db_paths
+        // 显示实际贡献会话的库,而不是路径列表中的第一个(可能只是空的目录库)
+        db_path: sessions
             .first()
-            .map(|path| path.to_string_lossy().to_string())
+            .map(|session| session.db_path.clone())
+            .or_else(|| {
+                db_paths
+                    .first()
+                    .map(|path| path.to_string_lossy().to_string())
+            })
             .unwrap_or_default(),
         db_paths: db_paths
             .iter()
@@ -1558,6 +1564,20 @@ pub fn delete_local_session(request: DeleteLocalSessionRequest) -> CommandResult
     } else {
         "failed"
     };
+    if status == "ok" {
+        // 删除成功后清理次级存储里的残留引用(catalog 行、session_index 条目)
+        let cleanup = codex_plus_data::cleanup_deleted_thread_references(
+            &codex_plus_core::codex_sqlite::default_codex_home_dir(),
+            session_id,
+        );
+        log_manager_event(
+            "manager.delete_local_session.references_cleanup",
+            json!({
+                "session_id": session_id,
+                "cleanup": cleanup,
+            }),
+        );
+    }
     CommandResult {
         status: status.to_string(),
         message: result.message.clone(),
@@ -4185,6 +4205,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    #[cfg(windows)]
     #[test]
     fn provider_switch_state_helpers_restore_only_safe_state() {
         let temp = tempfile::tempdir().unwrap();

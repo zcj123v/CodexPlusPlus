@@ -54,6 +54,66 @@ pub fn move_codex_thread_workspace_from_paths(
     result
 }
 
+/// Remove leftover references to a deleted thread from secondary stores that
+/// the per-database deletion does not cover: `local_thread_catalog` rows in
+/// the catalog databases and the thread's entry in `session_index.jsonl`.
+/// Failures are non-fatal and only reported through the return value.
+pub fn cleanup_deleted_thread_references(codex_home: &Path, session_id: &str) -> Value {
+    let thread_id = normalize_codex_thread_id(session_id);
+    let mut catalog_rows_removed = 0usize;
+    for db_path in
+        codex_plus_core::codex_sqlite::codex_thread_reference_db_paths_from_home(codex_home)
+    {
+        if !db_path.exists() {
+            continue;
+        }
+        if let Ok(db) = Connection::open(&db_path) {
+            if has_table(&db, "local_thread_catalog").unwrap_or(false) {
+                if let Ok(rows) = db.execute(
+                    "DELETE FROM local_thread_catalog WHERE thread_id = ?1",
+                    [&thread_id],
+                ) {
+                    catalog_rows_removed += rows;
+                }
+            }
+        }
+    }
+
+    let index_path = codex_home.join("session_index.jsonl");
+    let mut index_entries_removed = 0usize;
+    if let Ok(text) = fs::read_to_string(&index_path) {
+        let kept = text
+            .lines()
+            .filter(|line| {
+                serde_json::from_str::<Value>(line)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string)
+                    })
+                    .as_deref()
+                    != Some(thread_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        index_entries_removed = text.lines().count().saturating_sub(kept.len());
+        if index_entries_removed > 0 {
+            let mut next = kept.join("\n");
+            if !next.is_empty() {
+                next.push('\n');
+            }
+            let _ = codex_plus_core::settings::atomic_write(&index_path, next.as_bytes());
+        }
+    }
+
+    json!({
+        "thread_id": thread_id,
+        "catalog_rows_removed": catalog_rows_removed,
+        "session_index_entries_removed": index_entries_removed,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct SQLiteStorageAdapter {
     db_path: PathBuf,
