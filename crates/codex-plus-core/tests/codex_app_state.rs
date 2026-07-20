@@ -4,6 +4,7 @@ use codex_plus_core::codex_app_state::{
 };
 use serde_json::{Value, json};
 
+#[cfg(windows)]
 #[test]
 fn app_state_sync_restores_safe_state_and_ignores_sensitive_snapshot_keys() {
     let temp = tempfile::tempdir().unwrap();
@@ -195,6 +196,7 @@ fn app_state_sync_restores_safe_state_and_ignores_sensitive_snapshot_keys() {
     );
 }
 
+#[cfg(windows)]
 #[test]
 fn app_state_sync_normalizes_current_state_and_writes_backup_before_change() {
     let temp = tempfile::tempdir().unwrap();
@@ -307,4 +309,34 @@ hotkey-window-projectless-default-enabled = false
 
     assert!(!result.changed);
     assert_eq!(state["active-workspace-roots"], json!(["C:/work/app"]));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn app_state_sync_keeps_forward_slashes_and_repairs_backslash_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    let state_path = home.join(".codex-global-state.json");
+    std::fs::write(
+        &state_path,
+        json!({
+            "electron-saved-workspace-roots": ["/home/user", "\\home\\user\\"],
+            "active-workspace-roots": "/home/user/",
+            "projectless-thread-ids": ["thread-1"]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let result = sync_app_state_after_provider_switch(home).unwrap();
+    let state: Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+
+    assert!(result.changed);
+    assert_eq!(
+        state["electron-saved-workspace-roots"],
+        json!(["/home/user"])
+    );
+    assert_eq!(state["active-workspace-roots"], json!("/home/user"));
+    assert_eq!(state["projectless-thread-ids"], json!(["thread-1"]));
 }

@@ -461,19 +461,6 @@ fn is_codex_store_package_dir(path: &Path) -> bool {
 }
 
 pub fn build_codex_executable(app_dir: &Path) -> PathBuf {
-    #[cfg(target_os = "linux")]
-    {
-        // Prefer the distro wrapper script over the raw Electron binary: the
-        // wrapper prepares the webview server and renderer URL at startup.
-        for wrapper in linux_codex_wrapper_candidates() {
-            if wrapper.is_file() {
-                return wrapper;
-            }
-        }
-        if let Some(executable) = executable_in_dir(app_dir) {
-            return executable;
-        }
-    }
     if app_dir.extension() == Some(OsStr::new("app")) {
         let macos_dir = app_dir.join("Contents").join("MacOS");
         if let Some(executable) = macos_app_plist_value(app_dir, "CFBundleExecutable")
@@ -482,6 +469,23 @@ pub fn build_codex_executable(app_dir: &Path) -> PathBuf {
             return macos_dir.join(executable);
         }
         return macos_dir.join("Codex");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Distro packages install into well-known roots and ship a wrapper
+        // script that prepares the webview server; prefer it for those roots.
+        // Other directories keep their own executable (portable bundles etc.).
+        if linux_codex_app_roots().iter().any(|root| root == app_dir) {
+            if let Some(wrapper) = linux_codex_wrapper_candidates()
+                .into_iter()
+                .find(|wrapper| wrapper.is_file())
+            {
+                return wrapper;
+            }
+        }
+        if let Some(executable) = executable_in_dir(app_dir) {
+            return executable;
+        }
     }
     if let Some(executable) = executable_in_dir(app_dir) {
         return executable;
@@ -701,8 +705,16 @@ fn package_entry_dir(package_dir: &Path, spec: AppPackageSpec) -> Option<PathBuf
 }
 
 fn executable_in_dir(dir: &Path) -> Option<PathBuf> {
+    // Linux 优先匹配社区版的 codex / codex-desktop 二进制,同时保留经典的
+    // exe 名称以兼容 Windows 布局的目录(便携包、共享目录等)。
     #[cfg(target_os = "linux")]
-    const FALLBACK_EXECUTABLES: &[&str] = &["codex", "codex-desktop"];
+    const FALLBACK_EXECUTABLES: &[&str] = &[
+        "codex",
+        "codex-desktop",
+        "ChatGPT.exe",
+        "Codex.exe",
+        "codex.exe",
+    ];
     #[cfg(not(target_os = "linux"))]
     const FALLBACK_EXECUTABLES: &[&str] = STANDALONE_CODEX_EXECUTABLES;
     let names = package_spec_from_path(dir)

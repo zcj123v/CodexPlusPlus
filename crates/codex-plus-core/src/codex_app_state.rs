@@ -683,8 +683,13 @@ fn normalize_desktop_path(value: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
+    #[cfg(windows)]
     let mut path = trimmed.replace('/', r"\");
-    while path.len() > 3 && path.ends_with('\\') {
+    // On non-Windows platforms the workspace path uses forward slashes; also
+    // converts legacy backslash-contaminated entries back to a usable form.
+    #[cfg(not(windows))]
+    let mut path = trimmed.replace('\\', "/");
+    while path.len() > 3 && path.ends_with(std::path::MAIN_SEPARATOR) {
         path.pop();
     }
     Some(path)

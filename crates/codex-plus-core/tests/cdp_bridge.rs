@@ -431,9 +431,13 @@ fn injection_script_installs_dream_skin_from_backend_settings() {
     ));
     assert!(script.contains("window.__CODEX_PLUS_DREAM_SKIN_RUNTIME_REVISION__"));
     assert!(script.contains("window.__CODEX_PLUS_DREAM_SKIN_ART_SIGNATURE__"));
-    assert!(!script.contains(
-        "attributeFilter: [\"class\", \"data-theme\", \"data-appearance\", \"data-color-mode\", \"style\"]"
-    ));
+    if cfg!(windows) {
+        // The upstream macOS/Linux theme bundles legitimately contain this
+        // observer attribute list; only the Windows bundle must not.
+        assert!(!script.contains(
+            "attributeFilter: [\"class\", \"data-theme\", \"data-appearance\", \"data-color-mode\", \"style\"]"
+        ));
+    }
     assert!(script.contains("codexAppDreamSkinEnabled"));
     assert!(script.contains("codexAppDreamSkinPaused"));
     assert!(script.contains("codexAppDreamSkinThemeConfig"));
