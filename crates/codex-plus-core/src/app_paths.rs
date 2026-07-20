@@ -16,13 +16,16 @@ const CODEX_PACKAGE_EXECUTABLES: &[&str] = &["ChatGPT.exe", "Codex.exe", "codex.
 #[cfg(not(target_os = "linux"))]
 const STANDALONE_CODEX_EXECUTABLES: &[&str] = &["ChatGPT.exe", "Codex.exe", "codex.exe"];
 
-/// Linux 可执行文件名（原生优先，兼容便携包）
+/// Linux 可执行文件名（原生优先，兼容便携包）。`electron` / `codex-desktop`
+/// 来自社区版 ilysenko/codex-desktop-linux 及其改名打包。
 #[cfg(target_os = "linux")]
 const LINUX_CODEX_EXECUTABLES: &[&str] = &[
     "ChatGPT",
     "chatgpt",
     "Codex",
     "codex",
+    "electron",
+    "codex-desktop",
     "ChatGPT.exe",
     "Codex.exe",
     "codex.exe",
@@ -587,6 +590,7 @@ pub fn build_codex_executable(app_dir: &Path) -> PathBuf {
         // 发行版包（官方 openai-codex-desktop、社区 ilysenko/codex-desktop-linux）
         // 装进已知根目录并附带 wrapper 脚本；这些根目录下的应用必须经 wrapper
         // 启动，否则 webview server / ELECTRON_RENDERER_URL 未就绪会导致无法渲染。
+        // 其余目录（便携包等）仍用自身的可执行文件（见下方 executable_in_dir）。
         if linux_codex_app_roots().iter().any(|root| root == app_dir) {
             if let Some(wrapper) = linux_codex_wrapper_candidates(app_dir)
                 .into_iter()
