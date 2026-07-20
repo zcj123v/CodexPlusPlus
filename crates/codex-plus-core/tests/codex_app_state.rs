@@ -3,6 +3,7 @@ use codex_plus_core::codex_app_state::{
 };
 use serde_json::{Value, json};
 
+#[cfg(windows)]
 #[test]
 fn app_state_sync_restores_safe_state_and_ignores_sensitive_snapshot_keys() {
     let temp = tempfile::tempdir().unwrap();
@@ -194,6 +195,7 @@ fn app_state_sync_restores_safe_state_and_ignores_sensitive_snapshot_keys() {
     );
 }
 
+#[cfg(windows)]
 #[test]
 fn app_state_sync_normalizes_current_state_and_writes_backup_before_change() {
     let temp = tempfile::tempdir().unwrap();

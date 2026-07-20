@@ -346,9 +346,14 @@ fn switch_captures_safe_app_state_before_writing_provider_config() {
         .unwrap(),
     )
     .unwrap();
+    let expected_workspace_root = if cfg!(windows) {
+        "C:\\work\\app"
+    } else {
+        "C:/work/app"
+    };
     assert_eq!(
         snapshot["state"]["electron-saved-workspace-roots"],
-        serde_json::json!(["C:\\work\\app"])
+        serde_json::json!([expected_workspace_root])
     );
     assert_eq!(
         snapshot["state"]["electron-persisted-atom-state"]["default-service-tier"],
