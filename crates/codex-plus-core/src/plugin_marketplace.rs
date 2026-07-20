@@ -776,10 +776,19 @@ fn normalize_windows_extended_path(value: &str) -> String {
 
 fn windows_extended_path(path: &Path) -> String {
     let value = path.to_string_lossy();
-    if value.starts_with(r"\\?\") {
+    // The \\?\ extended-length prefix is a Windows-only convention; writing it
+    // on other platforms produces paths the Codex core cannot parse.
+    #[cfg(windows)]
+    {
+        if value.starts_with(r"\\?\") {
+            value.into_owned()
+        } else {
+            format!(r"\\?\{value}")
+        }
+    }
+    #[cfg(not(windows))]
+    {
         value.into_owned()
-    } else {
-        format!(r"\\?\{value}")
     }
 }
 
@@ -816,6 +825,17 @@ fn ensure_trailing_newline(mut contents: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Expected marketplace source path for the current platform: Windows uses
+    // the \\?\ extended-length prefix, other platforms use the plain path.
+    fn expected_marketplace_source(path: &Path) -> String {
+        let value = path.to_string_lossy();
+        if cfg!(windows) && !value.starts_with(r"\\?\") {
+            format!(r"\\?\{value}")
+        } else {
+            value.into_owned()
+        }
+    }
 
     fn write_marketplace(home: &Path) {
         let root = home.join(".tmp").join("plugins");
@@ -903,13 +923,7 @@ source = '{}'
         );
         assert_eq!(
             parsed["marketplaces"]["openai-curated-remote"]["source"].as_str(),
-            Some(
-                format!(
-                    r"\\?\{}",
-                    home.join(".tmp").join("plugins-remote").display()
-                )
-                .as_str()
-            )
+            Some(expected_marketplace_source(&home.join(".tmp").join("plugins-remote")).as_str())
         );
     }
 
@@ -965,16 +979,13 @@ source = "/opt/user-marketplace"
         );
         assert_eq!(
             parsed["marketplaces"]["role-specific-plugins"]["source"].as_str(),
-            Some(
-                format!(
-                    r"\\?\{}",
-                    home.join(".tmp")
-                        .join("marketplaces")
-                        .join("role-specific-plugins")
-                        .display()
-                )
-                .as_str()
+            Some(expected_marketplace_source(
+                &home
+                    .join(".tmp")
+                    .join("marketplaces")
+                    .join("role-specific-plugins"),
             )
+            .as_str())
         );
         for plugin in [
             "sales@role-specific-plugins",
@@ -1084,13 +1095,7 @@ source = "/opt/user-marketplace"
         );
         assert_eq!(
             parsed["marketplaces"]["openai-curated-remote"]["source"].as_str(),
-            Some(
-                format!(
-                    r"\\?\{}",
-                    home.join(".tmp").join("plugins-remote").display()
-                )
-                .as_str()
-            )
+            Some(expected_marketplace_source(&home.join(".tmp").join("plugins-remote")).as_str())
         );
     }
 
@@ -1125,13 +1130,7 @@ source = "/opt/user-marketplace"
         );
         assert_eq!(
             parsed["marketplaces"]["openai-curated-remote"]["source"].as_str(),
-            Some(
-                format!(
-                    r"\\?\{}",
-                    home.join(".tmp").join("plugins-remote").display()
-                )
-                .as_str()
-            )
+            Some(expected_marketplace_source(&home.join(".tmp").join("plugins-remote")).as_str())
         );
     }
 
