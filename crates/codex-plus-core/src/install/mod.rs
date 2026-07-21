@@ -4,6 +4,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+pub mod linux;
 pub mod macos;
 pub mod windows;
 
@@ -117,6 +118,10 @@ pub fn build_macos_app_bundle(options: &InstallOptions, manager: bool) -> MacosA
     macos::build_app_bundle(options, manager)
 }
 
+pub fn build_linux_desktop_entries(options: &InstallOptions) -> Vec<linux::LinuxDesktopEntry> {
+    linux::build_desktop_entries(options)
+}
+
 pub fn remove_owned_data() -> std::io::Result<()> {
     let dir = crate::paths::default_app_state_dir();
     if dir.exists() {
@@ -151,7 +156,14 @@ pub fn default_install_root() -> Option<PathBuf> {
         return Some(sys_apps);
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        // XDG 应用目录（~/.local/share/applications），不需要 root 即可写入，
+        // 桌面环境的应用菜单会扫描这里。
+        directories::BaseDirs::new().map(|dirs| dirs.data_dir().join("applications"))
+    }
+
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         directories::UserDirs::new().and_then(|dirs| dirs.desktop_dir().map(PathBuf::from))
     }
@@ -162,6 +174,8 @@ pub fn default_install_root_strategy() -> &'static str {
         "windows-known-folder"
     } else if cfg!(target_os = "macos") {
         "macos-applications"
+    } else if cfg!(target_os = "linux") {
+        "xdg-data-applications"
     } else {
         "user-dirs-desktop"
     }
@@ -178,7 +192,12 @@ fn platform_install(options: &InstallOptions) -> anyhow::Result<()> {
         macos::install_app_bundles(options)
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::install_desktop_entries(options)
+    }
+
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         let _ = options;
         anyhow::bail!("当前平台暂不支持安装 Codex++ 入口")
@@ -196,7 +215,12 @@ fn platform_uninstall(options: &InstallOptions) -> anyhow::Result<()> {
         macos::uninstall_app_bundles(options)
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::uninstall_desktop_entries(options)
+    }
+
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         let _ = options;
         anyhow::bail!("当前平台暂不支持卸载 Codex++ 入口")
@@ -222,16 +246,23 @@ fn action_result(result: anyhow::Result<()>, success_message: &str) -> InstallAc
 }
 
 fn entrypoint_candidates(root: &Option<PathBuf>, manager: bool) -> Vec<PathBuf> {
-    let Some(root) = root else {
-        return Vec::new();
-    };
-    let name = if manager { MANAGER_NAME } else { SILENT_NAME };
-    if cfg!(windows) {
-        vec![root.join(format!("{name}.lnk"))]
-    } else if cfg!(target_os = "macos") {
-        vec![root.join(format!("{name}.app"))]
-    } else {
-        vec![root.join(format!("{name}.desktop"))]
+    #[cfg(target_os = "linux")]
+    {
+        return linux::desktop_entry_candidates(root, manager);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let Some(root) = root else {
+            return Vec::new();
+        };
+        let name = if manager { MANAGER_NAME } else { SILENT_NAME };
+        if cfg!(windows) {
+            vec![root.join(format!("{name}.lnk"))]
+        } else if cfg!(target_os = "macos") {
+            vec![root.join(format!("{name}.app"))]
+        } else {
+            vec![root.join(format!("{name}.desktop"))]
+        }
     }
 }
 

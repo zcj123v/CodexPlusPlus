@@ -514,6 +514,69 @@ pub fn codex_app_version(app_dir: &Path) -> Option<String> {
         .or_else(|| codex_directory_version(app_dir))
         .or_else(|| codex_version_file(package_dir))
         .or_else(|| codex_version_file(app_dir))
+        .or_else(|| electron_package_version(app_dir))
+}
+
+/// 社区 Linux 版 Codex 桌面应用以 Electron bundle 形式分发
+/// （resources/app 或 resources/app.asar），目录结构本身不含版本信息；
+/// 真实应用版本保存在 bundle 内的 package.json 中。
+fn electron_package_version(app_dir: &Path) -> Option<String> {
+    let resources = app_dir.join("resources");
+    package_json_version(&resources.join("app").join("package.json"))
+        .or_else(|| asar_package_version(&resources.join("app.asar")))
+}
+
+fn package_json_version(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    package_json_version_from_str(&text)
+}
+
+fn package_json_version_from_str(text: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()?
+        .get("version")?
+        .as_str()
+        .filter(|version| !version.is_empty())
+        .map(str::to_string)
+}
+
+// 大小上限用于防止损坏或恶意的 asar 触发超大读取。
+const ASAR_HEADER_MAX_BYTES: u64 = 32 * 1024 * 1024;
+const ASAR_PACKAGE_JSON_MAX_BYTES: u64 = 256 * 1024;
+
+/// 从 Electron asar 归档中读取根 package.json 的版本号。
+///
+/// asar 布局：u32 头长度字段的 pickle 大小、u32 头部 pickle 大小、
+/// u32 对齐后 JSON 长度、u32 JSON 长度、JSON 头，之后是文件数据。
+/// 头部 JSON 中的文件偏移量相对于数据区起点。
+fn asar_package_version(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut prefix = [0_u8; 16];
+    file.read_exact(&mut prefix).ok()?;
+    let header_pickle_size = u64::from(u32::from_le_bytes(prefix[4..8].try_into().ok()?));
+    let json_len = u64::from(u32::from_le_bytes(prefix[12..16].try_into().ok()?));
+    if json_len == 0
+        || json_len > ASAR_HEADER_MAX_BYTES
+        || header_pickle_size > ASAR_HEADER_MAX_BYTES + 8
+    {
+        return None;
+    }
+    let mut header = vec![0_u8; json_len as usize];
+    file.read_exact(&mut header).ok()?;
+    let header: serde_json::Value = serde_json::from_slice(&header).ok()?;
+    let entry = header.get("files")?.get("package.json")?;
+    let size = entry.get("size")?.as_u64()?;
+    let offset = entry.get("offset")?.as_str()?.parse::<u64>().ok()?;
+    if size == 0 || size > ASAR_PACKAGE_JSON_MAX_BYTES {
+        return None;
+    }
+    let data_start = 8 + header_pickle_size;
+    file.seek(SeekFrom::Start(data_start + offset)).ok()?;
+    let mut body = vec![0_u8; size as usize];
+    file.read_exact(&mut body).ok()?;
+    package_json_version_from_str(std::str::from_utf8(&body).ok()?)
 }
 
 pub fn packaged_app_user_model_id(app_dir: &Path) -> Option<String> {

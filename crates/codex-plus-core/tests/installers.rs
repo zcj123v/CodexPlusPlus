@@ -1,7 +1,8 @@
 use codex_plus_core::install::{
     InstallOptions, MANAGER_BUNDLE_ID, SILENT_BINARY, SILENT_BUNDLE_ID, app_bundle_names,
-    build_macos_app_bundle, build_windows_entrypoint_plan, companion_binary_path_from_exe,
-    default_install_root_strategy, macos_companion_bundle_identifier_from_exe, shortcut_names,
+    build_linux_desktop_entries, build_macos_app_bundle, build_windows_entrypoint_plan,
+    companion_binary_path_from_exe, default_install_root_strategy,
+    macos_companion_bundle_identifier_from_exe, shortcut_names,
 };
 
 #[test]
@@ -100,6 +101,58 @@ fn macos_bundle_metadata_contains_silent_and_manager_apps() {
 fn installer_exports_expected_two_entrypoint_names() {
     assert_eq!(shortcut_names(), ("Codex++.lnk", "Codex++ 管理工具.lnk"));
     assert_eq!(app_bundle_names(), ("Codex++.app", "Codex++ 管理工具.app"));
+}
+
+#[test]
+fn linux_desktop_entries_target_install_root_and_companion_binaries() {
+    let options = InstallOptions {
+        install_root: Some("/home/a/.local/share/applications".into()),
+        launcher_path: Some("/opt/Codex++/codex-plus-plus".into()),
+        manager_path: Some("/opt/Codex++/codex-plus-plus-manager".into()),
+        remove_owned_data: false,
+    };
+
+    let entries = build_linux_desktop_entries(&options);
+
+    assert_eq!(entries.len(), 2);
+    assert!(entries[0].file_path.ends_with("codex-plus-plus.desktop"));
+    assert!(
+        entries[1]
+            .file_path
+            .ends_with("codex-plus-plus-manager.desktop")
+    );
+    assert!(entries[0].contents.contains("Type=Application\n"));
+    assert!(entries[0].contents.contains("Name=Codex++\n"));
+    assert!(
+        entries[0]
+            .contents
+            .contains("Exec=/opt/Codex++/codex-plus-plus\n")
+    );
+    assert!(entries[0].contents.contains("Terminal=false\n"));
+    assert!(entries[1].contents.contains("Name=Codex++ 管理工具\n"));
+    assert!(
+        entries[1]
+            .contents
+            .contains("Exec=/opt/Codex++/codex-plus-plus-manager\n")
+    );
+}
+
+#[test]
+fn linux_desktop_entry_quotes_exec_path_containing_spaces() {
+    let options = InstallOptions {
+        install_root: Some("/home/a/.local/share/applications".into()),
+        launcher_path: Some("/home/a/My Apps/codex-plus-plus".into()),
+        manager_path: Some("/home/a/My Apps/codex-plus-plus-manager".into()),
+        remove_owned_data: false,
+    };
+
+    let entries = build_linux_desktop_entries(&options);
+
+    assert!(
+        entries[0]
+            .contents
+            .contains("Exec=\"/home/a/My Apps/codex-plus-plus\"\n")
+    );
 }
 
 #[test]
@@ -212,13 +265,15 @@ fn macos_bundle_does_not_wrap_the_bundle_executable_in_itself() {
 }
 
 #[test]
-fn windows_default_install_root_uses_known_folder_before_userprofile_desktop() {
+fn default_install_root_strategy_matches_platform() {
     let strategy = default_install_root_strategy();
 
     if cfg!(windows) {
         assert_eq!(strategy, "windows-known-folder");
     } else if cfg!(target_os = "macos") {
         assert_eq!(strategy, "macos-applications");
+    } else if cfg!(target_os = "linux") {
+        assert_eq!(strategy, "xdg-data-applications");
     } else {
         assert_eq!(strategy, "user-dirs-desktop");
     }
