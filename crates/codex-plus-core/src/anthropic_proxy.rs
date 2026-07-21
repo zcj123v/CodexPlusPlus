@@ -1142,10 +1142,25 @@ impl AnthropicSseToResponsesConverter {
             self.emit_invalid_sse(output);
             return;
         };
-        if delta
+        let invalid_stop_reason = delta
             .get("stop_reason")
-            .is_some_and(|value| !value.is_string())
+            .is_some_and(|value| !value.is_null() && !value.is_string());
+        let invalid_usage = usage.iter().any(|(key, value)| {
+            if value.is_null() {
+                return key == "output_tokens";
+            }
+            match key.as_str() {
+                "input_tokens"
+                | "cache_creation_input_tokens"
+                | "cache_read_input_tokens"
+                | "output_tokens" => !value.is_u64(),
+                "output_tokens_details" | "server_tool_use" => !value.is_object(),
+                _ => false,
+            }
+        });
+        if invalid_stop_reason
             || !usage.get("output_tokens").is_some_and(Value::is_u64)
+            || invalid_usage
         {
             self.emit_invalid_sse(output);
             return;
@@ -1158,7 +1173,9 @@ impl AnthropicSseToResponsesConverter {
             return;
         };
         for (key, value) in usage {
-            output_usage.insert(key.clone(), value.clone());
+            if !value.is_null() {
+                output_usage.insert(key.clone(), value.clone());
+            }
         }
         self.message_delta_seen = true;
     }
