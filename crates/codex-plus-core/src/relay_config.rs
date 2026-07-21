@@ -528,8 +528,7 @@ pub async fn test_relay_profile(
     let endpoint = match profile.protocol {
         RelayProtocol::Responses => format!("{base_url}/responses"),
         RelayProtocol::ChatCompletions => format!("{base_url}/chat/completions"),
-        // Task 5 统一接线 Anthropic 连通性测试
-        RelayProtocol::Anthropic => todo!(),
+        RelayProtocol::Anthropic => crate::protocol_proxy::anthropic_messages_url(base_url),
     };
     let test_model = model.trim();
     if test_model.is_empty() {
@@ -537,13 +536,26 @@ pub async fn test_relay_profile(
     }
 
     let payload = relay_profile_test_payload(profile.protocol, test_model);
-    let response = client
-        .post(&endpoint)
-        .bearer_auth(api_key)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .json(&payload)
-        .send()
-        .await?;
+    // Anthropic 上游要求 anthropic-version 头，缺失会直接 400
+    let anthropic_headers = |request: reqwest::RequestBuilder| {
+        if profile.protocol == RelayProtocol::Anthropic {
+            request.header(
+                "anthropic-version",
+                crate::anthropic_proxy::ANTHROPIC_VERSION,
+            )
+        } else {
+            request
+        }
+    };
+    let response = anthropic_headers(
+        client
+            .post(&endpoint)
+            .bearer_auth(api_key)
+            .header(reqwest::header::CONTENT_TYPE, "application/json"),
+    )
+    .json(&payload)
+    .send()
+    .await?;
     let http_status = response.status().as_u16();
 
     // 如果 404 且 base_url 末尾没有 /v1，尝试自动补 /v1 后再发一次。
@@ -554,16 +566,17 @@ pub async fn test_relay_profile(
         let v1_endpoint = match profile.protocol {
             RelayProtocol::Responses => format!("{v1_url}/responses"),
             RelayProtocol::ChatCompletions => format!("{v1_url}/chat/completions"),
-            // Task 5 统一接线 Anthropic 连通性测试
-            RelayProtocol::Anthropic => todo!(),
+            RelayProtocol::Anthropic => crate::protocol_proxy::anthropic_messages_url(&v1_url),
         };
-        let v1_response = client
-            .post(&v1_endpoint)
-            .bearer_auth(api_key)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&payload)
-            .send()
-            .await?;
+        let v1_response = anthropic_headers(
+            client
+                .post(&v1_endpoint)
+                .bearer_auth(api_key)
+                .header(reqwest::header::CONTENT_TYPE, "application/json"),
+        )
+        .json(&payload)
+        .send()
+        .await?;
         let v1_status = v1_response.status().as_u16();
         if v1_status < 400 {
             let response_text = v1_response.text().await.unwrap_or_default();
@@ -593,15 +606,14 @@ fn relay_profile_test_payload(protocol: RelayProtocol, model: &str) -> Value {
             "input": "hi",
             "max_output_tokens": 16
         }),
-        RelayProtocol::ChatCompletions => serde_json::json!({
+        // Chat Completions 与 Anthropic Messages 的探测负载同构（均要求 messages + max_tokens）
+        RelayProtocol::ChatCompletions | RelayProtocol::Anthropic => serde_json::json!({
             "model": model,
             "messages": [
                 { "role": "user", "content": "hi" }
             ],
             "max_tokens": 16
         }),
-        // Task 5 统一接线 Anthropic 连通性测试
-        RelayProtocol::Anthropic => todo!(),
     }
 }
 

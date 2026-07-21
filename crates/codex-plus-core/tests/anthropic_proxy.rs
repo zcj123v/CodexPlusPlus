@@ -351,3 +351,38 @@ fn no_completed_after_error_event() {
     assert!(names.contains(&"response.failed"));
     assert!(!names.contains(&"response.completed"));
 }
+
+#[test]
+fn anthropic_error_maps_to_responses_error() {
+    let body = br#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens is required"}}"#;
+    let error = codex_plus_core::anthropic_proxy::anthropic_error_to_responses_error(400, body);
+    assert_eq!(error["error"]["message"], "max_tokens is required");
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(error["error"]["code"], 400);
+}
+
+#[test]
+fn anthropic_error_falls_back_on_non_json() {
+    let error = codex_plus_core::anthropic_proxy::anthropic_error_to_responses_error(502, b"bad gateway");
+    assert_eq!(error["error"]["code"], 502);
+    assert!(error["error"]["message"].as_str().unwrap().contains("bad gateway"));
+}
+
+#[test]
+fn anthropic_request_builder_sets_auth_and_originator_headers() {
+    let client = reqwest::Client::new();
+    let builder = codex_plus_core::anthropic_proxy::anthropic_request_builder(
+        client,
+        "https://example.com/v1/messages",
+        "sk-test",
+        true,
+        &serde_json::json!({"model":"k3"}),
+        Some("codex_cli_rs"),
+    );
+    let request = builder.build().unwrap();
+    assert_eq!(request.headers()["x-api-key"], "sk-test");
+    assert_eq!(request.headers()["anthropic-version"], "2023-06-01");
+    assert_eq!(request.headers()["authorization"], "Bearer sk-test");
+    assert_eq!(request.headers()["originator"], "codex_cli_rs");
+    assert_eq!(request.headers()["accept"], "text/event-stream");
+}

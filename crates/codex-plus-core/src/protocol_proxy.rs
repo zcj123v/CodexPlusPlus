@@ -444,6 +444,50 @@ impl ChatSseToResponsesConverter {
     }
 }
 
+/// 按上游 wire API 分发的 SSE 转换器。
+pub enum ResponsesSseConverter {
+    Chat(ChatSseToResponsesConverter),
+    Anthropic(crate::anthropic_proxy::AnthropicSseToResponsesConverter),
+}
+
+impl ResponsesSseConverter {
+    pub fn for_wire_api(wire_api: UpstreamWireApi, request_json: Option<&Value>) -> Self {
+        match wire_api {
+            UpstreamWireApi::AnthropicMessages => Self::Anthropic(
+                crate::anthropic_proxy::AnthropicSseToResponsesConverter::with_request(
+                    &request_json.cloned().unwrap_or_else(|| json!({})),
+                ),
+            ),
+            _ => Self::Chat(
+                request_json
+                    .map(ChatSseToResponsesConverter::with_request)
+                    .unwrap_or_default(),
+            ),
+        }
+    }
+
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Chat(converter) => converter.push_bytes(bytes),
+            Self::Anthropic(converter) => converter.push_bytes(bytes),
+        }
+    }
+
+    pub fn finish(&mut self) -> Vec<u8> {
+        match self {
+            Self::Chat(converter) => converter.finish(),
+            Self::Anthropic(converter) => converter.finish(),
+        }
+    }
+
+    pub fn fail(&mut self, message: String, error_type: Option<String>) -> Vec<u8> {
+        match self {
+            Self::Chat(converter) => converter.fail(message, error_type),
+            Self::Anthropic(converter) => converter.fail(message, error_type),
+        }
+    }
+}
+
 pub fn is_responses_proxy_path(path: &str) -> bool {
     let path = path.split_once('?').map_or(path, |(path, _)| path);
     matches!(
@@ -492,23 +536,32 @@ pub fn is_audio_transcriptions_proxy_path(path: &str) -> bool {
 pub async fn open_responses_proxy_request(
     body: &str,
     original_user_agent: Option<&str>,
+    originator: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let settings = SettingsStore::default().load().unwrap_or_default();
-    open_responses_proxy_request_with_settings_and_user_agent(body, settings, original_user_agent)
-        .await
+    open_responses_proxy_request_with_settings_and_user_agent(
+        body,
+        settings,
+        original_user_agent,
+        originator,
+    )
+    .await
 }
 
 pub async fn open_responses_proxy_request_with_settings(
     body: &str,
     settings: crate::settings::BackendSettings,
+    originator: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
-    open_responses_proxy_request_with_settings_and_user_agent(body, settings, None).await
+    open_responses_proxy_request_with_settings_and_user_agent(body, settings, None, originator)
+        .await
 }
 
 async fn open_responses_proxy_request_with_settings_and_user_agent(
     body: &str,
     settings: crate::settings::BackendSettings,
     original_user_agent: Option<&str>,
+    originator: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let request_json: Value = serde_json::from_str(body)?;
     let is_stream = request_json
@@ -543,20 +596,29 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 "headerTimeoutSeconds": header_timeout.as_secs()
             }),
         );
-        let upstream = match send_upstream_request_for_responses(
-            upstream_request_builder(
-                crate::http_client::proxied_client(&effective_user_agent(
-                    &relay.user_agent,
-                    original_user_agent,
-                ))?,
+        let http_client = crate::http_client::proxied_client(&effective_user_agent(
+            &relay.user_agent,
+            original_user_agent,
+        ))?;
+        let request_builder = if wire_api == UpstreamWireApi::AnthropicMessages {
+            crate::anthropic_proxy::anthropic_request_builder(
+                http_client,
                 &endpoint,
                 relay.api_key.trim(),
                 is_stream,
                 &upstream_body,
-            ),
-            is_stream,
-        )
-        .await
+                originator,
+            )
+        } else {
+            upstream_request_builder(
+                http_client,
+                &endpoint,
+                relay.api_key.trim(),
+                is_stream,
+                &upstream_body,
+            )
+        };
+        let upstream = match send_upstream_request_for_responses(request_builder, is_stream).await
         {
             Ok(upstream) => upstream,
             Err(error) => {
@@ -799,74 +861,82 @@ async fn upstream_request_parts(
     relay: &crate::settings::RelayProfile,
     request_json: Value,
 ) -> anyhow::Result<(String, Value, UpstreamWireApi)> {
-    let mut body = match relay.protocol {
-        RelayProtocol::Responses => request_json,
-        RelayProtocol::ChatCompletions => responses_to_chat_completions(request_json)?,
-        // Task 5 统一接线 Anthropic 请求转换
-        RelayProtocol::Anthropic => todo!(),
-    };
+    match relay.protocol {
+        RelayProtocol::Responses => {
+            let mut body = request_json;
+            apply_image_handling(relay, &mut body).await;
+            Ok((responses_url(&relay.base_url), body, UpstreamWireApi::Responses))
+        }
+        RelayProtocol::ChatCompletions => {
+            let mut body = responses_to_chat_completions(request_json)?;
+            apply_image_handling(relay, &mut body).await;
+            Ok((
+                chat_completions_url(&relay.base_url),
+                body,
+                UpstreamWireApi::ChatCompletions,
+            ))
+        }
+        RelayProtocol::Anthropic => {
+            // 图片处理在转换前的 Responses 格式 body 上做（vision 支持 input key）
+            let mut responses_body = request_json;
+            apply_image_handling(relay, &mut responses_body).await;
+            let body = crate::anthropic_proxy::responses_to_anthropic_messages(&responses_body)?;
+            Ok((
+                anthropic_messages_url(&relay.base_url),
+                body,
+                UpstreamWireApi::AnthropicMessages,
+            ))
+        }
+    }
+}
 
-    // Image handling (per-model): send-as-is / strip / VLM analysis
+/// 按 profile 的 modelVlm 配置处理图片：透传 / 剥离 / VLM 描述注入。
+/// 从原 upstream_request_parts 中提取，逻辑不变。
+async fn apply_image_handling(relay: &crate::settings::RelayProfile, body: &mut Value) {
     let model = body
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    if !model.is_empty() {
-        use crate::vision::ImageHandling;
-        match crate::vision::image_handling_mode(&model, &relay.model_vlm) {
-            ImageHandling::SendAsIs => { /* 不做任何处理 */ }
-            ImageHandling::Strip => {
-                for key in &["messages", "input"] {
-                    if let Some(arr) = body.get_mut(key).and_then(Value::as_array_mut) {
-                        crate::vision::strip_images_only(arr);
-                    }
+    if model.is_empty() {
+        return;
+    }
+    use crate::vision::ImageHandling;
+    match crate::vision::image_handling_mode(&model, &relay.model_vlm) {
+        ImageHandling::SendAsIs => { /* 不做任何处理 */ }
+        ImageHandling::Strip => {
+            for key in &["messages", "input"] {
+                if let Some(arr) = body.get_mut(key).and_then(Value::as_array_mut) {
+                    crate::vision::strip_images_only(arr);
                 }
             }
-            ImageHandling::Vlm => {
-                if !relay.vlm_api_key.is_empty()
-                    && !relay.vlm_model.is_empty()
-                    && !relay.vlm_base_url.is_empty()
-                {
-                    let vlm_config = crate::vision::VlmConfig {
-                        api_key: relay.vlm_api_key.clone(),
-                        model: relay.vlm_model.clone(),
-                        base_url: relay.vlm_base_url.clone(),
-                    };
+        }
+        ImageHandling::Vlm => {
+            if !relay.vlm_api_key.is_empty()
+                && !relay.vlm_model.is_empty()
+                && !relay.vlm_base_url.is_empty()
+            {
+                let vlm_config = crate::vision::VlmConfig {
+                    api_key: relay.vlm_api_key.clone(),
+                    model: relay.vlm_model.clone(),
+                    base_url: relay.vlm_base_url.clone(),
+                };
 
-                    for key in &["messages", "input"] {
-                        if let Some(arr) = body.get_mut(key).and_then(Value::as_array_mut) {
-                            crate::vision::strip_image_blocks(
-                                arr,
-                                &vlm_config,
-                                &relay.model_windows,
-                                &relay.context_window,
-                                &model,
-                            )
-                            .await;
-                        }
+                for key in &["messages", "input"] {
+                    if let Some(arr) = body.get_mut(key).and_then(Value::as_array_mut) {
+                        crate::vision::strip_image_blocks(
+                            arr,
+                            &vlm_config,
+                            &relay.model_windows,
+                            &relay.context_window,
+                            &model,
+                        )
+                        .await;
                     }
                 }
             }
         }
     }
-
-    let wire_api = match relay.protocol {
-        RelayProtocol::Responses => UpstreamWireApi::Responses,
-        RelayProtocol::ChatCompletions => UpstreamWireApi::ChatCompletions,
-        // Task 5 统一接线 Anthropic 上游
-        RelayProtocol::Anthropic => todo!(),
-    };
-    Ok((
-        match relay.protocol {
-            RelayProtocol::Responses => responses_url(&relay.base_url),
-            RelayProtocol::ChatCompletions => chat_completions_url(&relay.base_url),
-            // Task 5 统一接线 Anthropic 上游
-            RelayProtocol::Anthropic => todo!(),
-        },
-        body,
-        wire_api,
-    ))
 }
 
 fn upstream_request_builder(
@@ -924,7 +994,7 @@ fn effective_user_agent(configured_user_agent: &str, original_user_agent: Option
 
 pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyHttpResponse> {
     let request_json: Value = serde_json::from_str(body)?;
-    let upstream = open_responses_proxy_request(body, None).await?;
+    let upstream = open_responses_proxy_request(body, None, None).await?;
     let status_code = upstream.status_code;
     let upstream_content_type = upstream.content_type.clone();
     let is_stream = upstream.is_stream;
@@ -932,8 +1002,11 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
     let upstream_body = upstream.response.bytes().await?;
 
     if !(200..300).contains(&status_code) {
-        let error =
-            responses_error_from_upstream(status_code, &upstream_content_type, &upstream_body);
+        let error = if wire_api == UpstreamWireApi::AnthropicMessages {
+            crate::anthropic_proxy::anthropic_error_to_responses_error(status_code, &upstream_body)
+        } else {
+            responses_error_from_upstream(status_code, &upstream_content_type, &upstream_body)
+        };
         return Ok(ProxyHttpResponse {
             status: http_status_line(status_code),
             content_type: "application/json; charset=utf-8".to_string(),
@@ -955,15 +1028,22 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
 
     if is_stream {
         let text = String::from_utf8_lossy(&upstream_body);
+        let mut converter = ResponsesSseConverter::for_wire_api(wire_api, Some(&request_json));
+        let mut output = converter.push_bytes(text.as_bytes());
+        output.extend(converter.finish());
         return Ok(ProxyHttpResponse {
             status: "200 OK".to_string(),
             content_type: "text/event-stream; charset=utf-8".to_string(),
-            body: chat_sse_to_responses_sse_with_request(&text, &request_json).into_bytes(),
+            body: output,
         });
     }
 
-    let chat_json: Value = serde_json::from_slice(&upstream_body)?;
-    let response_json = chat_completion_to_response_with_request(chat_json, &request_json)?;
+    let upstream_json: Value = serde_json::from_slice(&upstream_body)?;
+    let response_json = if wire_api == UpstreamWireApi::AnthropicMessages {
+        crate::anthropic_proxy::anthropic_message_to_response(&upstream_json, Some(&request_json))?
+    } else {
+        chat_completion_to_response_with_request(upstream_json, &request_json)?
+    };
     Ok(ProxyHttpResponse {
         status: "200 OK".to_string(),
         content_type: "application/json; charset=utf-8".to_string(),

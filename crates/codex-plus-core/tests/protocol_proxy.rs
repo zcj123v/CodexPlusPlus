@@ -1403,6 +1403,7 @@ async fn aggregate_proxy_fails_over_to_next_member_in_same_request() {
     let result = open_responses_proxy_request_with_settings(
         r#"{"model":"gpt-5-mini","input":"hi","stream":false}"#,
         settings,
+        None,
     )
     .await
     .unwrap();
@@ -1451,6 +1452,7 @@ async fn aggregate_stream_request_sends_sse_accept_header() {
     let result = open_responses_proxy_request_with_settings(
         r#"{"model":"gpt-5-mini","input":"hi","stream":true}"#,
         settings,
+        None,
     )
     .await
     .unwrap();
@@ -1646,6 +1648,7 @@ async fn responses_proxy_passes_through_original_user_agent_when_unconfigured() 
     let upstream = open_responses_proxy_request(
         r#"{"model":"gpt-5.5","input":"hello","stream":false}"#,
         Some("Original-Codex-UA/1.0"),
+        None,
     )
     .await
     .unwrap();
