@@ -282,6 +282,49 @@ pub struct ProxyHttpResponse {
     pub body: Vec<u8>,
 }
 
+pub fn finalize_non_streaming_responses_response(
+    wire_api: UpstreamWireApi,
+    upstream_content_type: &str,
+    upstream_body: &[u8],
+    original_request: Option<&Value>,
+) -> anyhow::Result<ProxyHttpResponse> {
+    if wire_api == UpstreamWireApi::Responses {
+        return Ok(ProxyHttpResponse {
+            status: "200 OK".to_string(),
+            content_type: if upstream_content_type.is_empty() {
+                "application/json; charset=utf-8".to_string()
+            } else {
+                upstream_content_type.to_string()
+            },
+            body: upstream_body.to_vec(),
+        });
+    }
+
+    let upstream_json: Value = serde_json::from_slice(upstream_body)?;
+    let response_json = match wire_api {
+        UpstreamWireApi::AnthropicMessages => {
+            crate::anthropic_proxy::anthropic_message_to_response(&upstream_json, original_request)?
+        }
+        UpstreamWireApi::ChatCompletions => {
+            if let Some(original_request) = original_request {
+                chat_completion_to_response_with_request(upstream_json, original_request)?
+            } else {
+                chat_completion_to_response(upstream_json)?
+            }
+        }
+        UpstreamWireApi::Responses => unreachable!("handled above"),
+        UpstreamWireApi::AudioTranscriptions => {
+            anyhow::bail!("audio transcriptions cannot be finalized as a Responses response")
+        }
+    };
+
+    Ok(ProxyHttpResponse {
+        status: "200 OK".to_string(),
+        content_type: "application/json; charset=utf-8".to_string(),
+        body: serde_json::to_vec(&response_json)?,
+    })
+}
+
 pub struct UpstreamProxyResponse {
     pub status_code: u16,
     pub content_type: String,
@@ -618,8 +661,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 &upstream_body,
             )
         };
-        let upstream = match send_upstream_request_for_responses(request_builder, is_stream).await
-        {
+        let upstream = match send_upstream_request_for_responses(request_builder, is_stream).await {
             Ok(upstream) => upstream,
             Err(error) => {
                 let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -885,7 +927,11 @@ async fn upstream_request_parts(
         RelayProtocol::Responses => {
             let mut body = request_json;
             apply_image_handling(relay, &mut body).await;
-            Ok((responses_url(&relay.base_url), body, UpstreamWireApi::Responses))
+            Ok((
+                responses_url(&relay.base_url),
+                body,
+                UpstreamWireApi::Responses,
+            ))
         }
         RelayProtocol::ChatCompletions => {
             let mut body = responses_to_chat_completions(request_json)?;
@@ -1035,15 +1081,12 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
     }
 
     if wire_api == UpstreamWireApi::Responses {
-        return Ok(ProxyHttpResponse {
-            status: "200 OK".to_string(),
-            content_type: if upstream_content_type.is_empty() {
-                "application/json; charset=utf-8".to_string()
-            } else {
-                upstream_content_type
-            },
-            body: upstream_body.to_vec(),
-        });
+        return finalize_non_streaming_responses_response(
+            wire_api,
+            &upstream_content_type,
+            &upstream_body,
+            Some(&request_json),
+        );
     }
 
     if is_stream {
@@ -1058,17 +1101,12 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
         });
     }
 
-    let upstream_json: Value = serde_json::from_slice(&upstream_body)?;
-    let response_json = if wire_api == UpstreamWireApi::AnthropicMessages {
-        crate::anthropic_proxy::anthropic_message_to_response(&upstream_json, Some(&request_json))?
-    } else {
-        chat_completion_to_response_with_request(upstream_json, &request_json)?
-    };
-    Ok(ProxyHttpResponse {
-        status: "200 OK".to_string(),
-        content_type: "application/json; charset=utf-8".to_string(),
-        body: serde_json::to_vec(&response_json)?,
-    })
+    finalize_non_streaming_responses_response(
+        wire_api,
+        &upstream_content_type,
+        &upstream_body,
+        Some(&request_json),
+    )
 }
 
 pub fn chat_completions_url(base_url: &str) -> String {

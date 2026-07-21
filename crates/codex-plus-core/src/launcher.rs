@@ -1413,19 +1413,19 @@ async fn handle_protocol_proxy_connection(
         let status = upstream.status();
         let upstream_content_type = upstream.content_type.clone();
         let upstream_body = upstream.response.bytes().await?.to_vec();
-        let error = if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages
-        {
-            crate::anthropic_proxy::anthropic_error_to_responses_error(
-                upstream.status_code,
-                &upstream_body,
-            )
-        } else {
-            crate::protocol_proxy::responses_error_from_upstream(
-                upstream.status_code,
-                &upstream_content_type,
-                &upstream_body,
-            )
-        };
+        let error =
+            if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages {
+                crate::anthropic_proxy::anthropic_error_to_responses_error(
+                    upstream.status_code,
+                    &upstream_body,
+                )
+            } else {
+                crate::protocol_proxy::responses_error_from_upstream(
+                    upstream.status_code,
+                    &upstream_content_type,
+                    &upstream_body,
+                )
+            };
         let body = serde_json::to_vec(&error)?;
         write_http_response(stream, &status, "application/json; charset=utf-8", &body).await?;
         log_helper_response(
@@ -1503,48 +1503,24 @@ async fn handle_protocol_proxy_connection(
         return Ok(());
     }
     let upstream_body = upstream.response.bytes().await?;
-    if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
-        write_http_response(
-            stream,
-            "200 OK",
-            if upstream.content_type.is_empty() {
-                "application/json; charset=utf-8"
-            } else {
-                &upstream.content_type
-            },
-            &upstream_body,
-        )
-        .await?;
-        log_helper_response(
-            "helper.protocol_proxy_ok",
-            method,
-            path,
-            "200 OK",
-            remote_addr_text,
-        );
-        stream.shutdown().await?;
-        return Ok(());
-    }
-    let upstream_json: serde_json::Value = serde_json::from_slice(&upstream_body)?;
-    let response_json = if upstream.wire_api
-        == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages
-    {
-        crate::anthropic_proxy::anthropic_message_to_response(
-            &upstream_json,
-            request_json.as_ref(),
-        )?
-    } else if let Some(request_json) = request_json.as_ref() {
-        crate::protocol_proxy::chat_completion_to_response_with_request(upstream_json, request_json)?
-    } else {
-        crate::protocol_proxy::chat_completion_to_response(upstream_json)?
-    };
-    let body = serde_json::to_vec(&response_json)?;
-    write_http_response(stream, "200 OK", "application/json; charset=utf-8", &body).await?;
+    let response = crate::protocol_proxy::finalize_non_streaming_responses_response(
+        upstream.wire_api,
+        &upstream.content_type,
+        &upstream_body,
+        request_json.as_ref(),
+    )?;
+    write_http_response(
+        stream,
+        &response.status,
+        &response.content_type,
+        &response.body,
+    )
+    .await?;
     log_helper_response(
         "helper.protocol_proxy_ok",
         method,
         path,
-        "200 OK",
+        &response.status,
         remote_addr_text,
     );
     stream.shutdown().await?;
