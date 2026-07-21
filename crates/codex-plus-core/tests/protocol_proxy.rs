@@ -1837,6 +1837,7 @@ async fn aggregate_proxy_fails_over_to_next_member_in_same_request() {
     let result = open_responses_proxy_request_with_settings(
         r#"{"model":"gpt-5-mini","input":"hi","stream":false}"#,
         settings,
+        None,
     )
     .await
     .unwrap();
@@ -1889,7 +1890,7 @@ async fn model_route_uses_target_responses_provider_without_mutating_request() {
     });
     let settings = model_route_settings("gpt-5.6-luna", "", format!("http://{target_addr}/v1"));
 
-    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings, None)
         .await
         .unwrap();
     assert_eq!(result.status_code, 200);
@@ -1951,7 +1952,7 @@ async fn model_route_can_rewrite_only_the_target_model_name() {
         format!("http://{target_addr}/v1"),
     );
 
-    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings, None)
         .await
         .unwrap();
     assert_eq!(result.status_code, 200);
@@ -1989,7 +1990,7 @@ async fn responses_proxy_normalizes_legacy_custom_tool_item_ids_only() {
     });
     let settings = model_route_settings("gpt-5.6-luna", "", format!("http://{target_addr}/v1"));
 
-    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings, None)
         .await
         .unwrap();
     assert_eq!(result.status_code, 200);
@@ -2045,7 +2046,7 @@ async fn model_route_uses_exact_match_and_keeps_other_models_on_source_provider(
         model_route_settings("gpt-5.6-luna", "", "http://127.0.0.1:9/v1".to_string());
     settings.relay_profiles[0].base_url = format!("http://{source_addr}/v1");
 
-    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings, None)
         .await
         .unwrap();
     assert_eq!(result.status_code, 200);
@@ -2066,6 +2067,7 @@ async fn model_route_rejects_missing_or_non_responses_targets() {
     let error = open_responses_proxy_request_with_settings(
         r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
         missing,
+        None,
     )
     .await
     .err()
@@ -2077,6 +2079,7 @@ async fn model_route_rejects_missing_or_non_responses_targets() {
     let error = open_responses_proxy_request_with_settings(
         r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
         chat,
+        None,
     )
     .await
     .err()
@@ -2121,6 +2124,7 @@ async fn aggregate_stream_request_sends_sse_accept_header() {
     let result = open_responses_proxy_request_with_settings(
         r#"{"model":"gpt-5-mini","input":"hi","stream":true}"#,
         settings,
+        None,
     )
     .await
     .unwrap();
@@ -2405,6 +2409,7 @@ async fn responses_proxy_passes_through_original_user_agent_when_unconfigured() 
     let upstream = open_responses_proxy_request(
         r#"{"model":"gpt-5.5","input":"hello","stream":false}"#,
         Some("Original-Codex-UA/1.0"),
+        None,
     )
     .await
     .unwrap();
