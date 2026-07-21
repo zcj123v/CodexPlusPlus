@@ -536,13 +536,17 @@ pub async fn test_relay_profile(
     }
 
     let payload = relay_profile_test_payload(profile.protocol, test_model);
-    // Anthropic 上游要求 anthropic-version 头，缺失会直接 400
+    // Anthropic 上游要求 anthropic-version 头，缺失会直接 400；
+    // 原生 Anthropic 端点靠 x-api-key 认证，缺失会 401，
+    // 与主代理路径（anthropic_request_builder）保持一致，三头同发。
     let anthropic_headers = |request: reqwest::RequestBuilder| {
         if profile.protocol == RelayProtocol::Anthropic {
-            request.header(
-                "anthropic-version",
-                crate::anthropic_proxy::ANTHROPIC_VERSION,
-            )
+            request
+                .header(
+                    "anthropic-version",
+                    crate::anthropic_proxy::ANTHROPIC_VERSION,
+                )
+                .header("x-api-key", api_key)
         } else {
             request
         }
