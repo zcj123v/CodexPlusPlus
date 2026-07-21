@@ -792,3 +792,65 @@ impl AnthropicSseToResponsesConverter {
         }));
     }
 }
+
+/// Anthropic 上游请求构造：三头认证（x-api-key + anthropic-version + Bearer）。
+/// originator 非空时透传给上游（spec 硬约束：codex 的 originator 头需保留）。
+pub fn anthropic_request_builder(
+    client: reqwest::Client,
+    endpoint: &str,
+    api_key: &str,
+    is_stream: bool,
+    upstream_body: &Value,
+    originator: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let mut builder = client
+        .post(endpoint)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .bearer_auth(api_key)
+        .header(reqwest::header::CONTENT_TYPE, "application/json");
+    if is_stream {
+        builder = builder
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .header(reqwest::header::CACHE_CONTROL, "no-cache");
+    }
+    if let Some(originator) = originator.map(str::trim).filter(|value| !value.is_empty()) {
+        builder = builder.header("originator", originator);
+    }
+    builder.json(upstream_body)
+}
+
+/// Anthropic 错误体 → codex Responses 错误结构。
+pub fn anthropic_error_to_responses_error(status_code: u16, body: &[u8]) -> Value {
+    let parsed = serde_json::from_slice::<Value>(body).ok();
+    let (message, error_type) = parsed
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .map(|error| {
+            (
+                error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("upstream error")
+                    .to_string(),
+                error
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("upstream_error")
+                    .to_string(),
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                String::from_utf8_lossy(body).chars().take(256).collect(),
+                "upstream_error".to_string(),
+            )
+        });
+    json!({
+        "error": {
+            "message": message,
+            "type": error_type,
+            "code": status_code,
+        }
+    })
+}
