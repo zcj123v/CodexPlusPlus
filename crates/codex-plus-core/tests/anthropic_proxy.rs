@@ -98,7 +98,7 @@ fn tools_schema_cloned_verbatim() {
     });
     let body = json!({
         "model": "k3",
-        "input": [],
+        "input": "schema test",
         "tools": [{"type":"function","name":"shell","description":"run cmd","parameters":params.clone()}]
     });
     let out = responses_to_anthropic_messages(&body).unwrap();
@@ -133,14 +133,14 @@ fn converts_input_image_data_url() {
 
 #[test]
 fn maps_reasoning_effort_to_thinking_budget() {
-    let body = json!({"model":"k3","input":[],"reasoning":{"effort":"high"}});
+    let body = json!({"model":"k3","input":"budget","reasoning":{"effort":"high"}});
     let out = responses_to_anthropic_messages(&body).unwrap();
     assert_eq!(
         out["thinking"],
         json!({"type":"enabled","budget_tokens":16384})
     );
 
-    let body = json!({"model":"k3","input":[],"reasoning":{"effort":"none"}});
+    let body = json!({"model":"k3","input":"budget","reasoning":{"effort":"none"}});
     let out = responses_to_anthropic_messages(&body).unwrap();
     assert!(out.get("thinking").is_none());
 }
@@ -224,6 +224,21 @@ fn event_names(events: &[(String, serde_json::Value)]) -> Vec<&str> {
 fn message_start(id: &str) -> String {
     format!(
         "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{id}\",\"model\":\"k3\",\"usage\":{{\"input_tokens\":1}}}}}}\n\n"
+    )
+}
+
+fn raw_message_stop() -> String {
+    sse_event("message_stop", json!({"type":"message_stop"}))
+}
+
+fn message_stop() -> String {
+    format!(
+        "{}{}",
+        sse_event(
+            "message_delta",
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
+        ),
+        raw_message_stop(),
     )
 }
 
@@ -357,6 +372,7 @@ fn split_utf8_across_chunks() {
         "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
         "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"中文\"}}\n\n",
         "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
         "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
     );
     let bytes = full.as_bytes();
@@ -435,6 +451,15 @@ fn anthropic_error_maps_to_responses_error() {
     assert_eq!(error["error"]["message"], "max_tokens is required");
     assert_eq!(error["error"]["type"], "invalid_request_error");
     assert_eq!(error["error"]["code"], 400);
+}
+
+#[test]
+fn anthropic_error_maps_string_error_without_losing_text() {
+    let body = br#"{"type":"error","error":"upstream refused the request"}"#;
+    let error = codex_plus_core::anthropic_proxy::anthropic_error_to_responses_error(502, body);
+    assert_eq!(error["error"]["message"], "upstream refused the request");
+    assert_eq!(error["error"]["type"], "upstream_error");
+    assert_eq!(error["error"]["code"], 502);
 }
 
 #[test]
@@ -765,8 +790,13 @@ async fn anthropic_responses_proxy_prefers_original_user_agent_over_profile_user
     assert_eq!(upstream.wire_api, UpstreamWireApi::AnthropicMessages);
 
     let request = join_server(&mut server, "Anthropic User-Agent mock server").await;
-    let (head, _) = request.split_once("\r\n\r\n").unwrap();
+    let (head, body) = request.split_once("\r\n\r\n").unwrap();
     assert!(head.starts_with("POST /v1/messages HTTP/1.1"), "{head}");
+    let sent: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(
+        sent["messages"],
+        json!([{"role":"user","content":[{"type":"text","text":"hello"}]}])
+    );
     assert_eq!(
         request_header_value(head, "user-agent"),
         "Original-Anthropic-UA/1.0"
@@ -1182,7 +1212,7 @@ fn stream_terminal_eof_and_post_terminal_rules() {
                 "message_delta",
                 json!({"type":"message_delta","delta":{"stop_reason":reason},"usage":{"output_tokens":2}}),
             ),
-            sse_event("message_stop", json!({"type":"message_stop"})),
+            raw_message_stop(),
         );
         let output = converter.push_bytes(stream.as_bytes());
         let events = collect_events(&output);
@@ -1210,7 +1240,7 @@ fn stream_terminal_eof_and_post_terminal_rules() {
         }
         assert!(
             converter
-                .push_bytes(sse_event("message_stop", json!({"type":"message_stop"})).as_bytes())
+                .push_bytes(raw_message_stop().as_bytes())
                 .is_empty()
         );
         assert!(
@@ -1445,7 +1475,7 @@ fn invalid_sse_validation_matrix() {
             "content_block_start",
             json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})
         ),
-        sse_event("message_stop", json!({"type":"message_stop"}))
+        message_stop()
     );
     assert_invalid_sse_event(&open, None);
 }
@@ -1458,7 +1488,7 @@ fn ping_unknown_and_block_index_rules() {
         sse_event("ping", json!({"type":"ping"})),
         sse_event("vendor", json!({"x":1})),
         message_start("ignored"),
-        sse_event("message_stop", json!({"type":"message_stop"}))
+        message_stop()
     );
     let mut out = c.push_bytes(stream.as_bytes());
     out.extend(c.finish());
@@ -1582,7 +1612,7 @@ fn completed_and_nonstream_echo_request_fields_and_done_output() {
             "content_block_stop",
             json!({"type":"content_block_stop","index":1})
         ),
-        sse_event("message_stop", json!({"type":"message_stop"}))
+        message_stop()
     );
     let mut out = c.push_bytes(stream.as_bytes());
     out.extend(c.finish());
@@ -1609,10 +1639,20 @@ fn completed_and_nonstream_echo_request_fields_and_done_output() {
 #[test]
 fn function_call_output_normalization() {
     for (output, expected) in [
-        (json!("unchanged"), "unchanged"),
-        (serde_json::Value::Null, ""),
-        (json!({"b":[2,true],"a":1}), "{\"a\":1,\"b\":[2,true]}"),
-        (json!([1, "x", false]), "[1,\"x\",false]"),
+        (json!("unchanged"), json!("unchanged")),
+        (serde_json::Value::Null, json!("")),
+        (
+            json!({"b":[2,true],"a":1}),
+            json!("{\"a\":1,\"b\":[2,true]}"),
+        ),
+        (
+            json!([1, "x", false]),
+            json!([
+                {"type":"text","text":"1"},
+                {"type":"text","text":"\"x\""},
+                {"type":"text","text":"false"}
+            ]),
+        ),
     ] {
         let converted = responses_to_anthropic_messages(
             &json!({"input":[{"type":"function_call_output","call_id":"c1","output":output}]}),
@@ -1668,7 +1708,7 @@ fn signed_reasoning_and_thinking_lifecycle() {
             "content_block_stop",
             json!({"type":"content_block_stop","index":3})
         ),
-        sse_event("message_stop", json!({"type":"message_stop"}))
+        message_stop()
     );
     let mut out = c.push_bytes(stream.as_bytes());
     out.extend(c.finish());
@@ -1715,7 +1755,7 @@ fn thinking_signature_may_arrive_only_in_delta() {
             "content_block_stop",
             json!({"type":"content_block_stop","index":0}),
         ),
-        sse_event("message_stop", json!({"type":"message_stop"})),
+        message_stop(),
     );
     let mut out = converter.push_bytes(stream.as_bytes());
     out.extend(converter.finish());
@@ -1731,21 +1771,27 @@ fn thinking_signature_may_arrive_only_in_delta() {
     let mut converter = AnthropicSseToResponsesConverter::with_request(&json!({}));
     let stream = format!(
         "{}{}{}{}",
-        message_start("msg_empty_signature"),
+        message_start("msg_missing_signature"),
         sse_event(
             "content_block_start",
-            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"why","signature":""}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"why"}}),
         ),
         sse_event(
             "content_block_stop",
             json!({"type":"content_block_stop","index":0}),
         ),
-        sse_event("message_stop", json!({"type":"message_stop"})),
+        message_stop(),
     );
     let mut out = converter.push_bytes(stream.as_bytes());
     out.extend(converter.finish());
     let events = collect_events(&out);
-    assert_eq!(completed_response(&events)["output"][0]["signature"], "");
+    let item = &completed_response(&events)["output"][0];
+    assert!(item.get("signature").is_none());
+    let replay = responses_to_anthropic_messages(&json!({"input":[item]})).unwrap();
+    assert_eq!(
+        replay["messages"][0]["content"][0],
+        json!({"type":"thinking","thinking":"why"})
+    );
 }
 
 #[test]
@@ -1763,11 +1809,7 @@ fn missing_message_start_usage_fails_immediately_and_stays_failed() {
         "invalid_sse_event"
     );
 
-    let later = format!(
-        "{}{}",
-        message_start("msg_later"),
-        sse_event("message_stop", json!({"type":"message_stop"})),
-    );
+    let later = format!("{}{}", message_start("msg_later"), message_stop(),);
     assert!(converter.push_bytes(later.as_bytes()).is_empty());
     assert!(converter.finish().is_empty());
 }
@@ -1775,11 +1817,7 @@ fn missing_message_start_usage_fails_immediately_and_stays_failed() {
 #[test]
 fn stream_response_created_at_is_present_and_stable() {
     let mut converter = AnthropicSseToResponsesConverter::with_request(&json!({}));
-    let stream = format!(
-        "{}{}",
-        message_start("msg_created_at"),
-        sse_event("message_stop", json!({"type":"message_stop"})),
-    );
+    let stream = format!("{}{}", message_start("msg_created_at"), message_stop(),);
     let mut out = converter.push_bytes(stream.as_bytes());
     out.extend(converter.finish());
     let events = collect_events(&out);
@@ -1820,7 +1858,7 @@ fn tool_use_start_input_is_fallback_when_no_delta_arrives() {
             "content_block_stop",
             json!({"type":"content_block_stop","index":0}),
         ),
-        sse_event("message_stop", json!({"type":"message_stop"})),
+        message_stop(),
     );
     let mut out = converter.push_bytes(stream.as_bytes());
     out.extend(converter.finish());
@@ -1851,7 +1889,7 @@ fn tool_use_start_input_is_fallback_when_no_delta_arrives() {
             "content_block_stop",
             json!({"type":"content_block_stop","index":0}),
         ),
-        sse_event("message_stop", json!({"type":"message_stop"})),
+        message_stop(),
     );
     let mut out = converter.push_bytes(stream.as_bytes());
     out.extend(converter.finish());
@@ -1952,7 +1990,7 @@ fn item_ids_unique_and_stable_nonstream_and_sse() {
                 "content_block_stop",
                 json!({"type":"content_block_stop","index":7})
             ),
-            sse_event("message_stop", json!({"type":"message_stop"}))
+            message_stop()
         );
         let mut out = c.push_bytes(stream.as_bytes());
         out.extend(c.finish());
@@ -1982,12 +2020,8 @@ fn item_ids_unique_and_stable_nonstream_and_sse() {
 
 #[test]
 fn empty_input_and_tool_descriptions_are_safe() {
-    let empty = responses_to_anthropic_messages(&json!({"input":[]})).unwrap();
-    assert_eq!(
-        empty["messages"],
-        json!([{"role":"user","content":[{"type":"text","text":""}]}])
-    );
-    let converted=responses_to_anthropic_messages(&json!({"input":[],"tools":[{"type":"function","name":"missing","parameters":{}},{"type":"function","name":"null","description":null,"parameters":{}},{"type":"function","name":"verbatim","description":"  keep spacing  ","parameters":{}}]})).unwrap();
+    assert!(responses_to_anthropic_messages(&json!({"input":[]})).is_err());
+    let converted=responses_to_anthropic_messages(&json!({"input":"tool descriptions","tools":[{"type":"function","name":"missing","parameters":{}},{"type":"function","name":"null","description":null,"parameters":{}},{"type":"function","name":"verbatim","description":"  keep spacing  ","parameters":{}}]})).unwrap();
     assert!(converted["tools"][0].get("description").is_none());
     assert!(converted["tools"][1].get("description").is_none());
     assert_eq!(converted["tools"][2]["description"], "  keep spacing  ");
@@ -2047,4 +2081,376 @@ fn model_created_at_strict_rfc3339_calendar_validation() {
         &json!({"data":[{"type":"model","id":"z","created_at":"2024-02-29T00:00:00Z"},{"type":"model","id":"o","created_at":"2024-02-29T08:00:00+08:00"}]}),
     );
     assert_eq!(equal["data"][0]["created"], equal["data"][1]["created"]);
+}
+
+#[test]
+fn responses_string_input_and_validation() {
+    let converted = responses_to_anthropic_messages(&json!({"input":"hello"})).unwrap();
+    assert_eq!(
+        converted["messages"],
+        json!([{"role":"user","content":[{"type":"text","text":"hello"}]}])
+    );
+    for body in [
+        json!({"input":""}),
+        json!({"input":"   "}),
+        json!({"input":null}),
+        json!({"input":{}}),
+        json!({"input":7}),
+    ] {
+        let error = responses_to_anthropic_messages(&body)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("input"), "{error}");
+    }
+    assert!(responses_to_anthropic_messages(&json!({"input":[]})).is_err());
+}
+
+#[test]
+fn thinking_envelope_roundtrips_and_does_not_misread_opaque_ciphertext() {
+    let anthropic = json!({"id":"msg_envelope","model":"k3","stop_reason":"end_turn","usage":{},"content":[
+        {"type":"thinking","thinking":"private chain","signature":"sig-secret"},
+        {"type":"redacted_thinking","data":"redacted-secret"}
+    ]});
+    let response = anthropic_message_to_response(&anthropic, None).unwrap();
+    let output = response["output"].as_array().unwrap();
+    assert_eq!(output.len(), 2);
+    for item in output {
+        assert!(
+            item["encrypted_content"]
+                .as_str()
+                .unwrap()
+                .starts_with("codexplusplus-anthropic-v1:")
+        );
+    }
+    let replay = responses_to_anthropic_messages(&json!({"input":output})).unwrap();
+    assert_eq!(replay["messages"][0]["content"], anthropic["content"]);
+
+    let opaque = responses_to_anthropic_messages(&json!({"input":[{"type":"reasoning","encrypted_content":"ordinary-provider-ciphertext","summary":[{"text":"do not replay"}]}]})).unwrap_err();
+    assert!(opaque.to_string().contains("input"));
+    let prefixed_invalid = [
+        "codexplusplus-anthropic-v1:not-hex",
+        "codexplusplus-anthropic-v1:7b7d",
+        "codexplusplus-anthropic-v1:7b2274797065223a2274657874222c2274657874223a226e6f74207468696e6b696e67227d",
+        "codexplusplus-anthropic-v1:7b2274797065223a227468696e6b696e67222c227468696e6b696e67223a317d",
+        "codexplusplus-anthropic-v1:7b2274797065223a2272656461637465645f7468696e6b696e67222c2264617461223a317d",
+    ];
+    for encrypted_content in prefixed_invalid {
+        let result = responses_to_anthropic_messages(&json!({"input":[{
+            "type":"reasoning",
+            "encrypted_content":encrypted_content,
+            "signature":"must-not-fallback",
+            "summary":[{"text":"must not replay"}]
+        }]}));
+        assert!(
+            result.is_err(),
+            "accepted invalid envelope: {encrypted_content}"
+        );
+    }
+    let legacy = responses_to_anthropic_messages(&json!({"input":[{"type":"reasoning","signature":"legacy","summary":[{"text":"legacy thought"}]}]})).unwrap();
+    assert_eq!(
+        legacy["messages"][0]["content"][0],
+        json!({"type":"thinking","thinking":"legacy thought","signature":"legacy"})
+    );
+}
+
+#[test]
+fn streams_redacted_thinking_without_exposing_sensitive_data_and_replays_it() {
+    let secret = "opaque-redacted-secret";
+    let stream = format!(
+        "{}{}{}{}{}",
+        message_start("redacted"),
+        sse_event(
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":secret}}),
+        ),
+        sse_event(
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":0}),
+        ),
+        sse_event(
+            "message_delta",
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
+        ),
+        raw_message_stop(),
+    );
+    let mut converter = AnthropicSseToResponsesConverter::with_request(&json!({}));
+    let events = collect_events(&converter.push_bytes(stream.as_bytes()));
+    let names = event_names(&events);
+    assert!(!names.contains(&"response.reasoning_summary_part.added"));
+    assert!(!names.contains(&"response.reasoning_summary_text.delta"));
+    assert!(!names.contains(&"response.reasoning_summary_text.done"));
+    assert!(!names.contains(&"response.reasoning_summary_part.done"));
+
+    let response = completed_response(&events);
+    assert_eq!(response["output"][0]["summary"], json!([]));
+    let encrypted = response["output"][0]["encrypted_content"].as_str().unwrap();
+    assert!(encrypted.starts_with("codexplusplus-anthropic-v1:"));
+    assert!(!serde_json::to_string(&events).unwrap().contains(secret));
+
+    let replay = responses_to_anthropic_messages(&json!({"input":response["output"]})).unwrap();
+    assert_eq!(
+        replay["messages"][0]["content"],
+        json!([{"type":"redacted_thinking","data":secret}])
+    );
+}
+
+#[test]
+fn redacted_thinking_start_requires_string_data() {
+    let stream = format!(
+        "{}{}",
+        message_start("redacted-invalid"),
+        sse_event(
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":{"secret":true}}}),
+        ),
+    );
+    assert_invalid_sse_event(&stream, Some("secret"));
+}
+
+#[test]
+fn tool_choice_and_thinking_budget_boundaries() {
+    for (choice, expected) in [
+        (json!("auto"), json!({"type":"auto"})),
+        (json!("required"), json!({"type":"any"})),
+        (
+            json!({"type":"function","name":"lookup"}),
+            json!({"type":"tool","name":"lookup"}),
+        ),
+    ] {
+        let out = responses_to_anthropic_messages(&json!({"input":"hi","tools":[{"type":"function","name":"lookup","parameters":{}}],"tool_choice":choice})).unwrap();
+        assert_eq!(out["tool_choice"], expected);
+    }
+    let none = responses_to_anthropic_messages(&json!({"input":"hi","tools":[{"type":"function","name":"lookup","parameters":{}}],"tool_choice":"none"})).unwrap();
+    assert!(none.get("tools").is_none());
+    assert!(none.get("tool_choice").is_none());
+
+    for (max, effort, expected) in [
+        (1024, "high", None),
+        (1025, "high", Some(1024)),
+        (2048, "low", Some(1024)),
+        (8192, "medium", Some(7168)),
+        (32000, "high", Some(16384)),
+        (32000, "xhigh", Some(30976)),
+    ] {
+        let out = responses_to_anthropic_messages(
+            &json!({"input":"hi","max_output_tokens":max,"reasoning":{"effort":effort}}),
+        )
+        .unwrap();
+        assert_eq!(
+            out.get("thinking")
+                .and_then(|v| v["budget_tokens"].as_u64()),
+            expected,
+            "max={max} effort={effort}"
+        );
+        assert_eq!(out["max_tokens"], max);
+    }
+}
+
+#[test]
+fn explicit_tool_choice_disables_thinking_but_auto_can_coexist() {
+    let tools = json!([{"type":"function","name":"lookup","parameters":{}}]);
+    for (choice, expected) in [
+        (json!("required"), json!({"type":"any"})),
+        (
+            json!({"type":"function","name":"lookup"}),
+            json!({"type":"tool","name":"lookup"}),
+        ),
+    ] {
+        let out = responses_to_anthropic_messages(&json!({
+            "input":"hi",
+            "tools":tools,
+            "tool_choice":choice,
+            "reasoning":{"effort":"high"}
+        }))
+        .unwrap();
+        assert_eq!(out["tool_choice"], expected);
+        assert!(out.get("thinking").is_none());
+    }
+
+    let auto = responses_to_anthropic_messages(&json!({
+        "input":"hi",
+        "tools":tools,
+        "tool_choice":"auto",
+        "reasoning":{"effort":"high"}
+    }))
+    .unwrap();
+    assert_eq!(auto["tool_choice"], json!({"type":"auto"}));
+    assert_eq!(
+        auto["thinking"],
+        json!({"type":"enabled","budget_tokens":16384})
+    );
+}
+
+#[test]
+fn function_output_content_items_become_nested_tool_result_blocks() {
+    let out = responses_to_anthropic_messages(
+        &json!({"input":[{"type":"function_call_output","call_id":"c1","output":[
+            {"type":"input_text","text":"in"},{"type":"output_text","text":"out"},
+            {"type":"input_image","image_url":"data:image/png;base64,AAAA"},
+            {"type":"other","value":{"b":2,"a":1}}, 7
+        ]}]}),
+    )
+    .unwrap();
+    assert_eq!(
+        out["messages"][0]["content"][0]["content"],
+        json!([
+            {"type":"text","text":"in"},{"type":"text","text":"out"},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},
+            {"type":"text","text":"{\"type\":\"other\",\"value\":{\"a\":1,\"b\":2}}"},
+            {"type":"text","text":"7"}
+        ])
+    );
+}
+
+#[test]
+fn function_output_unknown_only_array_converts_each_item_and_empty_array_stays_empty() {
+    let unknown = responses_to_anthropic_messages(&json!({
+        "input":[{"type":"function_call_output","call_id":"c1","output":[
+            {"z":1,"a":2}, 7, true
+        ]}]
+    }))
+    .unwrap();
+    assert_eq!(
+        unknown["messages"][0]["content"][0]["content"],
+        json!([
+            {"type":"text","text":"{\"a\":2,\"z\":1}"},
+            {"type":"text","text":"7"},
+            {"type":"text","text":"true"}
+        ])
+    );
+
+    let empty = responses_to_anthropic_messages(&json!({
+        "input":[{"type":"function_call_output","call_id":"c2","output":[]}]
+    }))
+    .unwrap();
+    assert_eq!(empty["messages"][0]["content"][0]["content"], json!([]));
+}
+
+#[test]
+fn usage_rejects_invalid_values_and_saturates_extremes() {
+    for usage in [
+        json!({"input_tokens":-1}),
+        json!({"output_tokens":1.5}),
+        json!({"cache_read_input_tokens":"1"}),
+    ] {
+        assert!(anthropic_message_to_response(&json!({"content":[],"usage":usage}), None).is_err());
+    }
+    let max = u64::MAX;
+    let out = anthropic_message_to_response(&json!({"content":[],"usage":{"input_tokens":max,"output_tokens":max,"cache_read_input_tokens":max,"cache_creation_input_tokens":max}}), None).unwrap();
+    assert_eq!(out["usage"]["input_tokens"], max);
+    assert_eq!(out["usage"]["total_tokens"], max);
+}
+
+#[test]
+fn sse_rejects_starting_a_second_content_block_while_one_is_open() {
+    let stream = format!(
+        "{}{}{}",
+        message_start("overlap"),
+        sse_event(
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        ),
+        sse_event(
+            "content_block_start",
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+        ),
+    );
+    assert_invalid_sse_event(&stream, None);
+}
+
+#[test]
+fn sse_enforces_message_phase_and_saturating_usage() {
+    let block_start = sse_event(
+        "content_block_start",
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+    );
+    let block_stop = sse_event(
+        "content_block_stop",
+        json!({"type":"content_block_stop","index":0}),
+    );
+    for stream in [
+        format!("{}{}", message_start("a"), message_start("b")),
+        format!(
+            "{}{}{}",
+            message_start("a"),
+            block_start.clone(),
+            sse_event(
+                "message_delta",
+                json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}})
+            )
+        ),
+        format!(
+            "{}{}{}{}{}",
+            message_start("a"),
+            block_start.clone(),
+            block_stop.clone(),
+            sse_event(
+                "message_delta",
+                json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}})
+            ),
+            block_start.clone()
+        ),
+        format!(
+            "{}{}{}",
+            message_start("a"),
+            sse_event(
+                "message_delta",
+                json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}})
+            ),
+            sse_event(
+                "message_delta",
+                json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}})
+            )
+        ),
+    ] {
+        assert_invalid_sse_event(&stream, None);
+    }
+    assert_invalid_sse_event(
+        &sse_event("message_stop", json!({"type":"message_stop"})),
+        None,
+    );
+
+    let mut converter = AnthropicSseToResponsesConverter::with_request(&json!({}));
+    let stream = format!(
+        "{}{}{}",
+        sse_event(
+            "message_start",
+            json!({"type":"message_start","message":{"id":"max","model":"k3","usage":{"input_tokens":u64::MAX,"cache_read_input_tokens":u64::MAX}}})
+        ),
+        sse_event(
+            "message_delta",
+            json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":u64::MAX}})
+        ),
+        sse_event("message_stop", json!({"type":"message_stop"}))
+    );
+    let events = collect_events(&converter.push_bytes(stream.as_bytes()));
+    let response = &events
+        .iter()
+        .find(|(name, _)| name == "response.incomplete")
+        .unwrap()
+        .1["response"];
+    assert_eq!(response["usage"]["total_tokens"], u64::MAX);
+}
+
+#[test]
+fn sse_message_stop_requires_message_delta_and_invalid_final_usage_fails() {
+    let start_then_stop = format!("{}{}", message_start("missing_delta"), raw_message_stop(),);
+    assert_invalid_sse_event(&start_then_stop, None);
+
+    let mut converter = AnthropicSseToResponsesConverter::with_request(&json!({}));
+    let stream = format!(
+        "{}{}{}",
+        sse_event(
+            "message_start",
+            json!({"type":"message_start","message":{"id":"bad_usage","model":"k3","usage":{"input_tokens":"invalid"}}}),
+        ),
+        sse_event(
+            "message_delta",
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
+        ),
+        raw_message_stop(),
+    );
+    let events = collect_events(&converter.push_bytes(stream.as_bytes()));
+    assert_eq!(event_names(&events).last(), Some(&"response.failed"));
+    assert!(!event_names(&events).contains(&"response.completed"));
 }

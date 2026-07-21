@@ -1,13 +1,14 @@
 use codex_plus_core::protocol_proxy::{
-    ChatSseToResponsesConverter, UpstreamWireApi, audio_transcriptions_url,
-    chat_completion_to_response, chat_completion_to_response_with_request, chat_completions_url,
-    chat_sse_to_responses_sse, chat_sse_to_responses_sse_with_request,
-    finalize_non_streaming_responses_response, is_audio_transcriptions_proxy_path,
-    is_chat_completions_proxy_path, is_models_proxy_path, is_responses_proxy_path, models_url,
-    open_audio_transcriptions_proxy_request, open_chat_completions_proxy_request,
-    open_models_proxy_request, open_responses_proxy_request,
+    ChatSseToResponsesConverter, UpstreamWireApi, anthropic_messages_url, anthropic_models_url,
+    audio_transcriptions_url, chat_completion_to_response,
+    chat_completion_to_response_with_request, chat_completions_url, chat_sse_to_responses_sse,
+    chat_sse_to_responses_sse_with_request, finalize_non_streaming_responses_response,
+    is_audio_transcriptions_proxy_path, is_chat_completions_proxy_path, is_models_proxy_path,
+    is_responses_proxy_path, models_url, open_audio_transcriptions_proxy_request,
+    open_chat_completions_proxy_request, open_models_proxy_request,
+    open_models_proxy_request_with_originator, open_responses_proxy_request,
     open_responses_proxy_request_with_settings, responses_error_from_upstream,
-    responses_to_chat_completions, send_upstream_request_with_header_timeout,
+    responses_to_chat_completions, responses_url, send_upstream_request_with_header_timeout,
     upstream_header_timeout, upstream_http_client, upstream_stream_header_timeout,
 };
 use codex_plus_core::settings::{
@@ -1384,6 +1385,14 @@ fn models_url_normalizes_common_base_urls() {
         "https://api.example.test/v1/models"
     );
     assert_eq!(
+        models_url("https://api.example.test/v1/responses"),
+        "https://api.example.test/v1/models"
+    );
+    assert_eq!(
+        models_url("https://api.example.test/v1/messages"),
+        "https://api.example.test/v1/models"
+    );
+    assert_eq!(
         models_url("https://api.example.test/models"),
         "https://api.example.test/models"
     );
@@ -1399,6 +1408,88 @@ fn models_url_normalizes_common_base_urls() {
         models_url("https://api.example.test/openai#"),
         "https://api.example.test/openai/models"
     );
+}
+
+#[test]
+fn response_and_chat_urls_replace_complete_sibling_endpoints() {
+    assert_eq!(
+        responses_url("https://api.example.test/v1/chat/completions"),
+        "https://api.example.test/v1/responses"
+    );
+    assert_eq!(
+        responses_url("https://api.example.test/v1/messages"),
+        "https://api.example.test/v1/responses"
+    );
+    assert_eq!(
+        chat_completions_url("https://api.example.test/v1/responses"),
+        "https://api.example.test/v1/chat/completions"
+    );
+    assert_eq!(
+        chat_completions_url("https://api.example.test/v1/messages"),
+        "https://api.example.test/v1/chat/completions"
+    );
+    assert_eq!(
+        anthropic_messages_url("https://api.example.test/v1/models"),
+        "https://api.example.test/v1/messages"
+    );
+    assert_eq!(
+        anthropic_messages_url("https://api.example.test/v1/responses"),
+        "https://api.example.test/v1/messages"
+    );
+    assert_eq!(
+        anthropic_messages_url("https://api.example.test/v1/chat/completions"),
+        "https://api.example.test/v1/messages"
+    );
+    assert_eq!(
+        anthropic_models_url("https://api.example.test/v1/messages"),
+        "https://api.example.test/v1/models"
+    );
+    assert_eq!(
+        anthropic_models_url("https://api.example.test/v1/responses"),
+        "https://api.example.test/v1/models"
+    );
+    assert_eq!(
+        anthropic_models_url("https://api.example.test/v1/chat/completions"),
+        "https://api.example.test/v1/models"
+    );
+}
+
+#[test]
+fn chat_usage_rejects_invalid_numbers_and_saturates_extremes() {
+    for usage in [
+        json!({"prompt_tokens":-1}),
+        json!({"completion_tokens":1.5}),
+        json!({"cache_read_input_tokens":"1"}),
+        json!({"prompt_tokens_details":{"cached_tokens":-1}}),
+        json!({"input_tokens_details":{"cached_tokens":1.5}}),
+        json!({"cachedContentTokenCount":"1"}),
+        json!({"completion_tokens_details":{"reasoning_tokens":-1}}),
+        json!({"completion_tokens_details":{"accepted_prediction_tokens":1.5}}),
+        json!({"completion_tokens_details":{"rejected_prediction_tokens":"1"}}),
+        json!({"completion_tokens_details":{"audio_tokens":-1}}),
+    ] {
+        let result = chat_completion_to_response(
+            json!({"choices":[{"finish_reason":"stop","message":{}}],"usage":usage}),
+        );
+        assert!(result.is_err(), "accepted invalid usage: {usage}");
+    }
+    let details = chat_completion_to_response(json!({
+        "choices":[{"finish_reason":"stop","message":{}}],
+        "usage":{"prompt_tokens":10,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":3},"completion_tokens_details":{"reasoning_tokens":2,"accepted_prediction_tokens":1,"rejected_prediction_tokens":0,"audio_tokens":1}}
+    })).unwrap();
+    assert_eq!(details["usage"]["input_tokens"], 7);
+    assert_eq!(details["usage"]["input_tokens_details"]["cached_tokens"], 3);
+    assert_eq!(
+        details["usage"]["output_tokens_details"]["reasoning_tokens"],
+        2
+    );
+    let max = u64::MAX;
+    let converted = chat_completion_to_response(json!({
+        "choices":[{"finish_reason":"stop","message":{}}],
+        "usage":{"input_tokens":max,"output_tokens":max,"cache_read_input_tokens":max,"cache_creation_input_tokens":max}
+    })).unwrap();
+    assert_eq!(converted["usage"]["input_tokens"], max);
+    assert_eq!(converted["usage"]["total_tokens"], max);
 }
 
 #[test]
@@ -1824,37 +1915,85 @@ async fn responses_proxy_prefers_original_user_agent_over_configured_user_agent(
 }
 
 #[tokio::test]
-async fn models_proxy_passes_through_original_user_agent_when_unconfigured() {
-    let _lock = settings_path_test_lock().lock().unwrap();
-    let temp = tempfile::tempdir().unwrap();
-    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+async fn models_proxy_uses_passed_profile() {
     let server = spawn_chat_server();
-    write_chat_relay_settings(temp.path(), &server.base_url, "");
+    let profile = RelayProfile {
+        id: "models-direct".to_string(),
+        name: "Models Direct".to_string(),
+        base_url: server.base_url.clone(),
+        upstream_base_url: server.base_url.clone(),
+        api_key: "sk-test".to_string(),
+        protocol: codex_plus_core::settings::RelayProtocol::ChatCompletions,
+        relay_mode: RelayMode::MixedApi,
+        user_agent: "Profile-Models-UA/1.0".to_string(),
+        ..RelayProfile::default()
+    };
 
-    let upstream = open_models_proxy_request(Some("Original-Codex-UA/1.0"))
-        .await
-        .unwrap();
+    let upstream = open_models_proxy_request(&profile).await.unwrap();
     assert_eq!(upstream.status_code, 200);
 
     let request = server.finish();
-    assert_eq!(request.user_agent, "Original-Codex-UA/1.0");
+    assert_eq!(request.user_agent, "Profile-Models-UA/1.0");
 }
 
 #[tokio::test]
-async fn models_proxy_prefers_original_user_agent_over_configured_user_agent() {
-    let _lock = settings_path_test_lock().lock().unwrap();
-    let temp = tempfile::tempdir().unwrap();
-    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
-    let server = spawn_chat_server();
-    write_chat_relay_settings(temp.path(), &server.base_url, "Configured-Codex-UA/1.0");
+async fn anthropic_models_proxy_forwards_originator_and_auth_headers() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buffer = [0_u8; 4096];
+        let bytes = stream.read(&mut buffer).await.unwrap();
+        let request = String::from_utf8_lossy(&buffer[..bytes]).to_string();
+        let body = r#"{"data":[],"has_more":false}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        request
+    });
+    let profile = RelayProfile {
+        id: "anthropic-models".to_string(),
+        name: "Anthropic Models".to_string(),
+        base_url: format!("http://{addr}/v1"),
+        upstream_base_url: format!("http://{addr}/v1"),
+        api_key: "sk-models-test".to_string(),
+        protocol: codex_plus_core::settings::RelayProtocol::Anthropic,
+        relay_mode: RelayMode::MixedApi,
+        user_agent: "Models-UA/1.0".to_string(),
+        ..RelayProfile::default()
+    };
 
-    let upstream = open_models_proxy_request(Some("Original-Codex-UA/1.0"))
+    let upstream = open_models_proxy_request_with_originator(&profile, Some("codex_cli_rs"))
         .await
         .unwrap();
     assert_eq!(upstream.status_code, 200);
-
-    let request = server.finish();
-    assert_eq!(request.user_agent, "Original-Codex-UA/1.0");
+    let request = server.await.unwrap();
+    let head = request.split_once("\r\n\r\n").unwrap().0;
+    assert!(head.starts_with("GET /v1/models HTTP/1.1"), "{head}");
+    assert!(
+        head.lines()
+            .any(|line| line.eq_ignore_ascii_case("x-api-key: sk-models-test")),
+        "{head}"
+    );
+    assert!(
+        head.lines()
+            .any(|line| line.eq_ignore_ascii_case("authorization: Bearer sk-models-test")),
+        "{head}"
+    );
+    assert!(
+        head.lines()
+            .any(|line| line.eq_ignore_ascii_case("anthropic-version: 2023-06-01")),
+        "{head}"
+    );
+    assert!(
+        head.lines()
+            .any(|line| line.eq_ignore_ascii_case("originator: codex_cli_rs")),
+        "{head}"
+    );
 }
 
 fn write_chat_relay_settings(settings_dir: &Path, base_url: &str, user_agent: &str) {

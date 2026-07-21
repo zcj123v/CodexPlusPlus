@@ -10,7 +10,7 @@ use anyhow::Context;
 use serde_json::{Value, json};
 
 use crate::relay_rotation::{RotationContext, RotationEvent};
-use crate::settings::{RelayProtocol, SettingsStore};
+use crate::settings::{RelayProfile, RelayProtocol, SettingsStore};
 
 pub const DEFAULT_PROTOCOL_PROXY_PORT: u16 = 57321;
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -265,7 +265,7 @@ fn chat_completion_to_response_with_context(
         "status": response_status(choice.get("finish_reason").and_then(Value::as_str)),
         "model": body.get("model").and_then(Value::as_str).unwrap_or(""),
         "output": output,
-        "usage": chat_usage_to_responses_usage(body.get("usage"))
+        "usage": chat_usage_to_responses_usage(body.get("usage"))?
     });
 
     if choice.get("finish_reason").and_then(Value::as_str) == Some("length") {
@@ -748,18 +748,23 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
 }
 
 pub async fn open_models_proxy_request(
-    original_user_agent: Option<&str>,
+    profile: &RelayProfile,
 ) -> anyhow::Result<UpstreamProxyResponse> {
-    let settings = SettingsStore::default().load().unwrap_or_default();
-    let relay = crate::relay_rotation::select_relay_for_probe(&settings)?;
-    validate_upstream(&relay)?;
+    open_models_proxy_request_with_originator(profile, None).await
+}
 
-    let is_anthropic = relay.protocol == RelayProtocol::Anthropic;
+pub async fn open_models_proxy_request_with_originator(
+    profile: &RelayProfile,
+    originator: Option<&str>,
+) -> anyhow::Result<UpstreamProxyResponse> {
+    validate_upstream(profile)?;
+
+    let is_anthropic = profile.protocol == RelayProtocol::Anthropic;
     // Anthropic 协议下带路径的 base 也需补 /v1，故走 anthropic_models_url
     let endpoint = if is_anthropic {
-        anthropic_models_url(&relay.base_url)
+        anthropic_models_url(&profile.base_url)
     } else {
-        models_url(&relay.base_url)
+        models_url(&profile.base_url)
     };
     let wire_api = if is_anthropic {
         UpstreamWireApi::AnthropicMessages
@@ -769,29 +774,29 @@ pub async fn open_models_proxy_request(
     let _ = crate::diagnostic_log::append_diagnostic_log(
         "protocol_proxy.models_request",
         json!({
-            "relayId": relay.id,
-            "relayName": relay.name,
+            "relayId": profile.id,
+            "relayName": profile.name,
             "endpoint": endpoint,
             "wireApi": wire_api
         }),
     );
-    let client = crate::http_client::proxied_client(&protocol_proxy_original_first_user_agent(
-        &relay.user_agent,
-        original_user_agent,
-    ))?;
-    let request = if is_anthropic {
+    let client = crate::http_client::proxied_client(profile.user_agent.trim())?;
+    let mut request = if is_anthropic {
         // Anthropic 三头认证，与 messages 请求保持一致
         client
             .get(&endpoint)
-            .header("x-api-key", relay.api_key.trim())
+            .header("x-api-key", profile.api_key.trim())
             .header(
                 "anthropic-version",
                 crate::anthropic_proxy::ANTHROPIC_VERSION,
             )
-            .bearer_auth(relay.api_key.trim())
+            .bearer_auth(profile.api_key.trim())
     } else {
-        client.get(&endpoint).bearer_auth(relay.api_key.trim())
+        client.get(&endpoint).bearer_auth(profile.api_key.trim())
     };
+    if let Some(originator) = originator.map(str::trim).filter(|value| !value.is_empty()) {
+        request = request.header("originator", originator);
+    }
     let upstream = send_upstream_request(request).await?;
     let status_code = upstream.status().as_u16();
     let content_type = upstream
@@ -1130,14 +1135,24 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
 
 pub fn chat_completions_url(base_url: &str) -> String {
     let skip_version_prefix = base_url.trim().ends_with('#');
-    let base = base_url.trim().trim_end_matches('#').trim_end_matches('/');
+    let mut base = base_url
+        .trim()
+        .trim_end_matches('#')
+        .trim_end_matches('/')
+        .to_string();
+    for suffix in ["/responses", "/messages"] {
+        if base.to_ascii_lowercase().ends_with(suffix) {
+            base.truncate(base.len() - suffix.len());
+            break;
+        }
+    }
     if base.to_ascii_lowercase().ends_with("/chat/completions") {
-        return base.to_string();
+        return base;
     }
     let origin_only = base
         .split_once("://")
         .map_or(!base.contains('/'), |(_, rest)| !rest.contains('/'));
-    let mut url = if skip_version_prefix || has_version_suffix(base) || !origin_only {
+    let mut url = if skip_version_prefix || has_version_suffix(&base) || !origin_only {
         format!("{base}/chat/completions")
     } else {
         format!("{base}/v1/chat/completions")
@@ -1150,14 +1165,24 @@ pub fn chat_completions_url(base_url: &str) -> String {
 
 pub fn responses_url(base_url: &str) -> String {
     let skip_version_prefix = base_url.trim().ends_with('#');
-    let base = base_url.trim().trim_end_matches('#').trim_end_matches('/');
+    let mut base = base_url
+        .trim()
+        .trim_end_matches('#')
+        .trim_end_matches('/')
+        .to_string();
+    for suffix in ["/chat/completions", "/messages"] {
+        if base.to_ascii_lowercase().ends_with(suffix) {
+            base.truncate(base.len() - suffix.len());
+            break;
+        }
+    }
     if base.to_ascii_lowercase().ends_with("/responses") {
-        return base.to_string();
+        return base;
     }
     let origin_only = base
         .split_once("://")
         .map_or(!base.contains('/'), |(_, rest)| !rest.contains('/'));
-    let mut url = if skip_version_prefix || has_version_suffix(base) || !origin_only {
+    let mut url = if skip_version_prefix || has_version_suffix(&base) || !origin_only {
         format!("{base}/responses")
     } else {
         format!("{base}/v1/responses")
@@ -1195,8 +1220,11 @@ pub fn models_url(base_url: &str) -> String {
         .trim_end_matches('#')
         .trim_end_matches('/')
         .to_string();
-    if base.to_ascii_lowercase().ends_with("/chat/completions") {
-        base.truncate(base.len() - "/chat/completions".len());
+    for suffix in ["/chat/completions", "/responses", "/messages"] {
+        if base.to_ascii_lowercase().ends_with(suffix) {
+            base.truncate(base.len() - suffix.len());
+            break;
+        }
     }
     if base.to_ascii_lowercase().ends_with("/models") {
         return base;
@@ -1218,13 +1246,23 @@ pub fn models_url(base_url: &str) -> String {
 /// Anthropic Messages 端点拼接：除 `#` 后缀或已带版本号外，带路径的 base 也补 `/v1`。
 pub fn anthropic_messages_url(base_url: &str) -> String {
     let skip_version_prefix = base_url.trim().ends_with('#');
-    let base = base_url.trim().trim_end_matches('#').trim_end_matches('/');
+    let mut base = base_url
+        .trim()
+        .trim_end_matches('#')
+        .trim_end_matches('/')
+        .to_string();
+    for suffix in ["/chat/completions", "/responses", "/models"] {
+        if base.to_ascii_lowercase().ends_with(suffix) {
+            base.truncate(base.len() - suffix.len());
+            break;
+        }
+    }
     if base.to_ascii_lowercase().ends_with("/messages") {
-        return base.to_string();
+        return base;
     }
     // 与 responses_url 不同：带路径的 base 同样补 /v1 前缀，
     // 仅 `#` 后缀或已带版本号（如 /v1）时跳过。
-    let mut url = if skip_version_prefix || has_version_suffix(base) {
+    let mut url = if skip_version_prefix || has_version_suffix(&base) {
         format!("{base}/messages")
     } else {
         format!("{base}/v1/messages")
@@ -1240,11 +1278,21 @@ pub fn anthropic_messages_url(base_url: &str) -> String {
 /// 已是完整端点或以 /models 结尾则原样返回。
 pub fn anthropic_models_url(base_url: &str) -> String {
     let skip_version_prefix = base_url.trim().ends_with('#');
-    let base = base_url.trim().trim_end_matches('#').trim_end_matches('/');
-    if base.to_ascii_lowercase().ends_with("/models") {
-        return base.to_string();
+    let mut base = base_url
+        .trim()
+        .trim_end_matches('#')
+        .trim_end_matches('/')
+        .to_string();
+    for suffix in ["/chat/completions", "/responses", "/messages"] {
+        if base.to_ascii_lowercase().ends_with(suffix) {
+            base.truncate(base.len() - suffix.len());
+            break;
+        }
     }
-    let mut url = if skip_version_prefix || has_version_suffix(base) {
+    if base.to_ascii_lowercase().ends_with("/models") {
+        return base;
+    }
+    let mut url = if skip_version_prefix || has_version_suffix(&base) {
         format!("{base}/models")
     } else {
         format!("{base}/v1/models")
@@ -1402,7 +1450,13 @@ impl ChatSseState {
         self.ensure_response_started_into(output);
 
         if let Some(usage) = chunk.get("usage").filter(|value| !value.is_null()) {
-            self.latest_usage = Some(chat_usage_to_responses_usage(Some(usage)));
+            match chat_usage_to_responses_usage(Some(usage)) {
+                Ok(usage) => self.latest_usage = Some(usage),
+                Err(error) => {
+                    self.failed_into(output, error.to_string(), Some("invalid_usage".to_string()));
+                    return;
+                }
+            }
         }
 
         let Some(choice) = chunk
@@ -3569,10 +3623,47 @@ fn default_responses_usage() -> Value {
     json!({ "input_tokens": 0, "output_tokens": 0, "total_tokens": 0 })
 }
 
-fn chat_usage_to_responses_usage(usage: Option<&Value>) -> Value {
-    let Some(usage) = usage.filter(|value| value.is_object() && !value.is_null()) else {
-        return default_responses_usage();
+fn chat_usage_to_responses_usage(usage: Option<&Value>) -> anyhow::Result<Value> {
+    let Some(usage) = usage else {
+        return Ok(default_responses_usage());
     };
+    let object = usage
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("usage must be an object"))?;
+    for key in [
+        "prompt_tokens",
+        "input_tokens",
+        "promptTokenCount",
+        "completion_tokens",
+        "output_tokens",
+        "candidatesTokenCount",
+        "cachedContentTokenCount",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "cache_creation_5m_input_tokens",
+        "cache_creation_1h_input_tokens",
+        "total_tokens",
+    ] {
+        if let Some(value) = object.get(key) {
+            if value.as_u64().is_none() {
+                anyhow::bail!("usage.{key} must be a non-negative integer");
+            }
+        }
+    }
+    for pointer in [
+        "/prompt_tokens_details/cached_tokens",
+        "/input_tokens_details/cached_tokens",
+        "/completion_tokens_details/reasoning_tokens",
+        "/completion_tokens_details/accepted_prediction_tokens",
+        "/completion_tokens_details/rejected_prediction_tokens",
+        "/completion_tokens_details/audio_tokens",
+    ] {
+        if let Some(value) = usage.pointer(pointer) {
+            if value.as_u64().is_none() {
+                anyhow::bail!("usage{pointer} must be a non-negative integer");
+            }
+        }
+    }
     let mut input_tokens = usage
         .get("prompt_tokens")
         .or_else(|| usage.get("input_tokens"))
@@ -3632,33 +3723,29 @@ fn chat_usage_to_responses_usage(usage: Option<&Value>) -> Value {
         input_tokens_include_cache = false;
     }
 
+    let cache_creation_tokens =
+        effective_cache_creation_tokens(cache_creation, cache_creation_5m, cache_creation_1h);
     let usage_input_tokens = if input_tokens_include_cache {
-        input_tokens.saturating_sub(
-            cached_tokens
-                + effective_cache_creation_tokens(
-                    cache_creation,
-                    cache_creation_5m,
-                    cache_creation_1h,
-                ),
-        )
+        input_tokens.saturating_sub(cached_tokens.saturating_add(cache_creation_tokens))
     } else {
         input_tokens
     };
     let should_recalculate_total = usage.get("total_tokens").is_none()
         || cached_tokens > 0
-        || effective_cache_creation_tokens(cache_creation, cache_creation_5m, cache_creation_1h)
-            > 0
+        || cache_creation_tokens > 0
         || usage.get("promptTokenCount").is_some();
+    // Usage comes from untrusted providers; saturation preserves monotonic accounting
+    // instead of allowing integer wraparound at extreme values.
     let total_tokens = if should_recalculate_total {
         usage_input_tokens
-            + output_tokens
-            + cached_tokens
-            + effective_cache_creation_tokens(cache_creation, cache_creation_5m, cache_creation_1h)
+            .saturating_add(output_tokens)
+            .saturating_add(cached_tokens)
+            .saturating_add(cache_creation_tokens)
     } else {
         usage
             .get("total_tokens")
             .and_then(Value::as_u64)
-            .unwrap_or(usage_input_tokens + output_tokens)
+            .unwrap_or_else(|| usage_input_tokens.saturating_add(output_tokens))
     };
     let mut result = json!({
         "input_tokens": usage_input_tokens,
@@ -3693,7 +3780,7 @@ fn chat_usage_to_responses_usage(usage: Option<&Value>) -> Value {
     if let Some(cache_ttl) = cache_ttl {
         result["cache_ttl"] = json!(cache_ttl);
     }
-    result
+    Ok(result)
 }
 
 fn effective_cache_creation_tokens(
@@ -3704,7 +3791,7 @@ fn effective_cache_creation_tokens(
     if cache_creation > 0 {
         cache_creation
     } else {
-        cache_creation_5m + cache_creation_1h
+        cache_creation_5m.saturating_add(cache_creation_1h)
     }
 }
 
