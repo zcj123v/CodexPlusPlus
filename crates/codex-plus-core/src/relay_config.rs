@@ -528,6 +528,8 @@ pub async fn test_relay_profile(
     let endpoint = match profile.protocol {
         RelayProtocol::Responses => format!("{base_url}/responses"),
         RelayProtocol::ChatCompletions => format!("{base_url}/chat/completions"),
+        // Task 5 统一接线 Anthropic 连通性测试
+        RelayProtocol::Anthropic => todo!(),
     };
     let test_model = model.trim();
     if test_model.is_empty() {
@@ -552,6 +554,8 @@ pub async fn test_relay_profile(
         let v1_endpoint = match profile.protocol {
             RelayProtocol::Responses => format!("{v1_url}/responses"),
             RelayProtocol::ChatCompletions => format!("{v1_url}/chat/completions"),
+            // Task 5 统一接线 Anthropic 连通性测试
+            RelayProtocol::Anthropic => todo!(),
         };
         let v1_response = client
             .post(&v1_endpoint)
@@ -596,13 +600,15 @@ fn relay_profile_test_payload(protocol: RelayProtocol, model: &str) -> Value {
             ],
             "max_tokens": 16
         }),
+        // Task 5 统一接线 Anthropic 连通性测试
+        RelayProtocol::Anthropic => todo!(),
     }
 }
 
 fn codex_base_url_for_protocol(base_url: &str, protocol: RelayProtocol, proxy_port: u16) -> String {
     match protocol {
         RelayProtocol::Responses => base_url.to_string(),
-        RelayProtocol::ChatCompletions => {
+        RelayProtocol::ChatCompletions | RelayProtocol::Anthropic => {
             crate::protocol_proxy::local_responses_proxy_base_url(proxy_port)
         }
     }

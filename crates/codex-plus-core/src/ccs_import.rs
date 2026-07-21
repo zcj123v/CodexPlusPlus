@@ -259,6 +259,8 @@ fn build_config_toml(base_url: &str, api_key: &str, protocol: RelayProtocol) -> 
     let wire_api = match protocol {
         RelayProtocol::Responses => "responses",
         RelayProtocol::ChatCompletions => "chat",
+        // Task 5 统一接线 Anthropic 导入
+        RelayProtocol::Anthropic => todo!(),
     };
     [
         "model_provider = \"CodexPlusPlus\"".to_string(),

@@ -346,6 +346,26 @@ fn apply_chat_protocol_relay_points_codex_to_local_responses_proxy() {
 }
 
 #[test]
+fn anthropic_profile_config_points_to_local_proxy() {
+    let temp = tempfile::tempdir().unwrap();
+
+    let result = codex_plus_core::relay_config::apply_relay_config_to_home_with_protocol(
+        temp.path(),
+        "https://anthropic.example.test/v1",
+        "sk-test-redacted",
+        RelayProtocol::Anthropic,
+        57321,
+    )
+    .unwrap();
+    let updated = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+
+    // Anthropic profile 与 chatCompletions 一样指向本地协议代理
+    assert!(result.configured);
+    assert!(updated.contains("127.0.0.1"));
+    assert!(updated.contains(r#"wire_api = "responses""#));
+}
+
+#[test]
 fn responses_profile_stays_direct_and_backfill_repairs_legacy_local_proxy() {
     let temp = tempfile::tempdir().unwrap();
     let profile = RelayProfile {

@@ -294,6 +294,7 @@ pub struct UpstreamProxyResponse {
 pub enum UpstreamWireApi {
     Responses,
     ChatCompletions,
+    AnthropicMessages,
     AudioTranscriptions,
 }
 
@@ -801,6 +802,8 @@ async fn upstream_request_parts(
     let mut body = match relay.protocol {
         RelayProtocol::Responses => request_json,
         RelayProtocol::ChatCompletions => responses_to_chat_completions(request_json)?,
+        // Task 5 统一接线 Anthropic 请求转换
+        RelayProtocol::Anthropic => todo!(),
     };
 
     // Image handling (per-model): send-as-is / strip / VLM analysis
@@ -851,11 +854,15 @@ async fn upstream_request_parts(
     let wire_api = match relay.protocol {
         RelayProtocol::Responses => UpstreamWireApi::Responses,
         RelayProtocol::ChatCompletions => UpstreamWireApi::ChatCompletions,
+        // Task 5 统一接线 Anthropic 上游
+        RelayProtocol::Anthropic => todo!(),
     };
     Ok((
         match relay.protocol {
             RelayProtocol::Responses => responses_url(&relay.base_url),
             RelayProtocol::ChatCompletions => chat_completions_url(&relay.base_url),
+            // Task 5 统一接线 Anthropic 上游
+            RelayProtocol::Anthropic => todo!(),
         },
         body,
         wire_api,
@@ -1044,6 +1051,26 @@ pub fn models_url(base_url: &str) -> String {
         format!("{base}/models")
     } else {
         format!("{base}/v1/models")
+    };
+    while url.contains("/v1/v1") {
+        url = url.replace("/v1/v1", "/v1");
+    }
+    url
+}
+
+/// Anthropic Messages 端点拼接，规则与 `responses_url` 一致。
+pub fn anthropic_messages_url(base_url: &str) -> String {
+    let skip_version_prefix = base_url.trim().ends_with('#');
+    let base = base_url.trim().trim_end_matches('#').trim_end_matches('/');
+    if base.to_ascii_lowercase().ends_with("/messages") {
+        return base.to_string();
+    }
+    // 与 responses_url 不同：带路径的 base 同样补 /v1 前缀，
+    // 仅 `#` 后缀或已带版本号（如 /v1）时跳过。
+    let mut url = if skip_version_prefix || has_version_suffix(base) {
+        format!("{base}/messages")
+    } else {
+        format!("{base}/v1/messages")
     };
     while url.contains("/v1/v1") {
         url = url.replace("/v1/v1", "/v1");
