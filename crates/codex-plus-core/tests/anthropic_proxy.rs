@@ -43,7 +43,7 @@ fn anthropic_messages_url_rules() {
 }
 
 use codex_plus_core::anthropic_proxy::responses_to_anthropic_messages;
-use serde_json::{json, Value};
+use serde_json::json;
 
 #[test]
 fn converts_instructions_to_system_with_cache_control() {
@@ -303,17 +303,16 @@ fn split_utf8_across_chunks() {
 fn finish_processes_trailing_block_without_blank_line() {
     let mut converter = AnthropicSseToResponsesConverter::with_request(&serde_json::json!({}));
     let mut out = Vec::new();
-    // message_start 与 message_delta 正常结尾，末尾 message_stop 残缺（无尾部空行）
+    // message_start 正常结尾，末尾 message_delta（携带 usage）残缺（无尾部空行）
     let stream = concat!(
         "event: message_start\n",
         "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"model\":\"k3\",\"usage\":{\"input_tokens\":7}}}\n\n",
         "event: message_delta\n",
-        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}\n\n",
-        "event: message_stop\n",
-        "data: {\"type\":\"message_stop\"}",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}",
     );
     out.extend(converter.push_bytes(stream.as_bytes()));
-    // finish() 应解析 buffer 中未以 \n\n 结尾的 message_stop 残缺块
+    // finish() 应解析 buffer 中未以 \n\n 结尾的 message_delta 残缺块，
+    // 否则其 usage 会丢失（旧行为同样会补 response.completed，无法区分）
     out.extend(converter.finish());
 
     let events = collect_events(&out);
@@ -325,7 +324,7 @@ fn finish_processes_trailing_block_without_blank_line() {
         .map(|(_, data)| data.clone())
         .unwrap();
     assert_eq!(completed["response"]["status"], "completed");
-    // message_delta 的 output_tokens 应并入 completed 的 usage
+    // 残缺 message_delta 的 output_tokens 必须并入 completed 的 usage
     assert_eq!(completed["response"]["usage"]["output_tokens"], 42);
     assert_eq!(completed["response"]["usage"]["input_tokens"], 7);
 }
