@@ -298,3 +298,57 @@ fn split_utf8_across_chunks() {
     let text = String::from_utf8(out).unwrap();
     assert!(text.contains("中文") || converter.finish().is_empty());
 }
+
+#[test]
+fn finish_processes_trailing_block_without_blank_line() {
+    let mut converter = AnthropicSseToResponsesConverter::with_request(&serde_json::json!({}));
+    let mut out = Vec::new();
+    // message_start 与 message_delta 正常结尾，末尾 message_stop 残缺（无尾部空行）
+    let stream = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"model\":\"k3\",\"usage\":{\"input_tokens\":7}}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}",
+    );
+    out.extend(converter.push_bytes(stream.as_bytes()));
+    // finish() 应解析 buffer 中未以 \n\n 结尾的 message_stop 残缺块
+    out.extend(converter.finish());
+
+    let events = collect_events(&out);
+    let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names.last().copied(), Some("response.completed"));
+    let completed = events
+        .iter()
+        .find(|(name, _)| name == "response.completed")
+        .map(|(_, data)| data.clone())
+        .unwrap();
+    assert_eq!(completed["response"]["status"], "completed");
+    // message_delta 的 output_tokens 应并入 completed 的 usage
+    assert_eq!(completed["response"]["usage"]["output_tokens"], 42);
+    assert_eq!(completed["response"]["usage"]["input_tokens"], 7);
+}
+
+#[test]
+fn no_completed_after_error_event() {
+    let mut converter = AnthropicSseToResponsesConverter::with_request(&serde_json::json!({}));
+    let mut out = Vec::new();
+    // 先收到 error 事件（流已 failed）
+    out.extend(converter.push_bytes(
+        b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_3\",\"model\":\"k3\",\"usage\":{\"input_tokens\":1}}}\n\n",
+    ));
+    out.extend(converter.push_bytes(
+        b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+    ));
+    // 之后再收到 message_stop：只能有 response.failed，不能补 response.completed
+    out.extend(converter.push_bytes(
+        b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ));
+    out.extend(converter.finish());
+
+    let events = collect_events(&out);
+    let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+    assert!(names.contains(&"response.failed"));
+    assert!(!names.contains(&"response.completed"));
+}

@@ -434,6 +434,24 @@ impl AnthropicSseToResponsesConverter {
             self.utf8_remainder.clear();
         }
         let mut output = String::new();
+        // 与 push_bytes 相同的逻辑：先把 buffer 中完整的 SSE block 处理完
+        while let Some(block) = crate::protocol_proxy::take_sse_block(&mut self.buffer) {
+            if block.trim().is_empty() {
+                continue;
+            }
+            self.handle_block(&block, &mut output);
+            if self.failed {
+                break;
+            }
+        }
+        // buffer 中若仍有非空残留，说明最后一个事件没带尾部空行，
+        // 上游已结束，按完整 block 尝试解析一次（如末尾的 message_delta/message_stop）
+        if !self.failed {
+            let tail = std::mem::take(&mut self.buffer);
+            if !tail.trim().is_empty() {
+                self.handle_block(&tail, &mut output);
+            }
+        }
         // 上游提前断流：尽量收尾，未收到 message_stop 也补一个 completed
         if self.started && !self.completed && !self.failed {
             self.emit_completed(&mut output);
@@ -730,7 +748,8 @@ impl AnthropicSseToResponsesConverter {
     }
 
     fn emit_completed(&mut self, output: &mut String) {
-        if self.completed {
+        // 已失败或已完成的流不再补 completed，避免 failed 之后再发 completed
+        if self.completed || self.failed {
             return;
         }
         self.completed = true;
