@@ -6,7 +6,7 @@ use codex_plus_core::protocol_proxy::{
     is_audio_transcriptions_proxy_path, is_chat_completions_proxy_path, is_models_proxy_path,
     is_responses_proxy_path, models_url, open_audio_transcriptions_proxy_request,
     open_chat_completions_proxy_request, open_models_proxy_request,
-    open_models_proxy_request_with_originator, open_responses_proxy_request,
+    open_models_proxy_request_with_identity, open_responses_proxy_request,
     open_responses_proxy_request_with_settings, responses_error_from_upstream,
     responses_to_chat_completions, responses_url, send_upstream_request_with_header_timeout,
     upstream_header_timeout, upstream_http_client, upstream_stream_header_timeout,
@@ -1937,7 +1937,7 @@ async fn models_proxy_uses_passed_profile() {
 }
 
 #[tokio::test]
-async fn anthropic_models_proxy_forwards_originator_and_auth_headers() {
+async fn anthropic_models_proxy_prefers_original_user_agent_and_forwards_originator() {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
@@ -1967,13 +1967,22 @@ async fn anthropic_models_proxy_forwards_originator_and_auth_headers() {
         ..RelayProfile::default()
     };
 
-    let upstream = open_models_proxy_request_with_originator(&profile, Some("codex_cli_rs"))
-        .await
-        .unwrap();
+    let upstream = open_models_proxy_request_with_identity(
+        &profile,
+        Some("Original-Models-UA/2.0"),
+        Some("codex_cli_rs"),
+    )
+    .await
+    .unwrap();
     assert_eq!(upstream.status_code, 200);
     let request = server.await.unwrap();
     let head = request.split_once("\r\n\r\n").unwrap().0;
     assert!(head.starts_with("GET /v1/models HTTP/1.1"), "{head}");
+    assert!(
+        head.lines()
+            .any(|line| line.eq_ignore_ascii_case("user-agent: Original-Models-UA/2.0")),
+        "{head}"
+    );
     assert!(
         head.lines()
             .any(|line| line.eq_ignore_ascii_case("x-api-key: sk-models-test")),

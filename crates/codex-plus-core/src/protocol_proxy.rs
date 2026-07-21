@@ -750,11 +750,19 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
 pub async fn open_models_proxy_request(
     profile: &RelayProfile,
 ) -> anyhow::Result<UpstreamProxyResponse> {
-    open_models_proxy_request_with_originator(profile, None).await
+    open_models_proxy_request_with_identity(profile, None, None).await
 }
 
 pub async fn open_models_proxy_request_with_originator(
     profile: &RelayProfile,
+    originator: Option<&str>,
+) -> anyhow::Result<UpstreamProxyResponse> {
+    open_models_proxy_request_with_identity(profile, None, originator).await
+}
+
+pub async fn open_models_proxy_request_with_identity(
+    profile: &RelayProfile,
+    original_user_agent: Option<&str>,
     originator: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     validate_upstream(profile)?;
@@ -780,7 +788,10 @@ pub async fn open_models_proxy_request_with_originator(
             "wireApi": wire_api
         }),
     );
-    let client = crate::http_client::proxied_client(profile.user_agent.trim())?;
+    let client = crate::http_client::proxied_client(&protocol_proxy_original_first_user_agent(
+        &profile.user_agent,
+        original_user_agent,
+    ))?;
     let mut request = if is_anthropic {
         // Anthropic 三头认证，与 messages 请求保持一致
         client

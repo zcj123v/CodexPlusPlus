@@ -705,7 +705,11 @@ impl AnthropicSseToResponsesConverter {
             "content_block_stop" => self.on_block_stop(&data, output),
             "message_delta" => self.on_message_delta(&data, output),
             "message_stop" => {
-                if !self.started || !self.blocks.is_empty() || !self.message_delta_seen {
+                if !self.started
+                    || !self.blocks.is_empty()
+                    || !self.message_delta_seen
+                    || self.stop_reason.is_empty()
+                {
                     self.emit_invalid_sse(output);
                 } else {
                     self.emit_completed(output);
@@ -1127,7 +1131,7 @@ impl AnthropicSseToResponsesConverter {
     }
 
     fn on_message_delta(&mut self, data: &Value, output: &mut String) {
-        if !self.started || !self.blocks.is_empty() || self.message_delta_seen {
+        if !self.started || !self.blocks.is_empty() {
             self.emit_invalid_sse(output);
             return;
         }
@@ -1138,16 +1142,24 @@ impl AnthropicSseToResponsesConverter {
             self.emit_invalid_sse(output);
             return;
         };
-        let Some(stop) = delta.get("stop_reason").and_then(Value::as_str) else {
-            self.emit_invalid_sse(output);
-            return;
-        };
-        if !usage.get("output_tokens").is_some_and(Value::is_u64) {
+        if delta
+            .get("stop_reason")
+            .is_some_and(|value| !value.is_string())
+            || !usage.get("output_tokens").is_some_and(Value::is_u64)
+        {
             self.emit_invalid_sse(output);
             return;
         }
-        self.stop_reason = stop.to_string();
-        self.output_usage = Value::Object(usage.clone());
+        if let Some(stop) = delta.get("stop_reason").and_then(Value::as_str) {
+            self.stop_reason = stop.to_string();
+        }
+        let Some(output_usage) = self.output_usage.as_object_mut() else {
+            self.emit_invalid_sse(output);
+            return;
+        };
+        for (key, value) in usage {
+            output_usage.insert(key.clone(), value.clone());
+        }
         self.message_delta_seen = true;
     }
 

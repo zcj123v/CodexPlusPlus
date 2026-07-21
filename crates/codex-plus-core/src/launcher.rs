@@ -1067,6 +1067,7 @@ async fn handle_helper_connection(
     if crate::protocol_proxy::is_models_proxy_path(path) && matches!(method, "GET" | "OPTIONS") {
         return handle_models_proxy_connection(
             &mut stream,
+            request_user_agent.as_deref(),
             request_originator.as_deref(),
             method,
             path,
@@ -1290,6 +1291,7 @@ fn overlay_image_content_type(path: &Path) -> Option<&'static str> {
 
 async fn handle_models_proxy_connection(
     stream: &mut tokio::net::TcpStream,
+    request_user_agent: Option<&str>,
     request_originator: Option<&str>,
     method: &str,
     path: &str,
@@ -1308,8 +1310,9 @@ async fn handle_models_proxy_connection(
     }
     let settings = SettingsStore::default().load().unwrap_or_default();
     let profile = crate::relay_rotation::select_relay_for_probe(&settings)?;
-    let upstream = match crate::protocol_proxy::open_models_proxy_request_with_originator(
+    let upstream = match crate::protocol_proxy::open_models_proxy_request_with_identity(
         &profile,
+        request_user_agent,
         request_originator,
     )
     .await
