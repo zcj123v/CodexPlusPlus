@@ -309,7 +309,7 @@ type CodexContextEntries = {
   plugins: CodexContextEntry[];
 };
 
-type RelayProtocol = "responses" | "chatCompletions";
+type RelayProtocol = "responses" | "chatCompletions" | "anthropic";
 type RelayMode = "official" | "mixedApi" | "pureApi" | "aggregate";
 const PROTOCOL_PROXY_BASE_URL = "http://127.0.0.1:57321/v1";
 const CHAT_UPSTREAM_BASE_URL_KEY = "codex_plus_chat_base_url";
@@ -5678,6 +5678,13 @@ function RelayProfileEditor({
                 >
                   Chat Completions
                 </button>
+                <button
+                  className={`protocol-option ${profile.protocol === "anthropic" ? "active" : ""}`}
+                  onClick={() => updateDraft({ protocol: "anthropic" })}
+                  type="button"
+                >
+                  Anthropic
+                </button>
               </div>
             </Field>
           </div>
@@ -5826,7 +5833,7 @@ function RelayProfileEditor({
           </Field>
         ) : null}
       </div>
-      {showApiFields && profile.protocol === "chatCompletions" ? (
+      {showApiFields && (profile.protocol === "chatCompletions" || profile.protocol === "anthropic") ? (
         <div className="hint-line relay-protocol-hint">
           <MessageCircle className="h-4 w-4" />
           <span>{t("此上游会通过本地 127.0.0.1:57321 转成 Responses API，需要从 Codex++ 启动 Codex。")}</span>
@@ -7702,7 +7709,7 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     baseUrl: profile.baseUrl || defaultSettings.relayBaseUrl,
     upstreamBaseUrl: profile.upstreamBaseUrl || profile.baseUrl || "",
     apiKey: profile.apiKey || "",
-    protocol: profile.protocol === "chatCompletions" ? "chatCompletions" : "responses",
+    protocol: profile.protocol === "chatCompletions" || profile.protocol === "anthropic" ? profile.protocol : "responses",
     relayMode,
     officialMixApiKey,
     testModel: profile.testModel || "",
@@ -7748,6 +7755,7 @@ function activeRelayProfile(settings: BackendSettings): RelayProfile {
 }
 
 function relayProtocolLabel(protocol: RelayProtocol): string {
+  if (protocol === "anthropic") return t("Anthropic 转 Responses");
   return protocol === "chatCompletions" ? t("Chat Completions 转 Responses") : "Responses API";
 }
 
@@ -7889,7 +7897,7 @@ function buildRelayConfigToml(
   profile: Pick<RelayProfile, "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol">,
   options: { includeBearerToken: boolean },
 ): string {
-  const baseUrl = profile.protocol === "chatCompletions" ? PROTOCOL_PROXY_BASE_URL : profile.baseUrl.trim();
+  const baseUrl = profile.protocol === "chatCompletions" || profile.protocol === "anthropic" ? PROTOCOL_PROXY_BASE_URL : profile.baseUrl.trim();
   const apiKey = profile.apiKey.trim();
   const rootLines = [
     profile.model.trim() ? `model = "${tomlString(profile.model.trim())}"` : null,
@@ -7992,7 +8000,7 @@ function applyRelayProfilePatchToFiles(
     next.baseUrl = patch.upstreamBaseUrl || "";
   }
   if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch) {
-    const baseUrlForConfig = next.protocol === "chatCompletions" ? PROTOCOL_PROXY_BASE_URL : next.upstreamBaseUrl || next.baseUrl;
+    const baseUrlForConfig = next.protocol === "chatCompletions" || next.protocol === "anthropic" ? PROTOCOL_PROXY_BASE_URL : next.upstreamBaseUrl || next.baseUrl;
     next.configContents = setCodexProviderStringKey(next.configContents, "base_url", baseUrlForConfig);
     next.configContents = removeRootTomlKey(next.configContents, CHAT_UPSTREAM_BASE_URL_KEY);
   }

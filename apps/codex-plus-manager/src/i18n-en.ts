@@ -8,6 +8,7 @@ export const EN_PLAIN: Record<string, string> = {
   "API Key 模式下扩展插件市场请求，尽量显示完整插件列表；官方/混合模式通常不需要。":
     "Expands plugin marketplace requests in API Key mode to show the full plugin list. Usually unnecessary in official/mixed mode.",
   "API Key 环境变量": "API Key environment variable",
+  "Anthropic 转 Responses": "Anthropic to Responses",
   "Chat Completions 转 Responses": "Chat Completions to Responses",
   "Codex 启动参数": "Codex launch arguments",
   "Codex 工具与插件": "Codex tools & plugins",
