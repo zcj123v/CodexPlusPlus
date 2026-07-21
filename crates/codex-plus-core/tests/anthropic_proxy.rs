@@ -108,7 +108,10 @@ fn tools_schema_cloned_verbatim() {
     assert_eq!(tools[0]["description"], "run cmd");
     // 语义逐字节一致：Value 直接相等，未解构重建
     assert_eq!(tools[0]["input_schema"], params);
-    assert_eq!(tools.last().unwrap()["cache_control"], json!({"type":"ephemeral"}));
+    assert_eq!(
+        tools.last().unwrap()["cache_control"],
+        json!({"type":"ephemeral"})
+    );
 }
 
 #[test]
@@ -132,7 +135,10 @@ fn converts_input_image_data_url() {
 fn maps_reasoning_effort_to_thinking_budget() {
     let body = json!({"model":"k3","input":[],"reasoning":{"effort":"high"}});
     let out = responses_to_anthropic_messages(&body).unwrap();
-    assert_eq!(out["thinking"], json!({"type":"enabled","budget_tokens":16384}));
+    assert_eq!(
+        out["thinking"],
+        json!({"type":"enabled","budget_tokens":16384})
+    );
 
     let body = json!({"model":"k3","input":[],"reasoning":{"effort":"none"}});
     let out = responses_to_anthropic_messages(&body).unwrap();
@@ -281,10 +287,12 @@ fn error_event_yields_response_failed() {
     );
     let events = collect_events(&out);
     assert_eq!(events[0].0, "response.failed");
-    assert!(events[0].1["response"]["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("Overloaded"));
+    assert!(
+        events[0].1["response"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Overloaded")
+    );
 }
 
 #[test]
@@ -341,9 +349,7 @@ fn no_completed_after_error_event() {
         b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
     ));
     // 之后再收到 message_stop：只能有 response.failed，不能补 response.completed
-    out.extend(converter.push_bytes(
-        b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
-    ));
+    out.extend(converter.push_bytes(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
     out.extend(converter.finish());
 
     let events = collect_events(&out);
@@ -363,9 +369,15 @@ fn anthropic_error_maps_to_responses_error() {
 
 #[test]
 fn anthropic_error_falls_back_on_non_json() {
-    let error = codex_plus_core::anthropic_proxy::anthropic_error_to_responses_error(502, b"bad gateway");
+    let error =
+        codex_plus_core::anthropic_proxy::anthropic_error_to_responses_error(502, b"bad gateway");
     assert_eq!(error["error"]["code"], 502);
-    assert!(error["error"]["message"].as_str().unwrap().contains("bad gateway"));
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("bad gateway")
+    );
 }
 
 #[test]
@@ -477,20 +489,21 @@ fn anthropic_models_url_rules() {
 //
 // mock 模式复用 tests/protocol_proxy.rs 的写法：tokio TcpListener 起本地 mock 上游，
 // 按 Content-Length 读全请求体后返回固定响应；不引入新 mock 框架。
-//
-// 注意：open_responses_proxy_request_with_settings 只负责「请求转换 + 上游收发」，
-// 非流式响应的协议转换在 launcher 层按 wire_api 分发（anthropic_message_to_response）。
-// 因此 roundtrip 断言分两段：先校验 mock 收到的 anthropic 请求与 wire_api 标记，
-// 再走与 launcher 相同的转换函数校验最终 Responses JSON。
 
 use codex_plus_core::protocol_proxy::{
-    UpstreamWireApi, open_responses_proxy_request_with_settings,
+    UpstreamWireApi, finalize_non_streaming_responses_response,
+    open_responses_proxy_request_with_settings,
 };
 use codex_plus_core::settings::{
     AggregateRelayMember, AggregateRelayProfile, AggregateRelayStrategy, RelayMode,
 };
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
+
+const TASK8_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 聚合测试共享进程级 GLOBAL_SELECTOR（relay_rotation.rs），串行执行避免相互干扰。
 fn aggregate_test_lock() -> &'static Mutex<()> {
@@ -498,14 +511,31 @@ fn aggregate_test_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/// 按 Content-Length 读全一个 HTTP 请求，返回请求原文，然后写回固定响应。
-/// 读循环参照 tests/protocol_proxy.rs 的 audio_transcriptions_proxy_forwards_multipart_body。
-async fn capture_request_and_respond(listener: tokio::net::TcpListener, response: String) -> String {
-    let (mut stream, _) = listener.accept().await.unwrap();
+fn request_header_value<'a>(head: &'a str, expected_name: &str) -> &'a str {
+    let mut values = head.lines().skip(1).filter_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case(expected_name)
+            .then_some(value.trim())
+    });
+    let value = values
+        .next()
+        .unwrap_or_else(|| panic!("missing request header {expected_name:?} in:\n{head}"));
+    assert!(
+        values.next().is_none(),
+        "duplicate request header {expected_name:?} in:\n{head}"
+    );
+    value
+}
+
+async fn read_complete_request(stream: &mut tokio::net::TcpStream, context: &str) -> String {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
-        let read = stream.read(&mut chunk).await.unwrap();
+        let read = timeout(TASK8_TIMEOUT, stream.read(&mut chunk))
+            .await
+            .unwrap_or_else(|_| panic!("timed out reading {context}"))
+            .unwrap_or_else(|error| panic!("failed reading {context}: {error}"));
         if read == 0 {
             break;
         }
@@ -524,12 +554,38 @@ async fn capture_request_and_respond(listener: tokio::net::TcpListener, response
                 })
             })
             .unwrap_or(0);
-        if body.as_bytes().len() >= content_length {
+        if body.len() >= content_length {
             break;
         }
     }
-    stream.write_all(response.as_bytes()).await.unwrap();
     String::from_utf8_lossy(&buffer).to_string()
+}
+
+async fn join_server<T>(handle: &mut JoinHandle<T>, context: &str) -> T {
+    match timeout(TASK8_TIMEOUT, &mut *handle).await {
+        Ok(result) => result.unwrap_or_else(|error| panic!("{context} task failed: {error}")),
+        Err(_) => {
+            handle.abort();
+            panic!("timed out joining {context}");
+        }
+    }
+}
+
+/// 按 Content-Length 读全一个 HTTP 请求，返回请求原文，然后写回固定响应。
+async fn capture_request_and_respond(
+    listener: tokio::net::TcpListener,
+    response: String,
+) -> String {
+    let (mut stream, _) = timeout(TASK8_TIMEOUT, listener.accept())
+        .await
+        .expect("timed out accepting mock upstream connection")
+        .expect("failed accepting mock upstream connection");
+    let request = read_complete_request(&mut stream, "mock upstream request").await;
+    timeout(TASK8_TIMEOUT, stream.write_all(response.as_bytes()))
+        .await
+        .expect("timed out writing mock upstream response")
+        .expect("failed writing mock upstream response");
+    request
 }
 
 /// 构造 200 JSON 响应（content-length 按字节数计算）。
@@ -545,209 +601,303 @@ fn json_ok_response(body: &str) -> String {
 fn anthropic_settings(base_url: String) -> BackendSettings {
     BackendSettings {
         relay_profiles: vec![RelayProfile {
-            id: "ant".to_string(),
-            name: "Anthropic".to_string(),
+            id: "task8-anthropic-profile-unique".to_string(),
+            name: "Task 8 Anthropic Profile".to_string(),
             base_url,
-            api_key: "sk-ant-test".to_string(),
+            api_key: "sk-task8-anthropic-test".to_string(),
             protocol: RelayProtocol::Anthropic,
             relay_mode: RelayMode::MixedApi,
             ..RelayProfile::default()
         }],
-        active_relay_id: "ant".to_string(),
+        active_relay_id: "task8-anthropic-profile-unique".to_string(),
         ..BackendSettings::default()
     }
 }
 
 #[tokio::test]
 async fn end_to_end_responses_to_anthropic_roundtrip() {
-    // 1. 本地 mock 上游：固定返回含 text + tool_use 的 Anthropic message
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
     let addr = listener.local_addr().unwrap();
     let anthropic_body = json!({
-        "id": "msg_e2e",
+        "id": "msg_task8_roundtrip_unique",
         "type": "message",
         "role": "assistant",
-        "model": "k3",
+        "model": "task8-roundtrip-model",
         "stop_reason": "tool_use",
         "usage": {"input_tokens": 10, "output_tokens": 5},
         "content": [
-            {"type": "text", "text": "我来查一下"},
-            {"type": "tool_use", "id": "toolu_e2e", "name": "shell", "input": {"command": ["ls"]}}
+            {"type": "text", "text": "Task 8 roundtrip text"},
+            {"type": "tool_use", "id": "toolu_task8_roundtrip_unique", "name": "shell", "input": {"command": ["ls", "task8-roundtrip"]}}
         ]
     })
     .to_string();
-    let server = tokio::spawn(capture_request_and_respond(
+    let mut server = tokio::spawn(capture_request_and_respond(
         listener,
         json_ok_response(&anthropic_body),
     ));
 
-    // 2. anthropic profile 指向 mock，发起 codex Responses 请求
     let settings = anthropic_settings(format!("http://{addr}/v1"));
     let codex_body = json!({
-        "model": "k3",
-        "instructions": "You are Codex.",
-        "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        "model": "task8-roundtrip-model",
+        "instructions": "Task 8 roundtrip system instruction.",
+        "max_output_tokens": 1234,
+        "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Task 8 roundtrip user text"}]}],
         "stream": false
     });
-    let upstream = open_responses_proxy_request_with_settings(&codex_body.to_string(), settings, None)
-        .await
-        .unwrap();
+    let upstream = timeout(
+        TASK8_TIMEOUT,
+        open_responses_proxy_request_with_settings(&codex_body.to_string(), settings, None),
+    )
+    .await
+    .expect("timed out opening Task 8 roundtrip proxy request")
+    .expect("Task 8 roundtrip proxy request failed");
 
-    // 3. 断言 mock 收到的请求已转换为 Anthropic Messages 格式
-    let request = server.await.unwrap();
+    let request = join_server(&mut server, "Task 8 roundtrip mock server").await;
     let (head, body) = request.split_once("\r\n\r\n").unwrap();
     assert!(head.starts_with("POST /v1/messages HTTP/1.1"), "{head}");
-    let head_lower = head.to_ascii_lowercase();
-    assert!(head_lower.contains("x-api-key: sk-ant-test"), "{head}");
-    assert!(head_lower.contains("anthropic-version: 2023-06-01"), "{head}");
+    assert_eq!(
+        request_header_value(head, "x-api-key"),
+        "sk-task8-anthropic-test"
+    );
+    assert_eq!(
+        request_header_value(head, "anthropic-version"),
+        "2023-06-01"
+    );
+    assert_eq!(
+        request_header_value(head, "authorization"),
+        "Bearer sk-task8-anthropic-test"
+    );
+    assert_eq!(
+        request_header_value(head, "content-type"),
+        "application/json"
+    );
     let sent: serde_json::Value = serde_json::from_str(body).unwrap();
-    assert!(sent.get("system").is_some(), "{sent}");
-    assert!(sent.get("max_tokens").is_some(), "{sent}");
-    assert_eq!(sent["messages"][0]["role"], "user");
+    assert_eq!(sent["model"], "task8-roundtrip-model");
+    assert_eq!(
+        sent["system"],
+        json!([{
+            "type": "text",
+            "text": "Task 8 roundtrip system instruction.",
+            "cache_control": {"type": "ephemeral"}
+        }])
+    );
+    assert_eq!(sent["max_tokens"], 1234);
+    assert_eq!(
+        sent["messages"],
+        json!([{
+            "role": "user",
+            "content": [{"type": "text", "text": "Task 8 roundtrip user text"}]
+        }])
+    );
 
-    // 4. 断言上游标记为 anthropic 协议，响应可转换回 Responses JSON（含 message 与 function_call）
     assert_eq!(upstream.status_code, 200);
     assert_eq!(upstream.wire_api, UpstreamWireApi::AnthropicMessages);
-    let upstream_bytes = upstream.response.bytes().await.unwrap();
-    let upstream_json: serde_json::Value = serde_json::from_slice(&upstream_bytes).unwrap();
-    // 与 launcher.rs 非流式分支相同的转换入口
-    let converted = anthropic_message_to_response(&upstream_json, Some(&codex_body)).unwrap();
+    let wire_api = upstream.wire_api;
+    let upstream_content_type = upstream.content_type.clone();
+    let upstream_bytes = timeout(TASK8_TIMEOUT, upstream.response.bytes())
+        .await
+        .expect("timed out reading Task 8 roundtrip upstream response")
+        .expect("failed reading Task 8 roundtrip upstream response");
+    let finalized = finalize_non_streaming_responses_response(
+        wire_api,
+        &upstream_content_type,
+        &upstream_bytes,
+        Some(&codex_body),
+    )
+    .unwrap();
+    assert_eq!(finalized.status, "200 OK");
+    assert_eq!(finalized.content_type, "application/json; charset=utf-8");
+    let converted: serde_json::Value = serde_json::from_slice(&finalized.body).unwrap();
+    assert_eq!(converted["id"], "msg_task8_roundtrip_unique");
     assert_eq!(converted["object"], "response");
     assert_eq!(converted["status"], "completed");
-    let output = converted["output"].as_array().unwrap();
-    assert!(
-        output.iter().any(|item| item["type"] == "message"),
-        "{converted}"
+    assert_eq!(converted["model"], "task8-roundtrip-model");
+    assert_eq!(converted["usage"]["input_tokens"], 10);
+    assert_eq!(converted["usage"]["output_tokens"], 5);
+    assert_eq!(converted["usage"]["total_tokens"], 15);
+    assert_eq!(converted["output"][0]["type"], "message");
+    assert_eq!(converted["output"][0]["role"], "assistant");
+    assert_eq!(converted["output"][0]["content"][0]["type"], "output_text");
+    assert_eq!(
+        converted["output"][0]["content"][0]["text"],
+        "Task 8 roundtrip text"
     );
-    assert!(
-        output.iter().any(|item| item["type"] == "function_call"),
-        "{converted}"
+    assert_eq!(converted["output"][1]["type"], "function_call");
+    assert_eq!(
+        converted["output"][1]["call_id"],
+        "toolu_task8_roundtrip_unique"
     );
-    let call = output
-        .iter()
-        .find(|item| item["type"] == "function_call")
-        .unwrap();
-    assert_eq!(call["call_id"], "toolu_e2e");
-    assert_eq!(call["name"], "shell");
+    assert_eq!(converted["output"][1]["name"], "shell");
+    assert_eq!(
+        converted["output"][1]["arguments"],
+        "{\"command\":[\"ls\",\"task8-roundtrip\"]}"
+    );
 }
 
 #[tokio::test]
 async fn anthropic_strip_image_handling_applies_before_conversion() {
-    // model_vlm 把 k3 标记为 strip：input_image 应在转换为 anthropic body 之前被剥离
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
     let addr = listener.local_addr().unwrap();
     let anthropic_body = json!({
-        "id": "msg_strip",
+        "id": "msg_task8_vlm_strip_unique",
         "type": "message",
         "role": "assistant",
-        "model": "k3",
+        "model": "task8-vlm-strip-model",
         "stop_reason": "end_turn",
         "usage": {"input_tokens": 5, "output_tokens": 2},
-        "content": [{"type": "text", "text": "ok"}]
+        "content": [{"type": "text", "text": "Task 8 VLM response"}]
     })
     .to_string();
-    let server = tokio::spawn(capture_request_and_respond(
+    let mut server = tokio::spawn(capture_request_and_respond(
         listener,
         json_ok_response(&anthropic_body),
     ));
 
     let mut settings = anthropic_settings(format!("http://{addr}/v1"));
-    // model_vlm 为 model → ImageHandling 的 JSON map（vision.rs image_handling_mode）
-    settings.relay_profiles[0].model_vlm = r#"{"k3":"strip"}"#.to_string();
+    settings.relay_profiles[0].model_vlm = r#"{"task8-vlm-strip-model":"strip"}"#.to_string();
     let codex_body = json!({
-        "model": "k3",
+        "model": "task8-vlm-strip-model",
         "input": [{"type": "message", "role": "user", "content": [
-            {"type": "input_text", "text": "看图"},
-            {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+            {"type": "input_text", "text": "Task 8 VLM retained text"},
+            {"type": "input_image", "image_url": "data:image/png;base64,TASK8VLMUNIQUE="}
         ]}],
         "stream": false
     });
-    let upstream = open_responses_proxy_request_with_settings(&codex_body.to_string(), settings, None)
-        .await
-        .unwrap();
+    let upstream = timeout(
+        TASK8_TIMEOUT,
+        open_responses_proxy_request_with_settings(&codex_body.to_string(), settings, None),
+    )
+    .await
+    .expect("timed out opening Task 8 VLM proxy request")
+    .expect("Task 8 VLM proxy request failed");
     assert_eq!(upstream.status_code, 200);
+    assert_eq!(upstream.wire_api, UpstreamWireApi::AnthropicMessages);
 
-    // mock 收到的 anthropic body 中不应存在任何 image block，图片数据不得外泄
-    let request = server.await.unwrap();
-    let (_, body) = request.split_once("\r\n\r\n").unwrap();
+    let request = join_server(&mut server, "Task 8 VLM mock server").await;
+    let (head, body) = request.split_once("\r\n\r\n").unwrap();
+    assert!(head.starts_with("POST /v1/messages HTTP/1.1"), "{head}");
+    assert_eq!(
+        request_header_value(head, "content-type"),
+        "application/json"
+    );
     let sent: serde_json::Value = serde_json::from_str(body).unwrap();
-    let messages = sent["messages"].to_string();
-    assert!(!messages.contains("\"type\":\"image\""), "{sent}");
-    assert!(!messages.contains("iVBORw0KGgo="), "{sent}");
-    // 文本部分保留
-    assert!(messages.contains("看图"), "{sent}");
+    assert_eq!(sent["model"], "task8-vlm-strip-model");
+    assert_eq!(sent["stream"], false);
+    assert_eq!(sent["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(sent["messages"][0]["role"], "user");
+    let content = sent["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 1, "{sent}");
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "Task 8 VLM retained text");
+    assert!(
+        content.iter().all(|block| block["type"] != "image"),
+        "{sent}"
+    );
+    assert!(!body.contains("TASK8VLMUNIQUE="), "{sent}");
+    timeout(TASK8_TIMEOUT, upstream.response.bytes())
+        .await
+        .expect("timed out reading Task 8 VLM upstream response")
+        .expect("failed reading Task 8 VLM upstream response");
 }
 
 #[tokio::test]
 async fn aggregate_failover_to_anthropic_member() {
-    let _lock = aggregate_test_lock().lock().unwrap();
-    // 成员 A：chatCompletions 协议，mock 固定返回 500
+    let _lock = aggregate_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let first = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
     let first_addr = first.local_addr().unwrap();
-    let first_server = tokio::spawn(async move {
-        let (mut stream, _) = first.accept().await.unwrap();
-        let mut buffer = [0u8; 4096];
-        let _ = stream.read(&mut buffer).await.unwrap();
-        stream
-            .write_all(
-                b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 11\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"error\":1}",
-            )
+    let mut first_server = tokio::spawn(async move {
+        let (mut stream, _) = timeout(TASK8_TIMEOUT, first.accept())
             .await
-            .unwrap();
+            .expect("timed out accepting Task 8 aggregate member A connection")
+            .expect("failed accepting Task 8 aggregate member A connection");
+        let request = read_complete_request(&mut stream, "Task 8 aggregate member A request").await;
+        assert!(
+            request.starts_with("POST /v1/chat/completions HTTP/1.1"),
+            "{request}"
+        );
+        let (head, body) = request.split_once("\r\n\r\n").unwrap();
+        assert_eq!(
+            request_header_value(head, "authorization"),
+            "Bearer sk-task8-aggregate-member-a"
+        );
+        assert_eq!(
+            request_header_value(head, "content-type"),
+            "application/json"
+        );
+        let sent: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(sent["model"], "task8-aggregate-model");
+        assert_eq!(sent["stream"], false);
+        assert_eq!(sent["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(sent["messages"][0]["role"], "user");
+        assert_eq!(sent["messages"][0]["content"], "Task 8 aggregate user text");
+        assert_eq!(
+            sent["messages"],
+            json!([{"role": "user", "content": "Task 8 aggregate user text"}])
+        );
+        timeout(
+            TASK8_TIMEOUT,
+            stream.write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 11\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"error\":1}",
+            ),
+        )
+        .await
+        .expect("timed out writing Task 8 aggregate member A response")
+        .expect("failed writing Task 8 aggregate member A response");
     });
-    // 成员 B：anthropic 协议，mock 返回正常 Anthropic message
+
     let second = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
     let second_addr = second.local_addr().unwrap();
     let anthropic_body = json!({
-        "id": "msg_failover",
+        "id": "msg_task8_aggregate_member_b_unique",
         "type": "message",
         "role": "assistant",
-        "model": "k3",
+        "model": "task8-aggregate-model",
         "stop_reason": "end_turn",
         "usage": {"input_tokens": 8, "output_tokens": 3},
-        "content": [{"type": "text", "text": "来自成员B"}]
+        "content": [{"type": "text", "text": "Task 8 response from aggregate member B"}]
     })
     .to_string();
-    let second_server = tokio::spawn(capture_request_and_respond(
+    let mut second_server = tokio::spawn(capture_request_and_respond(
         second,
         json_ok_response(&anthropic_body),
     ));
 
-    // 聚合 profile：Failover 策略，A 在前 B 在后（构造方式参照 tests/protocol_proxy.rs）
-    let first_id = "agg-ant-a".to_string();
-    let second_id = "agg-ant-b".to_string();
-    let aggregate_id = "agg-ant".to_string();
+    let first_id = "task8-aggregate-member-a-chat-unique".to_string();
+    let second_id = "task8-aggregate-member-b-anthropic-unique".to_string();
+    let aggregate_id = "task8-aggregate-profile-unique".to_string();
     let settings = BackendSettings {
         relay_profiles: vec![
             RelayProfile {
                 id: first_id.clone(),
-                name: "member-a".to_string(),
+                name: "Task 8 Aggregate Member A".to_string(),
                 base_url: format!("http://{first_addr}/v1"),
-                api_key: "sk-first".to_string(),
+                api_key: "sk-task8-aggregate-member-a".to_string(),
                 protocol: RelayProtocol::ChatCompletions,
                 relay_mode: RelayMode::MixedApi,
                 ..RelayProfile::default()
             },
             RelayProfile {
                 id: second_id.clone(),
-                name: "member-b".to_string(),
+                name: "Task 8 Aggregate Member B".to_string(),
                 base_url: format!("http://{second_addr}/v1"),
-                api_key: "sk-second".to_string(),
+                api_key: "sk-task8-aggregate-member-b".to_string(),
                 protocol: RelayProtocol::Anthropic,
                 relay_mode: RelayMode::MixedApi,
                 ..RelayProfile::default()
             },
             RelayProfile {
                 id: aggregate_id.clone(),
-                name: "aggregate".to_string(),
+                name: "Task 8 Aggregate Profile".to_string(),
                 relay_mode: RelayMode::Aggregate,
                 ..RelayProfile::default()
             },
@@ -756,7 +906,7 @@ async fn aggregate_failover_to_anthropic_member() {
         active_aggregate_relay_id: aggregate_id.clone(),
         aggregate_relay_profiles: vec![AggregateRelayProfile {
             id: aggregate_id,
-            name: "aggregate".to_string(),
+            name: "Task 8 Aggregate Profile".to_string(),
             strategy: AggregateRelayStrategy::Failover,
             members: vec![
                 AggregateRelayMember {
@@ -773,28 +923,88 @@ async fn aggregate_failover_to_anthropic_member() {
     };
 
     let codex_body = json!({
-        "model": "k3",
-        "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        "model": "task8-aggregate-model",
+        "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Task 8 aggregate user text"}]}],
         "stream": false
     });
-    let upstream = open_responses_proxy_request_with_settings(&codex_body.to_string(), settings, None)
-        .await
-        .unwrap();
+    let upstream = timeout(
+        TASK8_TIMEOUT,
+        open_responses_proxy_request_with_settings(&codex_body.to_string(), settings, None),
+    )
+    .await
+    .expect("timed out opening Task 8 aggregate proxy request")
+    .expect("Task 8 aggregate proxy request failed");
 
-    // 成员 A 500 → 故障转移到成员 B；最终响应来自 B 且按 anthropic 协议转换
-    first_server.await.unwrap();
-    let second_request = second_server.await.unwrap();
+    join_server(&mut first_server, "Task 8 aggregate member A server").await;
+    let second_request = join_server(&mut second_server, "Task 8 aggregate member B server").await;
+    let (second_head, second_body) = second_request.split_once("\r\n\r\n").unwrap();
     assert!(
-        second_request.starts_with("POST /v1/messages HTTP/1.1"),
-        "{second_request}"
+        second_head.starts_with("POST /v1/messages HTTP/1.1"),
+        "{second_head}"
+    );
+    assert_eq!(
+        request_header_value(second_head, "x-api-key"),
+        "sk-task8-aggregate-member-b"
+    );
+    assert_eq!(
+        request_header_value(second_head, "anthropic-version"),
+        "2023-06-01"
+    );
+    assert_eq!(
+        request_header_value(second_head, "authorization"),
+        "Bearer sk-task8-aggregate-member-b"
+    );
+    assert_eq!(
+        request_header_value(second_head, "content-type"),
+        "application/json"
+    );
+    let second_sent: serde_json::Value = serde_json::from_str(second_body).unwrap();
+    assert_eq!(second_sent["model"], "task8-aggregate-model");
+    assert_eq!(second_sent["stream"], false);
+    assert_eq!(second_sent["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(second_sent["messages"][0]["role"], "user");
+    assert_eq!(
+        second_sent["messages"][0]["content"][0]["text"],
+        "Task 8 aggregate user text"
+    );
+    assert_eq!(
+        second_sent["messages"],
+        json!([{
+            "role": "user",
+            "content": [{"type": "text", "text": "Task 8 aggregate user text"}]
+        }])
     );
     assert_eq!(upstream.status_code, 200);
     assert_eq!(upstream.wire_api, UpstreamWireApi::AnthropicMessages);
-    let upstream_bytes = upstream.response.bytes().await.unwrap();
-    let upstream_json: serde_json::Value = serde_json::from_slice(&upstream_bytes).unwrap();
-    let converted = anthropic_message_to_response(&upstream_json, Some(&codex_body)).unwrap();
+    let wire_api = upstream.wire_api;
+    let upstream_content_type = upstream.content_type.clone();
+    let upstream_bytes = timeout(TASK8_TIMEOUT, upstream.response.bytes())
+        .await
+        .expect("timed out reading Task 8 aggregate upstream response")
+        .expect("failed reading Task 8 aggregate upstream response");
+    let finalized = finalize_non_streaming_responses_response(
+        wire_api,
+        &upstream_content_type,
+        &upstream_bytes,
+        Some(&codex_body),
+    )
+    .unwrap();
+    assert_eq!(finalized.status, "200 OK");
+    assert_eq!(finalized.content_type, "application/json; charset=utf-8");
+    let converted: serde_json::Value = serde_json::from_slice(&finalized.body).unwrap();
+    assert_eq!(converted["id"], "msg_task8_aggregate_member_b_unique");
     assert_eq!(converted["object"], "response");
     assert_eq!(converted["status"], "completed");
+    assert_eq!(converted["model"], "task8-aggregate-model");
+    assert_eq!(converted["usage"]["input_tokens"], 8);
+    assert_eq!(converted["usage"]["output_tokens"], 3);
+    assert_eq!(converted["usage"]["total_tokens"], 11);
+    assert_eq!(converted["output"].as_array().unwrap().len(), 1);
     assert_eq!(converted["output"][0]["type"], "message");
-    assert_eq!(converted["output"][0]["content"][0]["text"], "来自成员B");
+    assert_eq!(converted["output"][0]["role"], "assistant");
+    assert_eq!(converted["output"][0]["content"][0]["type"], "output_text");
+    assert_eq!(
+        converted["output"][0]["content"][0]["text"],
+        "Task 8 response from aggregate member B"
+    );
 }
