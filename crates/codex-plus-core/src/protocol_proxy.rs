@@ -3925,7 +3925,7 @@ fn normalize_chat_tool_arguments_string(text: &str) -> String {
     }
 }
 
-fn instruction_text(value: &Value) -> String {
+pub(crate) fn instruction_text(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         Value::Array(parts) => parts
