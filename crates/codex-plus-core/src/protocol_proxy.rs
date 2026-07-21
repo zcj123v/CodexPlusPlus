@@ -1767,7 +1767,7 @@ impl ChatSseState {
     }
 }
 
-fn take_sse_block(buffer: &mut String) -> Option<String> {
+pub(crate) fn take_sse_block(buffer: &mut String) -> Option<String> {
     let lf = buffer.find("\n\n").map(|index| (index, 2));
     let crlf = buffer.find("\r\n\r\n").map(|index| (index, 4));
     let (index, delimiter_len) = match (lf, crlf) {
@@ -1786,7 +1786,7 @@ fn take_sse_block(buffer: &mut String) -> Option<String> {
     Some(block)
 }
 
-fn append_utf8_safe(buffer: &mut String, remainder: &mut Vec<u8>, bytes: &[u8]) {
+pub(crate) fn append_utf8_safe(buffer: &mut String, remainder: &mut Vec<u8>, bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
@@ -1813,7 +1813,7 @@ fn append_utf8_safe(buffer: &mut String, remainder: &mut Vec<u8>, bytes: &[u8]) 
     }
 }
 
-fn strip_sse_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
+pub(crate) fn strip_sse_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
     let rest = line.strip_prefix(field)?.strip_prefix(':')?;
     Some(rest.strip_prefix(' ').unwrap_or(rest))
 }

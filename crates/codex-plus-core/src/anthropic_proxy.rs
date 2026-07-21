@@ -357,3 +357,419 @@ pub(crate) fn anthropic_usage_to_responses_usage(usage: Option<&Value>) -> Value
         "output_tokens_details": {"reasoning_tokens": 0}
     })
 }
+
+// ── SSE 流式转换 ──
+
+/// 打开的 content block 状态。
+#[derive(Default)]
+struct OpenBlock {
+    kind: String, // "text" | "tool_use" | "thinking"
+    item_id: String,
+    output_index: u64,
+    content_index: u64,
+    call_id: String,
+    name: String,
+    text_buffer: String,
+    args_buffer: String,
+    signature: String,
+}
+
+/// Anthropic SSE 流 → Responses SSE 流的增量转换器。
+///
+/// 与 `ChatSseToResponsesConverter` 结构对齐：push_bytes 增量喂入并返回
+/// 转换后的字节，finish 在流正常结束时收尾，fail 在流异常时输出
+/// `response.failed`。
+pub struct AnthropicSseToResponsesConverter {
+    buffer: String,
+    utf8_remainder: Vec<u8>,
+    response_id: String,
+    model: String,
+    input_usage: Value,
+    stop_reason: String,
+    output_usage: Value,
+    blocks: std::collections::HashMap<u64, OpenBlock>,
+    next_output_index: u64,
+    started: bool,
+    completed: bool,
+    failed: bool,
+}
+
+impl AnthropicSseToResponsesConverter {
+    pub fn with_request(_original_request: &Value) -> Self {
+        Self {
+            buffer: String::new(),
+            utf8_remainder: Vec::new(),
+            response_id: String::new(),
+            model: String::new(),
+            input_usage: json!({}),
+            stop_reason: String::new(),
+            output_usage: json!({}),
+            blocks: std::collections::HashMap::new(),
+            next_output_index: 0,
+            started: false,
+            completed: false,
+            failed: false,
+        }
+    }
+
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
+        crate::protocol_proxy::append_utf8_safe(&mut self.buffer, &mut self.utf8_remainder, bytes);
+        let mut output = String::new();
+        while let Some(block) = crate::protocol_proxy::take_sse_block(&mut self.buffer) {
+            if block.trim().is_empty() {
+                continue;
+            }
+            self.handle_block(&block, &mut output);
+            if self.failed {
+                break;
+            }
+        }
+        output.into_bytes()
+    }
+
+    pub fn finish(&mut self) -> Vec<u8> {
+        if !self.utf8_remainder.is_empty() {
+            self.buffer
+                .push_str(&String::from_utf8_lossy(&self.utf8_remainder));
+            self.utf8_remainder.clear();
+        }
+        let mut output = String::new();
+        // 上游提前断流：尽量收尾，未收到 message_stop 也补一个 completed
+        if self.started && !self.completed && !self.failed {
+            self.emit_completed(&mut output);
+        }
+        output.into_bytes()
+    }
+
+    pub fn fail(&mut self, message: String, error_type: Option<String>) -> Vec<u8> {
+        let mut output = String::new();
+        self.emit_failed(&mut output, message, error_type);
+        output.into_bytes()
+    }
+
+    fn handle_block(&mut self, block: &str, output: &mut String) {
+        let mut event_name = String::new();
+        let mut data_parts = Vec::new();
+        for line in block.lines() {
+            if let Some(value) = crate::protocol_proxy::strip_sse_field(line, "event") {
+                event_name = value.trim().to_string();
+            }
+            if let Some(value) = crate::protocol_proxy::strip_sse_field(line, "data") {
+                data_parts.push(value.to_string());
+            }
+        }
+        if data_parts.is_empty() {
+            return;
+        }
+        let Ok(data) = serde_json::from_str::<Value>(&data_parts.join("\n")) else {
+            return;
+        };
+        match event_name.as_str() {
+            "message_start" => self.on_message_start(&data, output),
+            "content_block_start" => self.on_block_start(&data, output),
+            "content_block_delta" => self.on_block_delta(&data, output),
+            "content_block_stop" => self.on_block_stop(&data, output),
+            "message_delta" => {
+                if let Some(stop) = data
+                    .get("delta")
+                    .and_then(|d| d.get("stop_reason"))
+                    .and_then(Value::as_str)
+                {
+                    self.stop_reason = stop.to_string();
+                }
+                if let Some(usage) = data.get("usage") {
+                    self.output_usage = usage.clone();
+                }
+            }
+            "message_stop" => self.emit_completed(output),
+            "error" => {
+                let message = data
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("upstream stream error")
+                    .to_string();
+                let error_type = data
+                    .get("error")
+                    .and_then(|e| e.get("type"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                self.emit_failed(output, message, error_type);
+            }
+            _ => { /* ping 等：忽略 */ }
+        }
+    }
+
+    fn response_skeleton(&self, status: &str) -> Value {
+        json!({
+            "id": self.response_id,
+            "object": "response",
+            "status": status,
+            "model": self.model,
+            "output": [],
+        })
+    }
+
+    fn emit(output: &mut String, event: &str, data: Value) {
+        output.push_str("event: ");
+        output.push_str(event);
+        output.push_str("\ndata: ");
+        output.push_str(&serde_json::to_string(&data).unwrap_or_else(|_| "{}".to_string()));
+        output.push_str("\n\n");
+    }
+
+    fn on_message_start(&mut self, data: &Value, output: &mut String) {
+        let message = data.get("message").cloned().unwrap_or(json!({}));
+        self.response_id = message
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("msg_unknown")
+            .to_string();
+        self.model = message
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        self.input_usage = message.get("usage").cloned().unwrap_or(json!({}));
+        self.started = true;
+        Self::emit(output, "response.created", json!({
+            "type": "response.created",
+            "response": self.response_skeleton("in_progress"),
+        }));
+        Self::emit(output, "response.in_progress", json!({
+            "type": "response.in_progress",
+            "response": self.response_skeleton("in_progress"),
+        }));
+    }
+
+    fn on_block_start(&mut self, data: &Value, output: &mut String) {
+        let index = data.get("index").and_then(Value::as_u64).unwrap_or(0);
+        let block = data.get("content_block").cloned().unwrap_or(json!({}));
+        let kind = block
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let output_index = self.next_output_index;
+        self.next_output_index += 1;
+        let item_id = format!("{}-item-{output_index}", self.response_id);
+
+        match kind.as_str() {
+            "text" => {
+                Self::emit(output, "response.output_item.added", json!({
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": {"type":"message","id":item_id,"role":"assistant","status":"in_progress","content":[]}
+                }));
+                Self::emit(output, "response.content_part.added", json!({
+                    "type": "response.content_part.added",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "part": {"type":"output_text","text":"","annotations":[]}
+                }));
+            }
+            "tool_use" => {
+                Self::emit(output, "response.output_item.added", json!({
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": {
+                        "type":"function_call","id":item_id,
+                        "call_id": block.get("id").and_then(Value::as_str).unwrap_or(""),
+                        "name": block.get("name").and_then(Value::as_str).unwrap_or(""),
+                        "arguments": "", "status": "in_progress"
+                    }
+                }));
+            }
+            "thinking" => {
+                Self::emit(output, "response.output_item.added", json!({
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": {"type":"reasoning","id":item_id,"summary":[]}
+                }));
+            }
+            _ => { /* 未知 block 类型：忽略 */ }
+        }
+        self.blocks.insert(
+            index,
+            OpenBlock {
+                kind,
+                item_id,
+                output_index,
+                content_index: 0,
+                call_id: block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                name: block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                ..OpenBlock::default()
+            },
+        );
+    }
+
+    fn on_block_delta(&mut self, data: &Value, output: &mut String) {
+        let index = data.get("index").and_then(Value::as_u64).unwrap_or(0);
+        let Some(block) = self.blocks.get_mut(&index) else {
+            return;
+        };
+        let delta = data.get("delta").cloned().unwrap_or(json!({}));
+        match delta.get("type").and_then(Value::as_str) {
+            Some("text_delta") => {
+                let text = delta.get("text").and_then(Value::as_str).unwrap_or("");
+                block.text_buffer.push_str(text);
+                Self::emit(output, "response.output_text.delta", json!({
+                    "type": "response.output_text.delta",
+                    "item_id": block.item_id,
+                    "output_index": block.output_index,
+                    "content_index": block.content_index,
+                    "delta": text,
+                }));
+            }
+            Some("input_json_delta") => {
+                // partial_json 片段原样转发，不重序列化
+                let partial = delta
+                    .get("partial_json")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                block.args_buffer.push_str(partial);
+                Self::emit(output, "response.function_call_arguments.delta", json!({
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": block.item_id,
+                    "output_index": block.output_index,
+                    "delta": partial,
+                }));
+            }
+            Some("thinking_delta") => {
+                let thinking = delta.get("thinking").and_then(Value::as_str).unwrap_or("");
+                block.text_buffer.push_str(thinking);
+                Self::emit(output, "response.reasoning_summary_text.delta", json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": block.item_id,
+                    "output_index": block.output_index,
+                    "summary_index": 0,
+                    "delta": thinking,
+                }));
+            }
+            Some("signature_delta") => {
+                if let Some(sig) = delta.get("signature").and_then(Value::as_str) {
+                    block.signature.push_str(sig);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_block_stop(&mut self, data: &Value, output: &mut String) {
+        let index = data.get("index").and_then(Value::as_u64).unwrap_or(0);
+        let Some(block) = self.blocks.remove(&index) else {
+            return;
+        };
+        match block.kind.as_str() {
+            "text" => {
+                Self::emit(output, "response.output_text.done", json!({
+                    "type": "response.output_text.done",
+                    "item_id": block.item_id,
+                    "output_index": block.output_index,
+                    "content_index": block.content_index,
+                    "text": block.text_buffer,
+                }));
+                Self::emit(output, "response.content_part.done", json!({
+                    "type": "response.content_part.done",
+                    "item_id": block.item_id,
+                    "output_index": block.output_index,
+                    "content_index": block.content_index,
+                    "part": {"type":"output_text","text":block.text_buffer,"annotations":[]}
+                }));
+                Self::emit(output, "response.output_item.done", json!({
+                    "type": "response.output_item.done",
+                    "output_index": block.output_index,
+                    "item": {"type":"message","id":block.item_id,"role":"assistant","status":"completed",
+                             "content":[{"type":"output_text","text":block.text_buffer,"annotations":[]}]}
+                }));
+            }
+            "tool_use" => {
+                Self::emit(output, "response.function_call_arguments.done", json!({
+                    "type": "response.function_call_arguments.done",
+                    "item_id": block.item_id,
+                    "output_index": block.output_index,
+                    "arguments": block.args_buffer,
+                }));
+                Self::emit(output, "response.output_item.done", json!({
+                    "type": "response.output_item.done",
+                    "output_index": block.output_index,
+                    "item": {"type":"function_call","id":block.item_id,"call_id":block.call_id,
+                             "name":block.name,"arguments":block.args_buffer,"status":"completed"}
+                }));
+            }
+            "thinking" => {
+                let mut item = json!({"type":"reasoning","id":block.item_id,
+                    "summary":[{"type":"summary_text","text":block.text_buffer}]});
+                if !block.signature.is_empty() {
+                    item["signature"] = json!(block.signature);
+                }
+                Self::emit(output, "response.reasoning_summary_text.done", json!({
+                    "type": "response.reasoning_summary_text.done",
+                    "item_id": block.item_id,
+                    "output_index": block.output_index,
+                    "summary_index": 0,
+                    "text": block.text_buffer,
+                }));
+                Self::emit(output, "response.output_item.done", json!({
+                    "type": "response.output_item.done",
+                    "output_index": block.output_index,
+                    "item": item,
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    fn emit_completed(&mut self, output: &mut String) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        // message_start 的 input usage 与 message_delta 的 output usage 合并
+        let mut usage = self.input_usage.clone();
+        if let (Some(target), Some(source)) = (usage.as_object_mut(), self.output_usage.as_object())
+        {
+            for (key, value) in source {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+        let mut response = self.response_skeleton(if self.stop_reason == "max_tokens" {
+            "incomplete"
+        } else {
+            "completed"
+        });
+        response["usage"] = anthropic_usage_to_responses_usage(Some(&usage));
+        if self.stop_reason == "max_tokens" {
+            response["incomplete_details"] = json!({"reason": "max_output_tokens"});
+        }
+        Self::emit(output, "response.completed", json!({
+            "type": "response.completed",
+            "response": response,
+        }));
+    }
+
+    fn emit_failed(&mut self, output: &mut String, message: String, error_type: Option<String>) {
+        if self.failed {
+            return;
+        }
+        self.failed = true;
+        let mut response = self.response_skeleton("failed");
+        response["error"] = json!({
+            "code": error_type.unwrap_or_else(|| "upstream_error".to_string()),
+            "message": message,
+        });
+        Self::emit(output, "response.failed", json!({
+            "type": "response.failed",
+            "response": response,
+        }));
+    }
+}
