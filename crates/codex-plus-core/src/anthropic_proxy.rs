@@ -820,6 +820,93 @@ pub fn anthropic_request_builder(
     builder.json(upstream_body)
 }
 
+/// Anthropic Models API 响应 → OpenAI /v1/models 格式。
+/// 非 Anthropic 格式（无 "type":"model" 条目）原样返回，便于直接透传。
+pub fn anthropic_models_to_openai_models(body: &Value) -> Value {
+    let Some(data) = body.get("data").and_then(Value::as_array) else {
+        return body.clone();
+    };
+    let is_anthropic = data
+        .iter()
+        .any(|item| item.get("type").and_then(Value::as_str) == Some("model"));
+    if !is_anthropic {
+        return body.clone();
+    }
+    let models: Vec<Value> = data
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("model"))
+        .map(|item| {
+            let created = item
+                .get("created_at")
+                .and_then(Value::as_str)
+                .and_then(parse_rfc3339_unix_seconds)
+                .unwrap_or(0);
+            json!({
+                "id": item.get("id").and_then(Value::as_str).unwrap_or(""),
+                "object": "model",
+                "created": created,
+                "owned_by": "anthropic",
+            })
+        })
+        .collect();
+    json!({"object": "list", "data": models})
+}
+
+/// 最小 RFC 3339 → unix 秒解析：仅处理 `YYYY-MM-DDTHH:MM:SSZ`
+/// 和带 `+hh:mm` / `-hh:mm` 偏移的形态（Anthropic created_at 的实际格式）。
+/// 项目无 chrono/time 直接依赖，故手写；解析失败返回 None。
+fn parse_rfc3339_unix_seconds(text: &str) -> Option<i64> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 20 && bytes.len() != 25 {
+        return None;
+    }
+    let digit = |index: usize| -> Option<i64> {
+        bytes
+            .get(index)
+            .filter(|ch| ch.is_ascii_digit())
+            .map(|ch| (ch - b'0') as i64)
+    };
+    let num2 = |index: usize| -> Option<i64> { Some(digit(index)? * 10 + digit(index + 1)?) };
+    let year = Some(digit(0)? * 1000 + digit(1)? * 100 + digit(2)? * 10 + digit(3)?)?;
+    let month = num2(5)?;
+    let day = num2(8)?;
+    let hour = num2(11)?;
+    let minute = num2(14)?;
+    let second = num2(17)?;
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let offset_seconds: i64 = match bytes[19] {
+        b'Z' if bytes.len() == 20 => 0,
+        sign @ (b'+' | b'-') if bytes.len() == 25 && bytes[22] == b':' => {
+            let value = num2(20)? * 3600 + num2(23)? * 60;
+            if sign == b'+' { value } else { -value }
+        }
+        _ => return None,
+    };
+    // Howard Hinnant 的 days_from_civil：公历日期 → 距 1970-01-01 的天数
+    let shifted_year = if month <= 2 { year - 1 } else { year };
+    let era = if shifted_year >= 0 {
+        shifted_year
+    } else {
+        shifted_year - 399
+    } / 400;
+    let year_of_era = shifted_year - era * 400;
+    let shifted_month = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Some(days * 86_400 + hour * 3600 + minute * 60 + second - offset_seconds)
+}
+
 /// Anthropic 错误体 → codex Responses 错误结构。
 pub fn anthropic_error_to_responses_error(status_code: u16, body: &[u8]) -> Value {
     let parsed = serde_json::from_slice::<Value>(body).ok();

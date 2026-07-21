@@ -1339,6 +1339,21 @@ async fn handle_models_proxy_connection(
         upstream.content_type.clone()
     };
     let body = upstream.response.bytes().await?.to_vec();
+    // Anthropic 上游成功时把 models 列表转成 OpenAI 格式再回给客户端
+    let body = if is_success
+        && upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages
+    {
+        serde_json::from_slice::<serde_json::Value>(&body)
+            .map(|json| {
+                serde_json::to_vec(&crate::anthropic_proxy::anthropic_models_to_openai_models(
+                    &json,
+                ))
+                .unwrap_or_default()
+            })
+            .unwrap_or(body)
+    } else {
+        body
+    };
     write_http_response(stream, &status, &content_type, &body).await?;
     log_helper_response(
         if is_success {

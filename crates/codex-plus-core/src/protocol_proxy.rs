@@ -713,25 +713,45 @@ pub async fn open_models_proxy_request(
     let relay = crate::relay_rotation::select_relay_for_probe(&settings)?;
     validate_upstream(&relay)?;
 
-    let endpoint = models_url(&relay.base_url);
+    let is_anthropic = relay.protocol == RelayProtocol::Anthropic;
+    // Anthropic 协议下带路径的 base 也需补 /v1，故走 anthropic_models_url
+    let endpoint = if is_anthropic {
+        anthropic_models_url(&relay.base_url)
+    } else {
+        models_url(&relay.base_url)
+    };
+    let wire_api = if is_anthropic {
+        UpstreamWireApi::AnthropicMessages
+    } else {
+        UpstreamWireApi::Responses
+    };
     let _ = crate::diagnostic_log::append_diagnostic_log(
         "protocol_proxy.models_request",
         json!({
             "relayId": relay.id,
             "relayName": relay.name,
             "endpoint": endpoint,
-            "wireApi": UpstreamWireApi::Responses
+            "wireApi": wire_api
         }),
     );
-    let upstream = send_upstream_request(
-        crate::http_client::proxied_client(&effective_user_agent(
-            &relay.user_agent,
-            original_user_agent,
-        ))?
-        .get(endpoint)
-        .bearer_auth(relay.api_key.trim()),
-    )
-    .await?;
+    let client = crate::http_client::proxied_client(&effective_user_agent(
+        &relay.user_agent,
+        original_user_agent,
+    ))?;
+    let request = if is_anthropic {
+        // Anthropic 三头认证，与 messages 请求保持一致
+        client
+            .get(&endpoint)
+            .header("x-api-key", relay.api_key.trim())
+            .header(
+                "anthropic-version",
+                crate::anthropic_proxy::ANTHROPIC_VERSION,
+            )
+            .bearer_auth(relay.api_key.trim())
+    } else {
+        client.get(&endpoint).bearer_auth(relay.api_key.trim())
+    };
+    let upstream = send_upstream_request(request).await?;
     let status_code = upstream.status().as_u16();
     let content_type = upstream
         .headers()
@@ -744,7 +764,7 @@ pub async fn open_models_proxy_request(
         status_code,
         is_stream: false,
         content_type,
-        wire_api: UpstreamWireApi::Responses,
+        wire_api,
         response: upstream,
     })
 }
@@ -1151,6 +1171,26 @@ pub fn anthropic_messages_url(base_url: &str) -> String {
         format!("{base}/messages")
     } else {
         format!("{base}/v1/messages")
+    };
+    while url.contains("/v1/v1") {
+        url = url.replace("/v1/v1", "/v1");
+    }
+    url
+}
+
+/// Anthropic Models 端点拼接，规则与 `anthropic_messages_url` 一致（端点名 models）。
+/// 与 `models_url` 不同：带路径的 base（如 `https://api.kimi.com/coding`）同样补 `/v1`；
+/// 已是完整端点或以 /models 结尾则原样返回。
+pub fn anthropic_models_url(base_url: &str) -> String {
+    let skip_version_prefix = base_url.trim().ends_with('#');
+    let base = base_url.trim().trim_end_matches('#').trim_end_matches('/');
+    if base.to_ascii_lowercase().ends_with("/models") {
+        return base.to_string();
+    }
+    let mut url = if skip_version_prefix || has_version_suffix(base) {
+        format!("{base}/models")
+    } else {
+        format!("{base}/v1/models")
     };
     while url.contains("/v1/v1") {
         url = url.replace("/v1/v1", "/v1");

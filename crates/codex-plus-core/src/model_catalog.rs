@@ -25,6 +25,8 @@ struct ModelSource {
     name: String,
     base_url: String,
     api_key: String,
+    /// 是否 Anthropic 协议来源（影响端点拼接、认证头与响应转换），缺省 false
+    anthropic: bool,
 }
 
 #[derive(Debug, Default)]
@@ -389,6 +391,7 @@ fn model_sources_from_environment(
         } else {
             api_key
         },
+        anthropic: false,
     }]
 }
 
@@ -425,6 +428,7 @@ fn model_source_from_config(
         },
         base_url,
         api_key,
+        anthropic: false,
     })
 }
 
@@ -472,7 +476,12 @@ async fn fetch_models_from_source(
     client: &reqwest::Client,
     source: &ModelSource,
 ) -> (Vec<String>, Value) {
-    let endpoint = models_endpoint(&source.base_url);
+    let endpoint = if source.anthropic {
+        // Anthropic 协议：带路径的 base 同样补 /v1，规则同 anthropic_messages_url
+        crate::protocol_proxy::anthropic_models_url(&source.base_url)
+    } else {
+        models_endpoint(&source.base_url)
+    };
     let mut safe_source = json!({
         "id": source.source_id,
         "type": source.source_type,
@@ -492,12 +501,28 @@ async fn fetch_models_from_source(
         .get(&endpoint)
         .header(reqwest::header::ACCEPT, "application/json");
     if !source.api_key.is_empty() {
-        request = request.bearer_auth(&source.api_key);
+        request = if source.anthropic {
+            // Anthropic 三头认证，与 messages 请求保持一致
+            request
+                .header("x-api-key", &source.api_key)
+                .header(
+                    "anthropic-version",
+                    crate::anthropic_proxy::ANTHROPIC_VERSION,
+                )
+                .bearer_auth(&source.api_key)
+        } else {
+            request.bearer_auth(&source.api_key)
+        };
     }
 
     match request.send().await {
         Ok(response) if response.status().is_success() => match response.json::<Value>().await {
             Ok(payload) => {
+                let payload = if source.anthropic {
+                    crate::anthropic_proxy::anthropic_models_to_openai_models(&payload)
+                } else {
+                    payload
+                };
                 let models = unique_strings(parse_model_payload(&payload));
                 safe_source["status"] = json!("ok");
                 safe_source["models"] = json!(models.len());
@@ -543,11 +568,16 @@ pub async fn fetch_relay_profile_model_ids(
             profile.upstream_base_url.trim().to_string()
         },
         api_key: profile.api_key.trim().to_string(),
+        anthropic: profile.protocol == crate::settings::RelayProtocol::Anthropic,
     };
     if source.base_url.is_empty() {
         anyhow::bail!("Base URL 不能为空");
     }
-    let endpoint = models_endpoint(&source.base_url);
+    let endpoint = if source.anthropic {
+        crate::protocol_proxy::anthropic_models_url(&source.base_url)
+    } else {
+        models_endpoint(&source.base_url)
+    };
     let client = crate::http_client::proxied_client(&profile.user_agent)?;
     let (models, status) = fetch_models_from_source(&client, &source).await;
     if models.is_empty() {
