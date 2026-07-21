@@ -138,3 +138,51 @@ fn maps_reasoning_effort_to_thinking_budget() {
     let out = responses_to_anthropic_messages(&body).unwrap();
     assert!(out.get("thinking").is_none());
 }
+
+use codex_plus_core::anthropic_proxy::anthropic_message_to_response;
+
+#[test]
+fn converts_message_with_text_tool_use_and_thinking() {
+    let body = json!({
+        "id": "msg_01",
+        "model": "k3",
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 100, "output_tokens": 50,
+                  "cache_read_input_tokens": 80, "cache_creation_input_tokens": 20},
+        "content": [
+            {"type":"thinking","thinking":"先看下目录","signature":"sig-abc"},
+            {"type":"text","text":"我来列一下文件"},
+            {"type":"tool_use","id":"toolu_1","name":"shell","input":{"command":["ls"]}}
+        ]
+    });
+    let out = anthropic_message_to_response(&body, None).unwrap();
+    assert_eq!(out["object"], "response");
+    assert_eq!(out["status"], "completed");
+    let output = out["output"].as_array().unwrap();
+    assert_eq!(output[0]["type"], "reasoning");
+    assert_eq!(output[0]["summary"][0]["text"], "先看下目录");
+    assert_eq!(output[0]["signature"], "sig-abc");
+    assert_eq!(output[1]["type"], "message");
+    assert_eq!(output[1]["content"][0]["type"], "output_text");
+    assert_eq!(output[1]["content"][0]["text"], "我来列一下文件");
+    assert_eq!(output[2]["type"], "function_call");
+    assert_eq!(output[2]["call_id"], "toolu_1");
+    assert_eq!(output[2]["name"], "shell");
+    assert_eq!(output[2]["arguments"], "{\"command\":[\"ls\"]}");
+    // usage 透传（含缓存字段）
+    assert_eq!(out["usage"]["input_tokens"], 100);
+    assert_eq!(out["usage"]["output_tokens"], 50);
+    assert_eq!(out["usage"]["input_tokens_details"]["cached_tokens"], 80);
+}
+
+#[test]
+fn maps_max_tokens_stop_to_incomplete() {
+    let body = json!({
+        "id": "msg_02", "model": "k3", "stop_reason": "max_tokens",
+        "usage": {"input_tokens": 1, "output_tokens": 32000},
+        "content": [{"type":"text","text":"..."}]
+    });
+    let out = anthropic_message_to_response(&body, None).unwrap();
+    assert_eq!(out["status"], "incomplete");
+    assert_eq!(out["incomplete_details"]["reason"], "max_output_tokens");
+}
