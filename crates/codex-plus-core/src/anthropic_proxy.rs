@@ -330,7 +330,7 @@ pub fn anthropic_message_to_response(
     Ok(response)
 }
 
-/// Anthropic usage → Responses usage（缓存 token 透传）。
+/// Anthropic usage → Responses usage（缓存 token 计入总输入）。
 pub(crate) fn anthropic_usage_to_responses_usage(usage: Option<&Value>) -> Value {
     let Some(usage) = usage else {
         return json!({"input_tokens": 0, "output_tokens": 0, "total_tokens": 0});
@@ -341,12 +341,18 @@ pub(crate) fn anthropic_usage_to_responses_usage(usage: Option<&Value>) -> Value
         .get("cache_read_input_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    // input_tokens 原样透传（cached_tokens 作为其明细字段，不重复计入总数）。
-    // 注意：Anthropic 的 cache_creation_input_tokens 暂不计入 input_tokens，见 task-3 报告。
+    let cache_creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    // Anthropic 的 input_tokens 不含缓存读/写，而 OpenAI Responses 的
+    // input_tokens 是含缓存的总输入（codex 依赖它做上下文窗口核算），
+    // 因此需要把 cache_read 与 cache_creation 都计入总输入。
+    let total_input = input + cached + cache_creation;
     json!({
-        "input_tokens": input,
+        "input_tokens": total_input,
         "output_tokens": output,
-        "total_tokens": input + output,
+        "total_tokens": total_input + output,
         "input_tokens_details": {"cached_tokens": cached},
         "output_tokens_details": {"reasoning_tokens": 0}
     })
