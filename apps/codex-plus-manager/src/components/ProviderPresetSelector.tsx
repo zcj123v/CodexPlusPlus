@@ -1,30 +1,9 @@
 import { useState, useMemo } from "react";
-import type { ProviderPreset, RelayProtocol } from "../presets";
-import { PRESETS } from "../presets";
+import type { ProviderPreset, PresetPatch } from "../presets";
+import { PRESETS, createPresetPatch } from "../presets";
 import { t, tf } from "@/i18n";
 
-export type RelayProfile = {
-  id: string;
-  name: string;
-  model: string;
-  baseUrl: string;
-  upstreamBaseUrl: string;
-  apiKey: string;
-  protocol: RelayProtocol;
-  relayMode: string;
-  officialMixApiKey: boolean;
-  testModel: string;
-  configContents: string;
-  authContents: string;
-  useCommonConfig: boolean;
-  contextWindow: string;
-  autoCompactLimit: string;
-  modelInsertMode: string;
-  modelList: string;
-  userAgent: string;
-};
-
-export type PresetPatch = Partial<RelayProfile>;
+export type { PresetPatch } from "../presets";
 
 const categoryLabels: Record<string, string> = {
   official: t("官方"),
@@ -36,20 +15,6 @@ const categoryLabels: Record<string, string> = {
 const initialFor = (name: string): string => {
   return name.charAt(0).toUpperCase();
 };
-
-export function createPresetPatch(preset: ProviderPreset): PresetPatch {
-  return {
-    name: preset.name,
-    baseUrl: preset.baseUrl,
-    upstreamBaseUrl: preset.baseUrl,
-    protocol: preset.protocol,
-    model: preset.model,
-    testModel: preset.model,
-    modelList: preset.modelList?.join("\n") ?? "",
-    relayMode: preset.category === "official" ? "official" : "pureApi",
-    officialMixApiKey: false,
-  };
-}
 
 export function ProviderPresetSelector({
   onSelect,

@@ -2,7 +2,7 @@
 //! codex Responses API ↔ Anthropic Messages API 的请求/响应/SSE 双向转换。
 //! 硬约束：工具定义、调用参数、工具结果、system prompt 语义零改写（见设计文档第 3 节）。
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub const DEFAULT_ANTHROPIC_MAX_TOKENS: u64 = 32000;
@@ -81,8 +81,8 @@ pub fn responses_to_anthropic_messages(body: &Value) -> anyhow::Result<Value> {
                         .get("arguments")
                         .and_then(Value::as_str)
                         .unwrap_or("{}");
-                    let input = serde_json::from_str::<Value>(arguments)
-                        .unwrap_or_else(|_| json!({}));
+                    let input =
+                        serde_json::from_str::<Value>(arguments).unwrap_or_else(|_| json!({}));
                     pending_assistant.push(json!({
                         "type": "tool_use",
                         "id": item.get("call_id").and_then(Value::as_str).unwrap_or(""),
@@ -92,11 +92,15 @@ pub fn responses_to_anthropic_messages(body: &Value) -> anyhow::Result<Value> {
                 }
                 Some("function_call_output") => {
                     flush_assistant(&mut messages, &mut pending_assistant);
-                    let output = item.get("output").cloned().unwrap_or(json!(""));
+                    let content = match item.get("output") {
+                        Some(Value::String(value)) => value.clone(),
+                        None | Some(Value::Null) => String::new(),
+                        Some(value) => stable_json_string(value),
+                    };
                     pending_user.push(json!({
                         "type": "tool_result",
                         "tool_use_id": item.get("call_id").and_then(Value::as_str).unwrap_or(""),
-                        "content": output,
+                        "content": content,
                     }));
                 }
                 Some("reasoning") => {
@@ -135,11 +139,14 @@ pub fn responses_to_anthropic_messages(body: &Value) -> anyhow::Result<Value> {
             .iter()
             .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
             .map(|tool| {
-                json!({
+                let mut converted = json!({
                     "name": tool.get("name").and_then(Value::as_str).unwrap_or(""),
-                    "description": tool.get("description").and_then(Value::as_str).unwrap_or(""),
                     "input_schema": tool.get("parameters").cloned().unwrap_or(json!({"type":"object"})),
-                })
+                });
+                if let Some(description) = tool.get("description").and_then(Value::as_str) {
+                    converted["description"] = json!(description);
+                }
+                converted
             })
             .collect();
         if !converted.is_empty() {
@@ -230,18 +237,72 @@ fn input_image_to_anthropic(part: &Value) -> Option<Value> {
     None
 }
 
-/// 提取 reasoning item 的文本（summary 首段优先，其次 content 首段）。
+/// 将 JSON 值序列化为键顺序稳定的紧凑字符串。
+fn stable_json_string(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<_> = map.keys().collect();
+            keys.sort_unstable();
+            let fields: Vec<String> = keys
+                .into_iter()
+                .map(|key| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string()),
+                        stable_json_string(&map[key])
+                    )
+                })
+                .collect();
+            format!("{{{}}}", fields.join(","))
+        }
+        Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(stable_json_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        _ => serde_json::to_string(value).unwrap_or_default(),
+    }
+}
+
+/// 提取 reasoning item 的文本：summary 全部文本优先，否则使用 content 全部文本。
 fn reasoning_item_text(item: &Value) -> String {
     for key in ["summary", "content"] {
         if let Some(parts) = item.get(key).and_then(Value::as_array) {
-            for part in parts {
-                if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    return text.to_string();
-                }
+            let texts: Vec<_> = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect();
+            if !texts.is_empty() {
+                return texts.join("\n");
             }
         }
     }
     String::new()
+}
+
+const RESPONSE_REQUEST_FIELDS: [&str; 11] = [
+    "instructions",
+    "max_output_tokens",
+    "parallel_tool_calls",
+    "previous_response_id",
+    "reasoning",
+    "temperature",
+    "tool_choice",
+    "tools",
+    "top_p",
+    "metadata",
+    "store",
+];
+
+fn copy_response_request_fields(response: &mut Value, request: &Value) {
+    for key in RESPONSE_REQUEST_FIELDS {
+        if let Some(value) = request.get(key) {
+            response[key] = value.clone();
+        }
+    }
 }
 
 /// Anthropic Messages 响应体 → codex Responses 响应体（非流式）。
@@ -257,18 +318,24 @@ pub fn anthropic_message_to_response(
     let mut output: Vec<Value> = Vec::new();
 
     if let Some(blocks) = body.get("content").and_then(Value::as_array) {
-        for block in blocks {
+        for (content_index, block) in blocks.iter().enumerate() {
+            let kind = match block.get("type").and_then(Value::as_str) {
+                Some("thinking") => "reasoning",
+                Some("text") => "message",
+                Some("tool_use") => "function_call",
+                _ => continue,
+            };
+            let item_id = format!("{response_id}-{kind}-{content_index}");
             match block.get("type").and_then(Value::as_str) {
                 Some("thinking") => {
                     let mut item = json!({
                         "type": "reasoning",
-                        "id": response_id,
+                        "id": item_id,
                         "summary": [{
                             "type": "summary_text",
                             "text": block.get("thinking").and_then(Value::as_str).unwrap_or("")
                         }]
                     });
-                    // 存下签名供多轮回传（Task 2 请求转换读取）
                     if let Some(signature) = block.get("signature").and_then(Value::as_str) {
                         item["signature"] = json!(signature);
                     }
@@ -277,7 +344,7 @@ pub fn anthropic_message_to_response(
                 Some("text") => {
                     output.push(json!({
                         "type": "message",
-                        "id": response_id,
+                        "id": item_id,
                         "role": "assistant",
                         "status": "completed",
                         "content": [{
@@ -291,19 +358,22 @@ pub fn anthropic_message_to_response(
                     let input = block.get("input").cloned().unwrap_or(json!({}));
                     output.push(json!({
                         "type": "function_call",
-                        "id": response_id,
+                        "id": item_id,
                         "call_id": block.get("id").and_then(Value::as_str).unwrap_or(""),
                         "name": block.get("name").and_then(Value::as_str).unwrap_or(""),
-                        "arguments": serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string()),
+                        "arguments": stable_json_string(&input),
                         "status": "completed"
                     }));
                 }
-                _ => { /* 未知 block：跳过 */ }
+                _ => {}
             }
         }
     }
 
-    let stop_reason = body.get("stop_reason").and_then(Value::as_str).unwrap_or("");
+    let stop_reason = body
+        .get("stop_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let mut response = json!({
         "id": response_id,
         "object": "response",
@@ -319,13 +389,8 @@ pub fn anthropic_message_to_response(
     if stop_reason == "max_tokens" {
         response["incomplete_details"] = json!({"reason": "max_output_tokens"});
     }
-    // 回显请求侧关键字段（与 chat 转换 copy_response_request_fields 对齐的最小子集）
     if let Some(request) = original_request {
-        for key in ["instructions", "parallel_tool_calls", "store"] {
-            if let Some(value) = request.get(key) {
-                response[key] = value.clone();
-            }
-        }
+        copy_response_request_fields(&mut response, request);
     }
     Ok(response)
 }
@@ -335,8 +400,14 @@ pub(crate) fn anthropic_usage_to_responses_usage(usage: Option<&Value>) -> Value
     let Some(usage) = usage else {
         return json!({"input_tokens": 0, "output_tokens": 0, "total_tokens": 0});
     };
-    let input = usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
-    let output = usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let input = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let cached = usage
         .get("cache_read_input_tokens")
         .and_then(Value::as_u64)
@@ -371,7 +442,18 @@ struct OpenBlock {
     name: String,
     text_buffer: String,
     args_buffer: String,
-    signature: String,
+    initial_tool_input: String,
+    received_args_delta: bool,
+    signature: Option<String>,
+}
+
+/// SSE 流的唯一终态。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TerminalState {
+    Open,
+    Completed,
+    Incomplete,
+    Failed,
 }
 
 /// Anthropic SSE 流 → Responses SSE 流的增量转换器。
@@ -388,14 +470,16 @@ pub struct AnthropicSseToResponsesConverter {
     stop_reason: String,
     output_usage: Value,
     blocks: std::collections::HashMap<u64, OpenBlock>,
-    next_output_index: u64,
+    seen_block_indices: std::collections::HashSet<u64>,
+    done_items: std::collections::BTreeMap<u64, Value>,
+    original_request: Value,
+    created_at: u64,
     started: bool,
-    completed: bool,
-    failed: bool,
+    terminal: TerminalState,
 }
 
 impl AnthropicSseToResponsesConverter {
-    pub fn with_request(_original_request: &Value) -> Self {
+    pub fn with_request(original_request: &Value) -> Self {
         Self {
             buffer: String::new(),
             utf8_remainder: Vec::new(),
@@ -405,22 +489,29 @@ impl AnthropicSseToResponsesConverter {
             stop_reason: String::new(),
             output_usage: json!({}),
             blocks: std::collections::HashMap::new(),
-            next_output_index: 0,
+            seen_block_indices: std::collections::HashSet::new(),
+            done_items: std::collections::BTreeMap::new(),
+            original_request: original_request.clone(),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0),
             started: false,
-            completed: false,
-            failed: false,
+            terminal: TerminalState::Open,
         }
     }
 
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
+        if self.terminal != TerminalState::Open {
+            return Vec::new();
+        }
         crate::protocol_proxy::append_utf8_safe(&mut self.buffer, &mut self.utf8_remainder, bytes);
         let mut output = String::new();
         while let Some(block) = crate::protocol_proxy::take_sse_block(&mut self.buffer) {
-            if block.trim().is_empty() {
-                continue;
+            if !block.trim().is_empty() {
+                self.handle_block(&block, &mut output);
             }
-            self.handle_block(&block, &mut output);
-            if self.failed {
+            if self.terminal != TerminalState::Open {
                 break;
             }
         }
@@ -428,44 +519,50 @@ impl AnthropicSseToResponsesConverter {
     }
 
     pub fn finish(&mut self) -> Vec<u8> {
+        if self.terminal != TerminalState::Open {
+            return Vec::new();
+        }
         if !self.utf8_remainder.is_empty() {
             self.buffer
                 .push_str(&String::from_utf8_lossy(&self.utf8_remainder));
             self.utf8_remainder.clear();
         }
         let mut output = String::new();
-        // 与 push_bytes 相同的逻辑：先把 buffer 中完整的 SSE block 处理完
         while let Some(block) = crate::protocol_proxy::take_sse_block(&mut self.buffer) {
-            if block.trim().is_empty() {
-                continue;
+            if !block.trim().is_empty() {
+                self.handle_block(&block, &mut output);
             }
-            self.handle_block(&block, &mut output);
-            if self.failed {
-                break;
-            }
-        }
-        // buffer 中若仍有非空残留，说明最后一个事件没带尾部空行，
-        // 上游已结束，按完整 block 尝试解析一次（如末尾的 message_delta/message_stop）
-        if !self.failed {
-            let tail = std::mem::take(&mut self.buffer);
-            if !tail.trim().is_empty() {
-                self.handle_block(&tail, &mut output);
+            if self.terminal != TerminalState::Open {
+                return output.into_bytes();
             }
         }
-        // 上游提前断流：尽量收尾，未收到 message_stop 也补一个 completed
-        if self.started && !self.completed && !self.failed {
-            self.emit_completed(&mut output);
+        let tail = std::mem::take(&mut self.buffer);
+        if !tail.trim().is_empty() {
+            self.handle_block(&tail, &mut output);
+        }
+        if self.terminal == TerminalState::Open {
+            self.emit_failed(
+                &mut output,
+                "upstream stream ended before message_stop".to_string(),
+                Some("unexpected_eof".to_string()),
+            );
         }
         output.into_bytes()
     }
 
     pub fn fail(&mut self, message: String, error_type: Option<String>) -> Vec<u8> {
+        if self.terminal != TerminalState::Open {
+            return Vec::new();
+        }
         let mut output = String::new();
         self.emit_failed(&mut output, message, error_type);
         output.into_bytes()
     }
 
     fn handle_block(&mut self, block: &str, output: &mut String) {
+        if self.terminal != TerminalState::Open {
+            return;
+        }
         let mut event_name = String::new();
         let mut data_parts = Vec::new();
         for line in block.lines() {
@@ -476,45 +573,59 @@ impl AnthropicSseToResponsesConverter {
                 data_parts.push(value.to_string());
             }
         }
+        let recognized = matches!(
+            event_name.as_str(),
+            "message_start"
+                | "content_block_start"
+                | "content_block_delta"
+                | "content_block_stop"
+                | "message_delta"
+                | "message_stop"
+                | "error"
+        );
+        if !recognized {
+            return;
+        }
         if data_parts.is_empty() {
+            self.emit_invalid_sse(output);
             return;
         }
         let Ok(data) = serde_json::from_str::<Value>(&data_parts.join("\n")) else {
+            self.emit_invalid_sse(output);
             return;
         };
+        if data.get("type").and_then(Value::as_str) != Some(event_name.as_str()) {
+            self.emit_invalid_sse(output);
+            return;
+        }
         match event_name.as_str() {
             "message_start" => self.on_message_start(&data, output),
             "content_block_start" => self.on_block_start(&data, output),
             "content_block_delta" => self.on_block_delta(&data, output),
             "content_block_stop" => self.on_block_stop(&data, output),
-            "message_delta" => {
-                if let Some(stop) = data
-                    .get("delta")
-                    .and_then(|d| d.get("stop_reason"))
-                    .and_then(Value::as_str)
-                {
-                    self.stop_reason = stop.to_string();
-                }
-                if let Some(usage) = data.get("usage") {
-                    self.output_usage = usage.clone();
+            "message_delta" => self.on_message_delta(&data, output),
+            "message_stop" => {
+                if !self.started || !self.blocks.is_empty() {
+                    self.emit_invalid_sse(output);
+                } else {
+                    self.emit_completed(output);
                 }
             }
-            "message_stop" => self.emit_completed(output),
             "error" => {
-                let message = data
-                    .get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("upstream stream error")
-                    .to_string();
-                let error_type = data
-                    .get("error")
-                    .and_then(|e| e.get("type"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                self.emit_failed(output, message, error_type);
+                let Some(error) = data.get("error").and_then(Value::as_object) else {
+                    self.emit_invalid_sse(output);
+                    return;
+                };
+                let (Some(error_type), Some(message)) = (
+                    error.get("type").and_then(Value::as_str),
+                    error.get("message").and_then(Value::as_str),
+                ) else {
+                    self.emit_invalid_sse(output);
+                    return;
+                };
+                self.emit_failed(output, message.to_string(), Some(error_type.to_string()));
             }
-            _ => { /* ping 等：忽略 */ }
+            _ => unreachable!(),
         }
     }
 
@@ -522,6 +633,7 @@ impl AnthropicSseToResponsesConverter {
         json!({
             "id": self.response_id,
             "object": "response",
+            "created_at": self.created_at,
             "status": status,
             "model": self.model,
             "output": [],
@@ -537,81 +649,148 @@ impl AnthropicSseToResponsesConverter {
     }
 
     fn on_message_start(&mut self, data: &Value, output: &mut String) {
-        let message = data.get("message").cloned().unwrap_or(json!({}));
-        self.response_id = message
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or("msg_unknown")
-            .to_string();
-        self.model = message
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        self.input_usage = message.get("usage").cloned().unwrap_or(json!({}));
+        if self.started {
+            self.emit_invalid_sse(output);
+            return;
+        }
+        let Some(message) = data.get("message").and_then(Value::as_object) else {
+            self.emit_invalid_sse(output);
+            return;
+        };
+        let (Some(id), Some(model)) = (
+            message.get("id").and_then(Value::as_str),
+            message.get("model").and_then(Value::as_str),
+        ) else {
+            self.emit_invalid_sse(output);
+            return;
+        };
+        let Some(usage) = message.get("usage").filter(|usage| usage.is_object()) else {
+            self.emit_invalid_sse(output);
+            return;
+        };
+        self.response_id = id.to_string();
+        self.model = model.to_string();
+        self.input_usage = usage.clone();
         self.started = true;
-        Self::emit(output, "response.created", json!({
-            "type": "response.created",
-            "response": self.response_skeleton("in_progress"),
-        }));
-        Self::emit(output, "response.in_progress", json!({
-            "type": "response.in_progress",
-            "response": self.response_skeleton("in_progress"),
-        }));
+        Self::emit(
+            output,
+            "response.created",
+            json!({
+                "type": "response.created",
+                "response": self.response_skeleton("in_progress"),
+            }),
+        );
+        Self::emit(
+            output,
+            "response.in_progress",
+            json!({
+                "type": "response.in_progress",
+                "response": self.response_skeleton("in_progress"),
+            }),
+        );
     }
 
     fn on_block_start(&mut self, data: &Value, output: &mut String) {
-        let index = data.get("index").and_then(Value::as_u64).unwrap_or(0);
-        let block = data.get("content_block").cloned().unwrap_or(json!({}));
-        let kind = block
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let output_index = self.next_output_index;
-        self.next_output_index += 1;
-        let item_id = format!("{}-item-{output_index}", self.response_id);
-
-        match kind.as_str() {
-            "text" => {
-                Self::emit(output, "response.output_item.added", json!({
-                    "type": "response.output_item.added",
-                    "output_index": output_index,
-                    "item": {"type":"message","id":item_id,"role":"assistant","status":"in_progress","content":[]}
-                }));
-                Self::emit(output, "response.content_part.added", json!({
-                    "type": "response.content_part.added",
-                    "item_id": item_id,
-                    "output_index": output_index,
-                    "content_index": 0,
-                    "part": {"type":"output_text","text":"","annotations":[]}
-                }));
-            }
+        if !self.started {
+            self.emit_invalid_sse(output);
+            return;
+        }
+        let (Some(index), Some(block)) = (
+            data.get("index").and_then(Value::as_u64),
+            data.get("content_block").and_then(Value::as_object),
+        ) else {
+            self.emit_invalid_sse(output);
+            return;
+        };
+        if self.seen_block_indices.contains(&index) {
+            self.emit_invalid_sse(output);
+            return;
+        }
+        let Some(kind) = block.get("type").and_then(Value::as_str) else {
+            self.emit_invalid_sse(output);
+            return;
+        };
+        let valid = match kind {
+            "text" => block.get("text").is_some_and(Value::is_string),
             "tool_use" => {
-                Self::emit(output, "response.output_item.added", json!({
-                    "type": "response.output_item.added",
-                    "output_index": output_index,
-                    "item": {
-                        "type":"function_call","id":item_id,
-                        "call_id": block.get("id").and_then(Value::as_str).unwrap_or(""),
-                        "name": block.get("name").and_then(Value::as_str).unwrap_or(""),
-                        "arguments": "", "status": "in_progress"
-                    }
-                }));
+                block.get("id").is_some_and(Value::is_string)
+                    && block.get("name").is_some_and(Value::is_string)
+                    && block.get("input").is_some_and(Value::is_object)
             }
             "thinking" => {
-                Self::emit(output, "response.output_item.added", json!({
-                    "type": "response.output_item.added",
-                    "output_index": output_index,
-                    "item": {"type":"reasoning","id":item_id,"summary":[]}
-                }));
+                block.get("thinking").is_some_and(Value::is_string)
+                    && block.get("signature").is_none_or(Value::is_string)
             }
-            _ => { /* 未知 block 类型：忽略 */ }
+            _ => false,
+        };
+        if !valid {
+            self.emit_invalid_sse(output);
+            return;
+        }
+        self.seen_block_indices.insert(index);
+        let output_index = self.done_items.len() as u64 + self.blocks.len() as u64;
+        let response_kind = match kind {
+            "text" => "message",
+            "tool_use" => "function_call",
+            "thinking" => "reasoning",
+            _ => unreachable!(),
+        };
+        let item_id = format!("{}-{response_kind}-{index}", self.response_id);
+        match kind {
+            "text" => {
+                Self::emit(
+                    output,
+                    "response.output_item.added",
+                    json!({
+                        "type":"response.output_item.added","output_index":output_index,
+                        "item":{"type":"message","id":item_id,"role":"assistant","status":"in_progress","content":[]}
+                    }),
+                );
+                Self::emit(
+                    output,
+                    "response.content_part.added",
+                    json!({
+                        "type":"response.content_part.added","item_id":item_id,"output_index":output_index,
+                        "content_index":0,"part":{"type":"output_text","text":"","annotations":[]}
+                    }),
+                );
+            }
+            "tool_use" => Self::emit(
+                output,
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added","output_index":output_index,
+                    "item":{"type":"function_call","id":item_id,
+                        "call_id":block.get("id").and_then(Value::as_str).unwrap_or(""),
+                        "name":block.get("name").and_then(Value::as_str).unwrap_or(""),
+                        "arguments":"","status":"in_progress"}
+                }),
+            ),
+            "thinking" => {
+                Self::emit(
+                    output,
+                    "response.output_item.added",
+                    json!({
+                        "type":"response.output_item.added","output_index":output_index,
+                        "item":{"type":"reasoning","id":item_id,"summary":[]}
+                    }),
+                );
+                Self::emit(
+                    output,
+                    "response.reasoning_summary_part.added",
+                    json!({
+                        "type":"response.reasoning_summary_part.added","item_id":item_id,
+                        "output_index":output_index,"summary_index":0,
+                        "part":{"type":"summary_text","text":""}
+                    }),
+                );
+            }
+            _ => unreachable!(),
         }
         self.blocks.insert(
             index,
             OpenBlock {
-                kind,
+                kind: kind.to_string(),
                 item_id,
                 output_index,
                 content_index: 0,
@@ -625,135 +804,231 @@ impl AnthropicSseToResponsesConverter {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string(),
-                ..OpenBlock::default()
+                text_buffer: block
+                    .get(if kind == "thinking" {
+                        "thinking"
+                    } else {
+                        "text"
+                    })
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                args_buffer: String::new(),
+                initial_tool_input: block
+                    .get("input")
+                    .map(stable_json_string)
+                    .unwrap_or_default(),
+                received_args_delta: false,
+                signature: block
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
             },
         );
     }
 
     fn on_block_delta(&mut self, data: &Value, output: &mut String) {
-        let index = data.get("index").and_then(Value::as_u64).unwrap_or(0);
-        let Some(block) = self.blocks.get_mut(&index) else {
+        let (Some(index), Some(delta)) = (
+            data.get("index").and_then(Value::as_u64),
+            data.get("delta").and_then(Value::as_object),
+        ) else {
+            self.emit_invalid_sse(output);
             return;
         };
-        let delta = data.get("delta").cloned().unwrap_or(json!({}));
-        match delta.get("type").and_then(Value::as_str) {
-            Some("text_delta") => {
-                let text = delta.get("text").and_then(Value::as_str).unwrap_or("");
-                block.text_buffer.push_str(text);
-                Self::emit(output, "response.output_text.delta", json!({
-                    "type": "response.output_text.delta",
-                    "item_id": block.item_id,
-                    "output_index": block.output_index,
-                    "content_index": block.content_index,
-                    "delta": text,
-                }));
+        let Some(delta_type) = delta.get("type").and_then(Value::as_str) else {
+            self.emit_invalid_sse(output);
+            return;
+        };
+        let field = match delta_type {
+            "text_delta" => "text",
+            "input_json_delta" => "partial_json",
+            "thinking_delta" => "thinking",
+            "signature_delta" => "signature",
+            _ => {
+                self.emit_invalid_sse(output);
+                return;
             }
-            Some("input_json_delta") => {
-                // partial_json 片段原样转发，不重序列化
-                let partial = delta
-                    .get("partial_json")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                block.args_buffer.push_str(partial);
-                Self::emit(output, "response.function_call_arguments.delta", json!({
-                    "type": "response.function_call_arguments.delta",
-                    "item_id": block.item_id,
-                    "output_index": block.output_index,
-                    "delta": partial,
-                }));
+        };
+        let Some(value) = delta.get(field).and_then(Value::as_str) else {
+            self.emit_invalid_sse(output);
+            return;
+        };
+        let Some(block) = self.blocks.get_mut(&index) else {
+            self.emit_invalid_sse(output);
+            return;
+        };
+        let compatible = matches!(
+            (block.kind.as_str(), delta_type),
+            ("text", "text_delta")
+                | ("tool_use", "input_json_delta")
+                | ("thinking", "thinking_delta")
+                | ("thinking", "signature_delta")
+        );
+        if !compatible {
+            self.emit_invalid_sse(output);
+            return;
+        }
+        match delta_type {
+            "text_delta" => {
+                block.text_buffer.push_str(value);
+                Self::emit(
+                    output,
+                    "response.output_text.delta",
+                    json!({
+                        "type":"response.output_text.delta","item_id":block.item_id,
+                        "output_index":block.output_index,"content_index":block.content_index,"delta":value
+                    }),
+                );
             }
-            Some("thinking_delta") => {
-                let thinking = delta.get("thinking").and_then(Value::as_str).unwrap_or("");
-                block.text_buffer.push_str(thinking);
-                Self::emit(output, "response.reasoning_summary_text.delta", json!({
-                    "type": "response.reasoning_summary_text.delta",
-                    "item_id": block.item_id,
-                    "output_index": block.output_index,
-                    "summary_index": 0,
-                    "delta": thinking,
-                }));
+            "input_json_delta" => {
+                block.received_args_delta = true;
+                block.args_buffer.push_str(value);
+                Self::emit(
+                    output,
+                    "response.function_call_arguments.delta",
+                    json!({
+                        "type":"response.function_call_arguments.delta","item_id":block.item_id,
+                        "output_index":block.output_index,"delta":value
+                    }),
+                );
             }
-            Some("signature_delta") => {
-                if let Some(sig) = delta.get("signature").and_then(Value::as_str) {
-                    block.signature.push_str(sig);
-                }
+            "thinking_delta" => {
+                block.text_buffer.push_str(value);
+                Self::emit(
+                    output,
+                    "response.reasoning_summary_text.delta",
+                    json!({
+                        "type":"response.reasoning_summary_text.delta","item_id":block.item_id,
+                        "output_index":block.output_index,"summary_index":0,"delta":value
+                    }),
+                );
             }
-            _ => {}
+            "signature_delta" => block
+                .signature
+                .get_or_insert_with(String::new)
+                .push_str(value),
+            _ => unreachable!(),
         }
     }
 
     fn on_block_stop(&mut self, data: &Value, output: &mut String) {
-        let index = data.get("index").and_then(Value::as_u64).unwrap_or(0);
-        let Some(block) = self.blocks.remove(&index) else {
+        let Some(index) = data.get("index").and_then(Value::as_u64) else {
+            self.emit_invalid_sse(output);
             return;
         };
-        match block.kind.as_str() {
+        let Some(block) = self.blocks.remove(&index) else {
+            self.emit_invalid_sse(output);
+            return;
+        };
+        let item = match block.kind.as_str() {
             "text" => {
-                Self::emit(output, "response.output_text.done", json!({
-                    "type": "response.output_text.done",
-                    "item_id": block.item_id,
-                    "output_index": block.output_index,
-                    "content_index": block.content_index,
-                    "text": block.text_buffer,
-                }));
-                Self::emit(output, "response.content_part.done", json!({
-                    "type": "response.content_part.done",
-                    "item_id": block.item_id,
-                    "output_index": block.output_index,
-                    "content_index": block.content_index,
-                    "part": {"type":"output_text","text":block.text_buffer,"annotations":[]}
-                }));
-                Self::emit(output, "response.output_item.done", json!({
-                    "type": "response.output_item.done",
-                    "output_index": block.output_index,
-                    "item": {"type":"message","id":block.item_id,"role":"assistant","status":"completed",
-                             "content":[{"type":"output_text","text":block.text_buffer,"annotations":[]}]}
-                }));
+                Self::emit(
+                    output,
+                    "response.output_text.done",
+                    json!({
+                        "type":"response.output_text.done","item_id":block.item_id,"output_index":block.output_index,
+                        "content_index":block.content_index,"text":block.text_buffer
+                    }),
+                );
+                Self::emit(
+                    output,
+                    "response.content_part.done",
+                    json!({
+                        "type":"response.content_part.done","item_id":block.item_id,"output_index":block.output_index,
+                        "content_index":block.content_index,"part":{"type":"output_text","text":block.text_buffer,"annotations":[]}
+                    }),
+                );
+                json!({"type":"message","id":block.item_id,"role":"assistant","status":"completed",
+                    "content":[{"type":"output_text","text":block.text_buffer,"annotations":[]}]})
             }
             "tool_use" => {
-                Self::emit(output, "response.function_call_arguments.done", json!({
-                    "type": "response.function_call_arguments.done",
-                    "item_id": block.item_id,
-                    "output_index": block.output_index,
-                    "arguments": block.args_buffer,
-                }));
-                Self::emit(output, "response.output_item.done", json!({
-                    "type": "response.output_item.done",
-                    "output_index": block.output_index,
-                    "item": {"type":"function_call","id":block.item_id,"call_id":block.call_id,
-                             "name":block.name,"arguments":block.args_buffer,"status":"completed"}
-                }));
+                let arguments = if block.received_args_delta {
+                    block.args_buffer.clone()
+                } else {
+                    block.initial_tool_input.clone()
+                };
+                if !serde_json::from_str::<Value>(&arguments).is_ok_and(|value| value.is_object()) {
+                    self.emit_invalid_sse(output);
+                    return;
+                }
+                Self::emit(
+                    output,
+                    "response.function_call_arguments.done",
+                    json!({
+                        "type":"response.function_call_arguments.done","item_id":block.item_id,
+                        "output_index":block.output_index,"arguments":arguments
+                    }),
+                );
+                json!({"type":"function_call","id":block.item_id,"call_id":block.call_id,
+                    "name":block.name,"arguments":arguments,"status":"completed"})
             }
             "thinking" => {
+                Self::emit(
+                    output,
+                    "response.reasoning_summary_text.done",
+                    json!({
+                        "type":"response.reasoning_summary_text.done","item_id":block.item_id,
+                        "output_index":block.output_index,"summary_index":0,"text":block.text_buffer
+                    }),
+                );
+                Self::emit(
+                    output,
+                    "response.reasoning_summary_part.done",
+                    json!({
+                        "type":"response.reasoning_summary_part.done","item_id":block.item_id,
+                        "output_index":block.output_index,"summary_index":0,
+                        "part":{"type":"summary_text","text":block.text_buffer}
+                    }),
+                );
                 let mut item = json!({"type":"reasoning","id":block.item_id,
                     "summary":[{"type":"summary_text","text":block.text_buffer}]});
-                if !block.signature.is_empty() {
-                    item["signature"] = json!(block.signature);
+                if let Some(signature) = block.signature {
+                    item["signature"] = json!(signature);
                 }
-                Self::emit(output, "response.reasoning_summary_text.done", json!({
-                    "type": "response.reasoning_summary_text.done",
-                    "item_id": block.item_id,
-                    "output_index": block.output_index,
-                    "summary_index": 0,
-                    "text": block.text_buffer,
-                }));
-                Self::emit(output, "response.output_item.done", json!({
-                    "type": "response.output_item.done",
-                    "output_index": block.output_index,
-                    "item": item,
-                }));
+                item
             }
-            _ => {}
+            _ => unreachable!(),
+        };
+        Self::emit(
+            output,
+            "response.output_item.done",
+            json!({
+                "type":"response.output_item.done","output_index":block.output_index,"item":item
+            }),
+        );
+        self.done_items.insert(block.output_index, item);
+    }
+
+    fn on_message_delta(&mut self, data: &Value, output: &mut String) {
+        let (Some(delta), Some(usage)) = (
+            data.get("delta").and_then(Value::as_object),
+            data.get("usage").and_then(Value::as_object),
+        ) else {
+            self.emit_invalid_sse(output);
+            return;
+        };
+        let Some(stop) = delta.get("stop_reason").and_then(Value::as_str) else {
+            self.emit_invalid_sse(output);
+            return;
+        };
+        if !usage.get("output_tokens").is_some_and(Value::is_u64) {
+            self.emit_invalid_sse(output);
+            return;
         }
+        self.stop_reason = stop.to_string();
+        self.output_usage = Value::Object(usage.clone());
     }
 
     fn emit_completed(&mut self, output: &mut String) {
-        // 已失败或已完成的流不再补 completed，避免 failed 之后再发 completed
-        if self.completed || self.failed {
+        if self.terminal != TerminalState::Open {
             return;
         }
-        self.completed = true;
-        // message_start 的 input usage 与 message_delta 的 output usage 合并
+        let incomplete = self.stop_reason == "max_tokens";
+        self.terminal = if incomplete {
+            TerminalState::Incomplete
+        } else {
+            TerminalState::Completed
+        };
         let mut usage = self.input_usage.clone();
         if let (Some(target), Some(source)) = (usage.as_object_mut(), self.output_usage.as_object())
         {
@@ -761,35 +1036,51 @@ impl AnthropicSseToResponsesConverter {
                 target.insert(key.clone(), value.clone());
             }
         }
-        let mut response = self.response_skeleton(if self.stop_reason == "max_tokens" {
+        let status = if incomplete {
             "incomplete"
         } else {
             "completed"
-        });
+        };
+        let mut response = self.response_skeleton(status);
+        response["output"] = Value::Array(self.done_items.values().cloned().collect());
         response["usage"] = anthropic_usage_to_responses_usage(Some(&usage));
-        if self.stop_reason == "max_tokens" {
-            response["incomplete_details"] = json!({"reason": "max_output_tokens"});
+        copy_response_request_fields(&mut response, &self.original_request);
+        if incomplete {
+            response["incomplete_details"] = json!({"reason":"max_output_tokens"});
         }
-        Self::emit(output, "response.completed", json!({
-            "type": "response.completed",
-            "response": response,
-        }));
+        let event = if incomplete {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        };
+        Self::emit(output, event, json!({"type":event,"response":response}));
+    }
+
+    fn emit_invalid_sse(&mut self, output: &mut String) {
+        self.emit_failed(
+            output,
+            "invalid Anthropic SSE event".to_string(),
+            Some("invalid_sse_event".to_string()),
+        );
     }
 
     fn emit_failed(&mut self, output: &mut String, message: String, error_type: Option<String>) {
-        if self.failed {
+        if self.terminal != TerminalState::Open {
             return;
         }
-        self.failed = true;
+        self.terminal = TerminalState::Failed;
+        let error_type = error_type.unwrap_or_else(|| "upstream_error".to_string());
         let mut response = self.response_skeleton("failed");
-        response["error"] = json!({
-            "code": error_type.unwrap_or_else(|| "upstream_error".to_string()),
-            "message": message,
-        });
-        Self::emit(output, "response.failed", json!({
-            "type": "response.failed",
-            "response": response,
-        }));
+        response["output"] = Value::Array(self.done_items.values().cloned().collect());
+        copy_response_request_fields(&mut response, &self.original_request);
+        response["error"] = json!({"code":error_type,"type":error_type,"message":message});
+        Self::emit(
+            output,
+            "response.failed",
+            json!({
+                "type":"response.failed","response":response
+            }),
+        );
     }
 }
 
@@ -828,7 +1119,10 @@ pub fn anthropic_models_to_openai_models(body: &Value) -> Value {
     };
     let is_anthropic = data
         .iter()
-        .any(|item| item.get("type").and_then(Value::as_str) == Some("model"));
+        .any(|item| item.get("type").and_then(Value::as_str) == Some("model"))
+        || (data.is_empty()
+            && body.get("has_more").is_some_and(Value::is_boolean)
+            && (body.get("first_id").is_some() || body.get("last_id").is_some()));
     if !is_anthropic {
         return body.clone();
     }
@@ -852,12 +1146,11 @@ pub fn anthropic_models_to_openai_models(body: &Value) -> Value {
     json!({"object": "list", "data": models})
 }
 
-/// 最小 RFC 3339 → unix 秒解析：仅处理 `YYYY-MM-DDTHH:MM:SSZ`
-/// 和带 `+hh:mm` / `-hh:mm` 偏移的形态（Anthropic created_at 的实际格式）。
+/// 严格 RFC 3339 → unix 秒解析，支持可选小数秒和 `Z`/数值偏移。
 /// 项目无 chrono/time 直接依赖，故手写；解析失败返回 None。
 fn parse_rfc3339_unix_seconds(text: &str) -> Option<i64> {
     let bytes = text.as_bytes();
-    if bytes.len() != 20 && bytes.len() != 25 {
+    if bytes.len() < 20 {
         return None;
     }
     let digit = |index: usize| -> Option<i64> {
@@ -867,27 +1160,57 @@ fn parse_rfc3339_unix_seconds(text: &str) -> Option<i64> {
             .map(|ch| (ch - b'0') as i64)
     };
     let num2 = |index: usize| -> Option<i64> { Some(digit(index)? * 10 + digit(index + 1)?) };
-    let year = Some(digit(0)? * 1000 + digit(1)? * 100 + digit(2)? * 10 + digit(3)?)?;
+    let year = digit(0)? * 1000 + digit(1)? * 100 + digit(2)? * 10 + digit(3)?;
     let month = num2(5)?;
     let day = num2(8)?;
     let hour = num2(11)?;
     let minute = num2(14)?;
     let second = num2(17)?;
-    if bytes[4] != b'-'
-        || bytes[7] != b'-'
-        || bytes[10] != b'T'
-        || bytes[13] != b':'
-        || bytes[16] != b':'
+    if bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
     {
         return None;
     }
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if !(1..=max_day).contains(&day) || hour > 23 || minute > 59 || second > 59 {
         return None;
     }
-    let offset_seconds: i64 = match bytes[19] {
-        b'Z' if bytes.len() == 20 => 0,
-        sign @ (b'+' | b'-') if bytes.len() == 25 && bytes[22] == b':' => {
-            let value = num2(20)? * 3600 + num2(23)? * 60;
+    let mut timezone_index = 19;
+    if bytes.get(timezone_index) == Some(&b'.') {
+        timezone_index += 1;
+        let fraction_start = timezone_index;
+        while bytes
+            .get(timezone_index)
+            .is_some_and(|value| value.is_ascii_digit())
+        {
+            timezone_index += 1;
+        }
+        if timezone_index == fraction_start {
+            return None;
+        }
+    }
+    let offset_seconds = match bytes.get(timezone_index).copied() {
+        Some(b'Z') if timezone_index + 1 == bytes.len() => 0,
+        Some(sign @ (b'+' | b'-'))
+            if timezone_index + 6 == bytes.len()
+                && bytes.get(timezone_index + 3) == Some(&b':') =>
+        {
+            let offset_hour = num2(timezone_index + 1)?;
+            let offset_minute = num2(timezone_index + 4)?;
+            if offset_hour > 23 || offset_minute > 59 {
+                return None;
+            }
+            let value = offset_hour * 3600 + offset_minute * 60;
             if sign == b'+' { value } else { -value }
         }
         _ => return None,

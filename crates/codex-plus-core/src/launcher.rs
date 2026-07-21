@@ -1439,7 +1439,17 @@ async fn handle_protocol_proxy_connection(
         return Ok(());
     }
     if upstream.is_stream {
-        write_http_stream_headers(stream, "200 OK", "text/event-stream; charset=utf-8").await?;
+        let stream_content_type =
+            if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
+                if upstream.content_type.is_empty() {
+                    "text/event-stream; charset=utf-8"
+                } else {
+                    &upstream.content_type
+                }
+            } else {
+                "text/event-stream; charset=utf-8"
+            };
+        write_http_stream_headers(stream, "200 OK", stream_content_type).await?;
         if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
             let mut bytes_stream = upstream.response.bytes_stream();
             while let Some(chunk) = bytes_stream.next().await {

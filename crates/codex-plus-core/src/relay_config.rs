@@ -621,12 +621,18 @@ fn relay_profile_test_payload(protocol: RelayProtocol, model: &str) -> Value {
     }
 }
 
+fn relay_protocol_uses_local_responses_proxy(protocol: RelayProtocol) -> bool {
+    matches!(
+        protocol,
+        RelayProtocol::ChatCompletions | RelayProtocol::Anthropic
+    )
+}
+
 fn codex_base_url_for_protocol(base_url: &str, protocol: RelayProtocol, proxy_port: u16) -> String {
-    match protocol {
-        RelayProtocol::Responses => base_url.to_string(),
-        RelayProtocol::ChatCompletions | RelayProtocol::Anthropic => {
-            crate::protocol_proxy::local_responses_proxy_base_url(proxy_port)
-        }
+    if relay_protocol_uses_local_responses_proxy(protocol) {
+        crate::protocol_proxy::local_responses_proxy_base_url(proxy_port)
+    } else {
+        base_url.to_string()
     }
 }
 
@@ -2023,7 +2029,7 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
             crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
         );
     }
-    if profile.protocol == RelayProtocol::ChatCompletions {
+    if relay_protocol_uses_local_responses_proxy(profile.protocol) {
         if !profile.upstream_base_url.trim().is_empty() {
             return profile.upstream_base_url.trim().to_string();
         }
@@ -2039,7 +2045,7 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
     let provider_base_url = provider_string_from_config(&profile.config_contents, "base_url")
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_default();
-    if profile.protocol == RelayProtocol::ChatCompletions
+    if relay_protocol_uses_local_responses_proxy(profile.protocol)
         && provider_base_url
             == crate::protocol_proxy::local_responses_proxy_base_url(
                 crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
@@ -2117,11 +2123,12 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
     {
         provider["name"] = toml_edit::value(provider_id.as_str());
     }
-    if provider
-        .get("wire_api")
-        .and_then(Item::as_str)
-        .map(str::trim)
-        .is_none_or(str::is_empty)
+    if relay_protocol_uses_local_responses_proxy(profile.protocol)
+        || provider
+            .get("wire_api")
+            .and_then(Item::as_str)
+            .map(str::trim)
+            .is_none_or(str::is_empty)
     {
         provider["wire_api"] = toml_edit::value("responses");
     }

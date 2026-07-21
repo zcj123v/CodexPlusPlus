@@ -1,7 +1,8 @@
 use codex_plus_core::protocol_proxy::{
-    ChatSseToResponsesConverter, audio_transcriptions_url, chat_completion_to_response,
-    chat_completion_to_response_with_request, chat_completions_url, chat_sse_to_responses_sse,
-    chat_sse_to_responses_sse_with_request, is_audio_transcriptions_proxy_path,
+    ChatSseToResponsesConverter, UpstreamWireApi, audio_transcriptions_url,
+    chat_completion_to_response, chat_completion_to_response_with_request, chat_completions_url,
+    chat_sse_to_responses_sse, chat_sse_to_responses_sse_with_request,
+    finalize_non_streaming_responses_response, is_audio_transcriptions_proxy_path,
     is_chat_completions_proxy_path, is_models_proxy_path, is_responses_proxy_path, models_url,
     open_audio_transcriptions_proxy_request, open_chat_completions_proxy_request,
     open_models_proxy_request, open_responses_proxy_request,
@@ -802,6 +803,73 @@ fn chat_completion_response_converts_to_responses_response() {
 }
 
 #[test]
+fn responses_finalize_preserves_upstream_body_and_content_type() {
+    let body = b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
+    let response = finalize_non_streaming_responses_response(
+        UpstreamWireApi::Responses,
+        "text/event-stream; charset=utf-8",
+        body,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(response.content_type, "text/event-stream; charset=utf-8");
+    assert_eq!(response.body, body);
+}
+
+#[test]
+fn chat_finalize_echoes_original_response_request_fields() {
+    let request = json!({
+        "model": "gpt-5-mini",
+        "input": "hello",
+        "instructions": "Be exact.",
+        "max_output_tokens": 321,
+        "parallel_tool_calls": false,
+        "previous_response_id": "resp_previous",
+        "reasoning": { "effort": "high" },
+        "temperature": 0.25,
+        "tool_choice": "auto",
+        "tools": [{ "type": "function", "name": "lookup", "parameters": {} }],
+        "top_p": 0.8,
+        "metadata": { "trace": "request-echo" }
+    });
+    let upstream = serde_json::to_vec(&json!({
+        "id": "chatcmpl_echo",
+        "created": 123,
+        "model": "gpt-5-mini",
+        "choices": [{
+            "finish_reason": "stop",
+            "message": { "role": "assistant", "content": "ok" }
+        }]
+    }))
+    .unwrap();
+
+    let response = finalize_non_streaming_responses_response(
+        UpstreamWireApi::ChatCompletions,
+        "application/json",
+        &upstream,
+        Some(&request),
+    )
+    .unwrap();
+    let response: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+
+    for key in [
+        "instructions",
+        "max_output_tokens",
+        "parallel_tool_calls",
+        "previous_response_id",
+        "reasoning",
+        "temperature",
+        "tool_choice",
+        "tools",
+        "top_p",
+        "metadata",
+    ] {
+        assert_eq!(response[key], request[key], "request field {key}");
+    }
+}
+
+#[test]
 fn chat_completion_response_maps_reasoning_tool_calls_and_usage_details() {
     let converted = chat_completion_to_response(json!({
         "id": "chatcmpl_1",
@@ -1468,6 +1536,82 @@ async fn aggregate_stream_request_sends_sse_accept_header() {
     fallback_server.abort();
 }
 
+#[tokio::test]
+async fn responses_proxy_stream_intent_does_not_override_json_response_type() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let fallback = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let fallback_addr = fallback.local_addr().unwrap();
+    let server = tokio::spawn(respond_once(
+        listener,
+        "HTTP/1.1 200 OK\r\ncontent-length: 35\r\ncontent-type: application/json\r\n\r\n{\"id\":\"resp_1\",\"object\":\"response\"}",
+    ));
+    let fallback_server = tokio::spawn(respond_once(
+        fallback,
+        "HTTP/1.1 200 OK\r\ncontent-length: 35\r\ncontent-type: application/json\r\n\r\n{\"id\":\"resp_2\",\"object\":\"response\"}",
+    ));
+    let settings = aggregate_proxy_settings(
+        "stream-json",
+        format!("http://{addr}/v1"),
+        format!("http://{fallback_addr}/v1"),
+    );
+
+    let result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-5-mini","input":"hi","stream":true}"#,
+        settings,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(!result.is_stream);
+    server.await.unwrap();
+    fallback_server.abort();
+}
+
+#[tokio::test]
+async fn responses_proxy_detects_sse_response_without_stream_intent() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let fallback = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let fallback_addr = fallback.local_addr().unwrap();
+    let server = tokio::spawn(respond_once(
+        listener,
+        "HTTP/1.1 200 OK\r\ncontent-length: 14\r\ncontent-type: text/event-stream\r\n\r\ndata: [DONE]\n\n",
+    ));
+    let fallback_server = tokio::spawn(respond_once(
+        fallback,
+        "HTTP/1.1 200 OK\r\ncontent-length: 14\r\ncontent-type: text/event-stream\r\n\r\ndata: [DONE]\n\n",
+    ));
+    let settings = aggregate_proxy_settings(
+        "nonstream-sse",
+        format!("http://{addr}/v1"),
+        format!("http://{fallback_addr}/v1"),
+    );
+
+    let result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-5-mini","input":"hi","stream":false}"#,
+        settings,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(result.is_stream);
+    server.await.unwrap();
+    fallback_server.abort();
+}
+
 async fn respond_once(listener: tokio::net::TcpListener, response: &'static str) {
     let (mut stream, _) = listener.accept().await.unwrap();
     let mut buffer = [0; 1024];
@@ -1659,12 +1803,50 @@ async fn responses_proxy_passes_through_original_user_agent_when_unconfigured() 
 }
 
 #[tokio::test]
+async fn responses_proxy_prefers_original_user_agent_over_configured_user_agent() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+    let server = spawn_chat_server();
+    write_chat_relay_settings(temp.path(), &server.base_url, "Configured-Codex-UA/1.0");
+
+    let upstream = open_responses_proxy_request(
+        r#"{"model":"gpt-5.5","input":"hello","stream":false}"#,
+        Some("Original-Codex-UA/1.0"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(upstream.status_code, 200);
+
+    let request = server.finish();
+    assert_eq!(request.user_agent, "Original-Codex-UA/1.0");
+}
+
+#[tokio::test]
 async fn models_proxy_passes_through_original_user_agent_when_unconfigured() {
     let _lock = settings_path_test_lock().lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
     let server = spawn_chat_server();
     write_chat_relay_settings(temp.path(), &server.base_url, "");
+
+    let upstream = open_models_proxy_request(Some("Original-Codex-UA/1.0"))
+        .await
+        .unwrap();
+    assert_eq!(upstream.status_code, 200);
+
+    let request = server.finish();
+    assert_eq!(request.user_agent, "Original-Codex-UA/1.0");
+}
+
+#[tokio::test]
+async fn models_proxy_prefers_original_user_agent_over_configured_user_agent() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+    let server = spawn_chat_server();
+    write_chat_relay_settings(temp.path(), &server.base_url, "Configured-Codex-UA/1.0");
 
     let upstream = open_models_proxy_request(Some("Original-Codex-UA/1.0"))
         .await

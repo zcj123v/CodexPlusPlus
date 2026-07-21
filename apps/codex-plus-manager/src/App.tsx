@@ -5546,7 +5546,8 @@ function RelayProfileEditor({
       {isNew ? (
         <ProviderPresetSelector
           onSelect={(patch: PresetPatch) => {
-            updateDraft(patch as unknown as Partial<RelayProfile>);
+            updateDraft(patch as Partial<RelayProfile>);
+            setModelWindowRows(modelWindowRowsFromProfile(patch.modelList, patch.modelWindows));
           }}
         />
       ) : null}
@@ -5741,7 +5742,7 @@ function RelayProfileEditor({
                       value={row.imageHandling}
                       disabled={vlmUnsupportedProtocol}
                       onChange={(e) => updateModelWindowRow(index, { imageHandling: e.currentTarget.value as ImageHandling })}
-                      title={vlmUnsupportedProtocol ? t("VLM 仅支持 Chat Completions 协议和聚合模式") : ""}
+                      title={vlmUnsupportedProtocol ? t("VLM 仅支持 Chat Completions、Anthropic 协议和聚合模式") : ""}
                     >
                       <option value="" disabled>{t("纯文本模型请配置此项")}</option>
                       <option value="send-as-is" title={t("原样发送图片")}>send-as-is</option>
@@ -5816,7 +5817,7 @@ function RelayProfileEditor({
             <p className="field-hint">
               {t("若开启 VLM analysis，请确认 VLM 配置项完整且服务可用。")}
               <br />
-              {t("仅在 Chat Completion 和聚合模式生效。")}
+              {t("仅在 Chat Completions、Anthropic 协议和聚合模式生效。")}
             </p>
             {modelWindowRows.some((row) => row.imageHandling === "vlm") && (!profile.vlmApiKey || !profile.vlmModel || !profile.vlmBaseUrl) ? (
               <p className="field-hint warn">{t("VLM 配置不完整：API Key、Model 和 Base URL 为必填项，否则 VLM 不会生效。")}</p>

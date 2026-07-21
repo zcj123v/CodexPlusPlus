@@ -639,10 +639,9 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 "headerTimeoutSeconds": header_timeout.as_secs()
             }),
         );
-        let http_client = crate::http_client::proxied_client(&effective_user_agent(
-            &relay.user_agent,
-            original_user_agent,
-        ))?;
+        let http_client = crate::http_client::proxied_client(
+            &protocol_proxy_original_first_user_agent(&relay.user_agent, original_user_agent),
+        )?;
         let request_builder = if wire_api == UpstreamWireApi::AnthropicMessages {
             crate::anthropic_proxy::anthropic_request_builder(
                 http_client,
@@ -724,7 +723,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         if (200..300).contains(&status_code) || !has_more_candidates {
             return Ok(UpstreamProxyResponse {
                 status_code,
-                is_stream: is_stream || content_type.contains("text/event-stream"),
+                is_stream: content_type_is_sse(&content_type),
                 content_type,
                 wire_api,
                 response: upstream,
@@ -776,7 +775,7 @@ pub async fn open_models_proxy_request(
             "wireApi": wire_api
         }),
     );
-    let client = crate::http_client::proxied_client(&effective_user_agent(
+    let client = crate::http_client::proxied_client(&protocol_proxy_original_first_user_agent(
         &relay.user_agent,
         original_user_agent,
     ))?;
@@ -836,7 +835,7 @@ pub async fn open_audio_transcriptions_proxy_request(
         }),
     );
     let upstream = send_upstream_request(
-        crate::http_client::proxied_client(&effective_user_agent(
+        crate::http_client::proxied_client(&protocol_proxy_original_first_user_agent(
             &relay.user_agent,
             original_user_agent,
         ))?
@@ -861,6 +860,13 @@ pub async fn open_audio_transcriptions_proxy_request(
         wire_api: UpstreamWireApi::AudioTranscriptions,
         response: upstream,
     })
+}
+
+fn content_type_is_sse(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
 fn response_header_timeout(is_stream: bool) -> Duration {
@@ -892,10 +898,9 @@ pub async fn open_chat_completions_proxy_request(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let upstream = crate::http_client::proxied_client(&effective_user_agent(
-        &relay.user_agent,
-        original_user_agent,
-    ))?
+    let upstream = crate::http_client::proxied_client(
+        &direct_chat_legacy_configured_first_user_agent(&relay.user_agent, original_user_agent),
+    )?
     .post(chat_completions_url(&relay.base_url))
     .bearer_auth(relay.api_key.trim())
     .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -1046,7 +1051,21 @@ fn conversation_id_from_responses_request(body: &Value) -> Option<String> {
     None
 }
 
-fn effective_user_agent(configured_user_agent: &str, original_user_agent: Option<&str>) -> String {
+fn protocol_proxy_original_first_user_agent(
+    configured_user_agent: &str,
+    original_user_agent: Option<&str>,
+) -> String {
+    let original_user_agent = original_user_agent.map(str::trim).unwrap_or("");
+    if !original_user_agent.is_empty() {
+        return original_user_agent.to_string();
+    }
+    configured_user_agent.trim().to_string()
+}
+
+fn direct_chat_legacy_configured_first_user_agent(
+    configured_user_agent: &str,
+    original_user_agent: Option<&str>,
+) -> String {
     let configured_user_agent = configured_user_agent.trim();
     if !configured_user_agent.is_empty() {
         return configured_user_agent.to_string();
@@ -1196,7 +1215,7 @@ pub fn models_url(base_url: &str) -> String {
     url
 }
 
-/// Anthropic Messages 端点拼接，规则与 `responses_url` 一致。
+/// Anthropic Messages 端点拼接：除 `#` 后缀或已带版本号外，带路径的 base 也补 `/v1`。
 pub fn anthropic_messages_url(base_url: &str) -> String {
     let skip_version_prefix = base_url.trim().ends_with('#');
     let base = base_url.trim().trim_end_matches('#').trim_end_matches('/');
