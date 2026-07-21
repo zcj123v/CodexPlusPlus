@@ -472,3 +472,329 @@ fn anthropic_models_url_rules() {
         "https://api.example.com/v1/models"
     );
 }
+
+// ── Task 8：端到端集成测试（本地 mock 上游 + open_responses_proxy_request_with_settings）──
+//
+// mock 模式复用 tests/protocol_proxy.rs 的写法：tokio TcpListener 起本地 mock 上游，
+// 按 Content-Length 读全请求体后返回固定响应；不引入新 mock 框架。
+//
+// 注意：open_responses_proxy_request_with_settings 只负责「请求转换 + 上游收发」，
+// 非流式响应的协议转换在 launcher 层按 wire_api 分发（anthropic_message_to_response）。
+// 因此 roundtrip 断言分两段：先校验 mock 收到的 anthropic 请求与 wire_api 标记，
+// 再走与 launcher 相同的转换函数校验最终 Responses JSON。
+
+use codex_plus_core::protocol_proxy::{
+    UpstreamWireApi, open_responses_proxy_request_with_settings,
+};
+use codex_plus_core::settings::{
+    AggregateRelayMember, AggregateRelayProfile, AggregateRelayStrategy, RelayMode,
+};
+use std::sync::{Mutex, OnceLock};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// 聚合测试共享进程级 GLOBAL_SELECTOR（relay_rotation.rs），串行执行避免相互干扰。
+fn aggregate_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// 按 Content-Length 读全一个 HTTP 请求，返回请求原文，然后写回固定响应。
+/// 读循环参照 tests/protocol_proxy.rs 的 audio_transcriptions_proxy_forwards_multipart_body。
+async fn capture_request_and_respond(listener: tokio::net::TcpListener, response: String) -> String {
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let read = stream.read(&mut chunk).await.unwrap();
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        let request = String::from_utf8_lossy(&buffer);
+        let Some((headers, body)) = request.split_once("\r\n\r\n") else {
+            continue;
+        };
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+            })
+            .unwrap_or(0);
+        if body.as_bytes().len() >= content_length {
+            break;
+        }
+    }
+    stream.write_all(response.as_bytes()).await.unwrap();
+    String::from_utf8_lossy(&buffer).to_string()
+}
+
+/// 构造 200 JSON 响应（content-length 按字节数计算）。
+fn json_ok_response(body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+/// 构造单个 anthropic profile 的 BackendSettings。
+fn anthropic_settings(base_url: String) -> BackendSettings {
+    BackendSettings {
+        relay_profiles: vec![RelayProfile {
+            id: "ant".to_string(),
+            name: "Anthropic".to_string(),
+            base_url,
+            api_key: "sk-ant-test".to_string(),
+            protocol: RelayProtocol::Anthropic,
+            relay_mode: RelayMode::MixedApi,
+            ..RelayProfile::default()
+        }],
+        active_relay_id: "ant".to_string(),
+        ..BackendSettings::default()
+    }
+}
+
+#[tokio::test]
+async fn end_to_end_responses_to_anthropic_roundtrip() {
+    // 1. 本地 mock 上游：固定返回含 text + tool_use 的 Anthropic message
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let anthropic_body = json!({
+        "id": "msg_e2e",
+        "type": "message",
+        "role": "assistant",
+        "model": "k3",
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+        "content": [
+            {"type": "text", "text": "我来查一下"},
+            {"type": "tool_use", "id": "toolu_e2e", "name": "shell", "input": {"command": ["ls"]}}
+        ]
+    })
+    .to_string();
+    let server = tokio::spawn(capture_request_and_respond(
+        listener,
+        json_ok_response(&anthropic_body),
+    ));
+
+    // 2. anthropic profile 指向 mock，发起 codex Responses 请求
+    let settings = anthropic_settings(format!("http://{addr}/v1"));
+    let codex_body = json!({
+        "model": "k3",
+        "instructions": "You are Codex.",
+        "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        "stream": false
+    });
+    let upstream = open_responses_proxy_request_with_settings(&codex_body.to_string(), settings, None)
+        .await
+        .unwrap();
+
+    // 3. 断言 mock 收到的请求已转换为 Anthropic Messages 格式
+    let request = server.await.unwrap();
+    let (head, body) = request.split_once("\r\n\r\n").unwrap();
+    assert!(head.starts_with("POST /v1/messages HTTP/1.1"), "{head}");
+    let head_lower = head.to_ascii_lowercase();
+    assert!(head_lower.contains("x-api-key: sk-ant-test"), "{head}");
+    assert!(head_lower.contains("anthropic-version: 2023-06-01"), "{head}");
+    let sent: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert!(sent.get("system").is_some(), "{sent}");
+    assert!(sent.get("max_tokens").is_some(), "{sent}");
+    assert_eq!(sent["messages"][0]["role"], "user");
+
+    // 4. 断言上游标记为 anthropic 协议，响应可转换回 Responses JSON（含 message 与 function_call）
+    assert_eq!(upstream.status_code, 200);
+    assert_eq!(upstream.wire_api, UpstreamWireApi::AnthropicMessages);
+    let upstream_bytes = upstream.response.bytes().await.unwrap();
+    let upstream_json: serde_json::Value = serde_json::from_slice(&upstream_bytes).unwrap();
+    // 与 launcher.rs 非流式分支相同的转换入口
+    let converted = anthropic_message_to_response(&upstream_json, Some(&codex_body)).unwrap();
+    assert_eq!(converted["object"], "response");
+    assert_eq!(converted["status"], "completed");
+    let output = converted["output"].as_array().unwrap();
+    assert!(
+        output.iter().any(|item| item["type"] == "message"),
+        "{converted}"
+    );
+    assert!(
+        output.iter().any(|item| item["type"] == "function_call"),
+        "{converted}"
+    );
+    let call = output
+        .iter()
+        .find(|item| item["type"] == "function_call")
+        .unwrap();
+    assert_eq!(call["call_id"], "toolu_e2e");
+    assert_eq!(call["name"], "shell");
+}
+
+#[tokio::test]
+async fn anthropic_strip_image_handling_applies_before_conversion() {
+    // model_vlm 把 k3 标记为 strip：input_image 应在转换为 anthropic body 之前被剥离
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let anthropic_body = json!({
+        "id": "msg_strip",
+        "type": "message",
+        "role": "assistant",
+        "model": "k3",
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 5, "output_tokens": 2},
+        "content": [{"type": "text", "text": "ok"}]
+    })
+    .to_string();
+    let server = tokio::spawn(capture_request_and_respond(
+        listener,
+        json_ok_response(&anthropic_body),
+    ));
+
+    let mut settings = anthropic_settings(format!("http://{addr}/v1"));
+    // model_vlm 为 model → ImageHandling 的 JSON map（vision.rs image_handling_mode）
+    settings.relay_profiles[0].model_vlm = r#"{"k3":"strip"}"#.to_string();
+    let codex_body = json!({
+        "model": "k3",
+        "input": [{"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "看图"},
+            {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+        ]}],
+        "stream": false
+    });
+    let upstream = open_responses_proxy_request_with_settings(&codex_body.to_string(), settings, None)
+        .await
+        .unwrap();
+    assert_eq!(upstream.status_code, 200);
+
+    // mock 收到的 anthropic body 中不应存在任何 image block，图片数据不得外泄
+    let request = server.await.unwrap();
+    let (_, body) = request.split_once("\r\n\r\n").unwrap();
+    let sent: serde_json::Value = serde_json::from_str(body).unwrap();
+    let messages = sent["messages"].to_string();
+    assert!(!messages.contains("\"type\":\"image\""), "{sent}");
+    assert!(!messages.contains("iVBORw0KGgo="), "{sent}");
+    // 文本部分保留
+    assert!(messages.contains("看图"), "{sent}");
+}
+
+#[tokio::test]
+async fn aggregate_failover_to_anthropic_member() {
+    let _lock = aggregate_test_lock().lock().unwrap();
+    // 成员 A：chatCompletions 协议，mock 固定返回 500
+    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let first_addr = first.local_addr().unwrap();
+    let first_server = tokio::spawn(async move {
+        let (mut stream, _) = first.accept().await.unwrap();
+        let mut buffer = [0u8; 4096];
+        let _ = stream.read(&mut buffer).await.unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 11\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"error\":1}",
+            )
+            .await
+            .unwrap();
+    });
+    // 成员 B：anthropic 协议，mock 返回正常 Anthropic message
+    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let second_addr = second.local_addr().unwrap();
+    let anthropic_body = json!({
+        "id": "msg_failover",
+        "type": "message",
+        "role": "assistant",
+        "model": "k3",
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 8, "output_tokens": 3},
+        "content": [{"type": "text", "text": "来自成员B"}]
+    })
+    .to_string();
+    let second_server = tokio::spawn(capture_request_and_respond(
+        second,
+        json_ok_response(&anthropic_body),
+    ));
+
+    // 聚合 profile：Failover 策略，A 在前 B 在后（构造方式参照 tests/protocol_proxy.rs）
+    let first_id = "agg-ant-a".to_string();
+    let second_id = "agg-ant-b".to_string();
+    let aggregate_id = "agg-ant".to_string();
+    let settings = BackendSettings {
+        relay_profiles: vec![
+            RelayProfile {
+                id: first_id.clone(),
+                name: "member-a".to_string(),
+                base_url: format!("http://{first_addr}/v1"),
+                api_key: "sk-first".to_string(),
+                protocol: RelayProtocol::ChatCompletions,
+                relay_mode: RelayMode::MixedApi,
+                ..RelayProfile::default()
+            },
+            RelayProfile {
+                id: second_id.clone(),
+                name: "member-b".to_string(),
+                base_url: format!("http://{second_addr}/v1"),
+                api_key: "sk-second".to_string(),
+                protocol: RelayProtocol::Anthropic,
+                relay_mode: RelayMode::MixedApi,
+                ..RelayProfile::default()
+            },
+            RelayProfile {
+                id: aggregate_id.clone(),
+                name: "aggregate".to_string(),
+                relay_mode: RelayMode::Aggregate,
+                ..RelayProfile::default()
+            },
+        ],
+        active_relay_id: aggregate_id.clone(),
+        active_aggregate_relay_id: aggregate_id.clone(),
+        aggregate_relay_profiles: vec![AggregateRelayProfile {
+            id: aggregate_id,
+            name: "aggregate".to_string(),
+            strategy: AggregateRelayStrategy::Failover,
+            members: vec![
+                AggregateRelayMember {
+                    relay_id: first_id,
+                    weight: 1,
+                },
+                AggregateRelayMember {
+                    relay_id: second_id,
+                    weight: 1,
+                },
+            ],
+        }],
+        ..BackendSettings::default()
+    };
+
+    let codex_body = json!({
+        "model": "k3",
+        "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        "stream": false
+    });
+    let upstream = open_responses_proxy_request_with_settings(&codex_body.to_string(), settings, None)
+        .await
+        .unwrap();
+
+    // 成员 A 500 → 故障转移到成员 B；最终响应来自 B 且按 anthropic 协议转换
+    first_server.await.unwrap();
+    let second_request = second_server.await.unwrap();
+    assert!(
+        second_request.starts_with("POST /v1/messages HTTP/1.1"),
+        "{second_request}"
+    );
+    assert_eq!(upstream.status_code, 200);
+    assert_eq!(upstream.wire_api, UpstreamWireApi::AnthropicMessages);
+    let upstream_bytes = upstream.response.bytes().await.unwrap();
+    let upstream_json: serde_json::Value = serde_json::from_slice(&upstream_bytes).unwrap();
+    let converted = anthropic_message_to_response(&upstream_json, Some(&codex_body)).unwrap();
+    assert_eq!(converted["object"], "response");
+    assert_eq!(converted["status"], "completed");
+    assert_eq!(converted["output"][0]["type"], "message");
+    assert_eq!(converted["output"][0]["content"][0]["text"], "来自成员B");
+}
