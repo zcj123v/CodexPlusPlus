@@ -386,3 +386,89 @@ fn anthropic_request_builder_sets_auth_and_originator_headers() {
     assert_eq!(request.headers()["originator"], "codex_cli_rs");
     assert_eq!(request.headers()["accept"], "text/event-stream");
 }
+
+use codex_plus_core::anthropic_proxy::anthropic_models_to_openai_models;
+use codex_plus_core::protocol_proxy::anthropic_models_url;
+
+#[test]
+fn converts_anthropic_models_payload() {
+    let body = json!({
+        "data": [
+            {"type":"model","id":"k3","display_name":"K3","created_at":"2026-07-15T00:00:00Z"},
+            {"type":"model","id":"kimi-for-coding","display_name":"K2.7 Code","created_at":"2026-04-01T00:00:00Z"}
+        ],
+        "has_more": false
+    });
+    let out = anthropic_models_to_openai_models(&body);
+    assert_eq!(out["object"], "list");
+    let data = out["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2);
+    assert_eq!(data[0]["id"], "k3");
+    assert_eq!(data[0]["object"], "model");
+    assert!(data[0]["created"].as_u64().unwrap() > 0);
+    assert_eq!(data[1]["id"], "kimi-for-coding");
+}
+
+#[test]
+fn anthropic_models_created_at_falls_back_to_zero() {
+    let body = json!({
+        "data": [
+            {"type":"model","id":"bad-date","created_at":"not-a-date"},
+            {"type":"model","id":"no-date"}
+        ]
+    });
+    let out = anthropic_models_to_openai_models(&body);
+    let data = out["data"].as_array().unwrap();
+    assert_eq!(data[0]["created"], 0);
+    assert_eq!(data[1]["created"], 0);
+}
+
+#[test]
+fn anthropic_models_created_at_supports_offset() {
+    // 带 +08:00 偏移：2026-01-01T08:00:00+08:00 == 2026-01-01T00:00:00Z
+    let body = json!({
+        "data": [
+            {"type":"model","id":"a","created_at":"2026-01-01T08:00:00+08:00"},
+            {"type":"model","id":"b","created_at":"2026-01-01T00:00:00Z"}
+        ]
+    });
+    let out = anthropic_models_to_openai_models(&body);
+    let data = out["data"].as_array().unwrap();
+    assert_eq!(data[0]["created"], data[1]["created"]);
+    assert!(data[0]["created"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn passes_through_non_anthropic_payload() {
+    let body = json!({"object":"list","data":[{"id":"gpt-5.5","object":"model"}]});
+    let out = anthropic_models_to_openai_models(&body);
+    assert_eq!(out, body);
+}
+
+#[test]
+fn anthropic_models_url_rules() {
+    // 带路径的 base 同样补 /v1（与 anthropic_messages_url 语义一致）
+    assert_eq!(
+        anthropic_models_url("https://api.kimi.com/coding"),
+        "https://api.kimi.com/coding/v1/models"
+    );
+    assert_eq!(
+        anthropic_models_url("https://api.kimi.com/coding/"),
+        "https://api.kimi.com/coding/v1/models"
+    );
+    // `#` 后缀跳过版本前缀
+    assert_eq!(
+        anthropic_models_url("https://proxy.example.com/anthropic#"),
+        "https://proxy.example.com/anthropic/models"
+    );
+    // 已带版本号不重复拼接
+    assert_eq!(
+        anthropic_models_url("https://api.example.com/v1"),
+        "https://api.example.com/v1/models"
+    );
+    // 已是完整端点或以 /models 结尾则原样
+    assert_eq!(
+        anthropic_models_url("https://api.example.com/v1/models"),
+        "https://api.example.com/v1/models"
+    );
+}
