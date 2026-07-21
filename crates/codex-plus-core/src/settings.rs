@@ -220,6 +220,7 @@ pub enum RelayProtocol {
     #[default]
     Responses,
     ChatCompletions,
+    Anthropic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -761,7 +762,10 @@ impl BackendSettings {
 
     pub fn active_relay_uses_protocol_proxy(&self) -> bool {
         self.active_aggregate_relay_profile().is_some()
-            || self.active_relay_profile().protocol == RelayProtocol::ChatCompletions
+            || matches!(
+                self.active_relay_profile().protocol,
+                RelayProtocol::ChatCompletions | RelayProtocol::Anthropic
+            )
             || self.active_relay_profile().has_model_routes()
             || self.active_relay_profile().uses_no_auth()
             || self.active_relay_session_provider() == RelaySessionProvider::Openai
