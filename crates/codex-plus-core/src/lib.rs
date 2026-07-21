@@ -1,4 +1,5 @@
 pub mod ads;
+pub mod anthropic_proxy;
 pub mod app_paths;
 pub mod assets;
 pub mod bridge;
