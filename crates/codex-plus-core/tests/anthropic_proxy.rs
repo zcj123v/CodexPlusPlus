@@ -187,3 +187,114 @@ fn maps_max_tokens_stop_to_incomplete() {
     assert_eq!(out["status"], "incomplete");
     assert_eq!(out["incomplete_details"]["reason"], "max_output_tokens");
 }
+
+use codex_plus_core::anthropic_proxy::AnthropicSseToResponsesConverter;
+
+/// 把转换器输出按 SSE block 拆成 (event, data_json) 列表方便断言。
+fn collect_events(bytes: &[u8]) -> Vec<(String, serde_json::Value)> {
+    let text = String::from_utf8_lossy(bytes);
+    text.split("\n\n")
+        .filter(|block| !block.trim().is_empty())
+        .map(|block| {
+            let mut event = String::new();
+            let mut data = String::new();
+            for line in block.lines() {
+                if let Some(value) = line.strip_prefix("event: ") {
+                    event = value.to_string();
+                }
+                if let Some(value) = line.strip_prefix("data: ") {
+                    data.push_str(value);
+                }
+            }
+            (event, serde_json::from_str(&data).unwrap())
+        })
+        .collect()
+}
+
+#[test]
+fn streams_text_tool_call_and_usage() {
+    let mut converter = AnthropicSseToResponsesConverter::with_request(&serde_json::json!({}));
+    let mut out = Vec::new();
+    let stream = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"k3\",\"usage\":{\"input_tokens\":10}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"你好\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"shell\",\"input\":{}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"[\\\"ls\\\"]}\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":20}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    out.extend(converter.push_bytes(stream.as_bytes()));
+    out.extend(converter.finish());
+
+    let events = collect_events(&out);
+    let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names.first().copied(), Some("response.created"));
+    assert!(names.contains(&"response.output_text.delta"));
+    assert!(names.contains(&"response.function_call_arguments.delta"));
+    assert_eq!(names.last().copied(), Some("response.completed"));
+
+    // 文本 delta 内容
+    let text_delta = events
+        .iter()
+        .find(|(name, _)| name == "response.output_text.delta")
+        .map(|(_, data)| data["delta"].as_str().unwrap().to_string())
+        .unwrap();
+    assert_eq!(text_delta, "你好");
+
+    // arguments 两个 delta 原样拼接后等于完整 JSON
+    let args: String = events
+        .iter()
+        .filter(|(name, _)| name == "response.function_call_arguments.delta")
+        .map(|(_, data)| data["delta"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(args, "{\"command\":[\"ls\"]}");
+
+    // completed 携带 usage
+    let completed = events
+        .iter()
+        .find(|(name, _)| name == "response.completed")
+        .map(|(_, data)| data.clone())
+        .unwrap();
+    assert_eq!(completed["response"]["status"], "completed");
+    assert_eq!(completed["response"]["usage"]["output_tokens"], 20);
+}
+
+#[test]
+fn error_event_yields_response_failed() {
+    let mut converter = AnthropicSseToResponsesConverter::with_request(&serde_json::json!({}));
+    let out = converter.push_bytes(
+        b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+    );
+    let events = collect_events(&out);
+    assert_eq!(events[0].0, "response.failed");
+    assert!(events[0].1["response"]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Overloaded"));
+}
+
+#[test]
+fn split_utf8_across_chunks() {
+    let mut converter = AnthropicSseToResponsesConverter::with_request(&serde_json::json!({}));
+    let full = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"中文\"}}\n\n";
+    let bytes = full.as_bytes();
+    // 在多字节字符中间切开喂入，不应产生乱码或 panic
+    let mut out = converter.push_bytes(&bytes[..bytes.len() / 2]);
+    out.extend(converter.push_bytes(&bytes[bytes.len() / 2..]));
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("中文") || converter.finish().is_empty());
+}
