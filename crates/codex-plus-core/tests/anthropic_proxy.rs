@@ -2390,18 +2390,6 @@ fn sse_enforces_message_phase_and_saturating_usage() {
             ),
             block_start.clone()
         ),
-        format!(
-            "{}{}{}",
-            message_start("a"),
-            sse_event(
-                "message_delta",
-                json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}})
-            ),
-            sse_event(
-                "message_delta",
-                json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}})
-            )
-        ),
     ] {
         assert_invalid_sse_event(&stream, None);
     }
@@ -2409,6 +2397,33 @@ fn sse_enforces_message_phase_and_saturating_usage() {
         &sse_event("message_stop", json!({"type":"message_stop"})),
         None,
     );
+
+    for (stop_reason, expected_event, expected_tokens) in [
+        ("end_turn", "response.completed", 3_u64),
+        ("max_tokens", "response.incomplete", 5_u64),
+    ] {
+        let mut converter = AnthropicSseToResponsesConverter::with_request(&json!({}));
+        let stream = format!(
+            "{}{}{}{}",
+            message_start("multi_delta"),
+            sse_event(
+                "message_delta",
+                json!({"type":"message_delta","delta":{"stop_sequence":"END"},"usage":{"output_tokens":1}}),
+            ),
+            sse_event(
+                "message_delta",
+                json!({"type":"message_delta","delta":{"stop_reason":stop_reason},"usage":{"output_tokens":expected_tokens}}),
+            ),
+            raw_message_stop(),
+        );
+        let events = collect_events(&converter.push_bytes(stream.as_bytes()));
+        let response = &events
+            .iter()
+            .find(|(name, _)| name == expected_event)
+            .unwrap()
+            .1["response"];
+        assert_eq!(response["usage"]["output_tokens"], expected_tokens);
+    }
 
     let mut converter = AnthropicSseToResponsesConverter::with_request(&json!({}));
     let stream = format!(
