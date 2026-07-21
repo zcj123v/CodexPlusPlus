@@ -1431,14 +1431,19 @@ fn invalid_sse_validation_matrix() {
         json!({"type":"message_delta","delta":null,"usage":{}}),
         json!({"type":"message_delta","delta":{},"usage":null}),
         json!({"type":"message_delta","delta":{"stop_reason":7},"usage":{"output_tokens":1}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":null}}),
         json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":"1"}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":-1,"output_tokens":1}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"cache_creation_input_tokens":"1","output_tokens":1}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"cache_read_input_tokens":false,"output_tokens":1}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1,"output_tokens_details":7}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1,"server_tool_use":[]}}),
     ] {
         assert_invalid_sse_event(&sse_event("message_delta", payload), None);
     }
     for payload in [
         json!({"type":"message_delta","usage":{"output_tokens":1}}),
         json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
-        json!({"type":"message_delta","delta":{},"usage":{"output_tokens":1}}),
         json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{}}),
     ] {
         assert_invalid_sse_event(&sse_event("message_delta", payload), None);
@@ -2448,9 +2453,77 @@ fn sse_enforces_message_phase_and_saturating_usage() {
 }
 
 #[test]
+fn sse_nullable_message_delta_fields_preserve_existing_usage() {
+    let mut converter = AnthropicSseToResponsesConverter::with_request(&json!({}));
+    let stream = format!(
+        "{}{}{}{}",
+        sse_event(
+            "message_start",
+            json!({
+                "type":"message_start",
+                "message":{
+                    "id":"nullable_delta",
+                    "model":"k3",
+                    "usage":{
+                        "input_tokens":11,
+                        "cache_creation_input_tokens":12,
+                        "cache_read_input_tokens":13,
+                        "output_tokens_details":{"thinking_tokens":14},
+                        "server_tool_use":{"web_fetch_requests":15,"web_search_requests":16}
+                    }
+                }
+            }),
+        ),
+        sse_event(
+            "message_delta",
+            json!({
+                "type":"message_delta",
+                "delta":{"stop_reason":null},
+                "usage":{
+                    "input_tokens":null,
+                    "cache_creation_input_tokens":null,
+                    "cache_read_input_tokens":null,
+                    "output_tokens":1,
+                    "output_tokens_details":null,
+                    "server_tool_use":null
+                }
+            }),
+        ),
+        sse_event(
+            "message_delta",
+            json!({
+                "type":"message_delta",
+                "delta":{"stop_reason":"end_turn"},
+                "usage":{"output_tokens":2}
+            }),
+        ),
+        raw_message_stop(),
+    );
+    let events = collect_events(&converter.push_bytes(stream.as_bytes()));
+    let response = &events
+        .iter()
+        .find(|(name, _)| name == "response.completed")
+        .unwrap()
+        .1["response"];
+    assert_eq!(response["usage"]["input_tokens"], 36);
+    assert_eq!(response["usage"]["output_tokens"], 2);
+    assert_eq!(response["usage"]["total_tokens"], 38);
+}
+
+#[test]
 fn sse_message_stop_requires_message_delta_and_invalid_final_usage_fails() {
     let start_then_stop = format!("{}{}", message_start("missing_delta"), raw_message_stop(),);
     assert_invalid_sse_event(&start_then_stop, None);
+    let null_stop_then_stop = format!(
+        "{}{}{}",
+        message_start("null_stop"),
+        sse_event(
+            "message_delta",
+            json!({"type":"message_delta","delta":{"stop_reason":null},"usage":{"output_tokens":1}}),
+        ),
+        raw_message_stop(),
+    );
+    assert_invalid_sse_event(&null_stop_then_stop, None);
 
     let mut converter = AnthropicSseToResponsesConverter::with_request(&json!({}));
     let stream = format!(
