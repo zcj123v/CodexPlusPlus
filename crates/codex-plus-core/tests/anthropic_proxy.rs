@@ -169,9 +169,10 @@ fn converts_message_with_text_tool_use_and_thinking() {
     assert_eq!(output[2]["call_id"], "toolu_1");
     assert_eq!(output[2]["name"], "shell");
     assert_eq!(output[2]["arguments"], "{\"command\":[\"ls\"]}");
-    // usage 透传（含缓存字段）
-    assert_eq!(out["usage"]["input_tokens"], 100);
+    // usage 转换：缓存读/写计入总输入（100+80+20=200），cached_tokens 仅取 cache_read
+    assert_eq!(out["usage"]["input_tokens"], 200);
     assert_eq!(out["usage"]["output_tokens"], 50);
+    assert_eq!(out["usage"]["total_tokens"], 250);
     assert_eq!(out["usage"]["input_tokens_details"]["cached_tokens"], 80);
 }
 
