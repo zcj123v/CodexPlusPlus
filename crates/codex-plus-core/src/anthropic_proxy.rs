@@ -243,3 +243,111 @@ fn reasoning_item_text(item: &Value) -> String {
     }
     String::new()
 }
+
+/// Anthropic Messages 响应体 → codex Responses 响应体（非流式）。
+pub fn anthropic_message_to_response(
+    body: &Value,
+    original_request: Option<&Value>,
+) -> anyhow::Result<Value> {
+    let response_id = body
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("msg_unknown")
+        .to_string();
+    let mut output: Vec<Value> = Vec::new();
+
+    if let Some(blocks) = body.get("content").and_then(Value::as_array) {
+        for block in blocks {
+            match block.get("type").and_then(Value::as_str) {
+                Some("thinking") => {
+                    let mut item = json!({
+                        "type": "reasoning",
+                        "id": response_id,
+                        "summary": [{
+                            "type": "summary_text",
+                            "text": block.get("thinking").and_then(Value::as_str).unwrap_or("")
+                        }]
+                    });
+                    // 存下签名供多轮回传（Task 2 请求转换读取）
+                    if let Some(signature) = block.get("signature").and_then(Value::as_str) {
+                        item["signature"] = json!(signature);
+                    }
+                    output.push(item);
+                }
+                Some("text") => {
+                    output.push(json!({
+                        "type": "message",
+                        "id": response_id,
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{
+                            "type": "output_text",
+                            "text": block.get("text").and_then(Value::as_str).unwrap_or(""),
+                            "annotations": []
+                        }]
+                    }));
+                }
+                Some("tool_use") => {
+                    let input = block.get("input").cloned().unwrap_or(json!({}));
+                    output.push(json!({
+                        "type": "function_call",
+                        "id": response_id,
+                        "call_id": block.get("id").and_then(Value::as_str).unwrap_or(""),
+                        "name": block.get("name").and_then(Value::as_str).unwrap_or(""),
+                        "arguments": serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string()),
+                        "status": "completed"
+                    }));
+                }
+                _ => { /* 未知 block：跳过 */ }
+            }
+        }
+    }
+
+    let stop_reason = body.get("stop_reason").and_then(Value::as_str).unwrap_or("");
+    let mut response = json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        "status": if stop_reason == "max_tokens" { "incomplete" } else { "completed" },
+        "model": body.get("model").and_then(Value::as_str).unwrap_or(""),
+        "output": output,
+        "usage": anthropic_usage_to_responses_usage(body.get("usage")),
+    });
+    if stop_reason == "max_tokens" {
+        response["incomplete_details"] = json!({"reason": "max_output_tokens"});
+    }
+    // 回显请求侧关键字段（与 chat 转换 copy_response_request_fields 对齐的最小子集）
+    if let Some(request) = original_request {
+        for key in ["instructions", "parallel_tool_calls", "store"] {
+            if let Some(value) = request.get(key) {
+                response[key] = value.clone();
+            }
+        }
+    }
+    Ok(response)
+}
+
+/// Anthropic usage → Responses usage（缓存 token 透传）。
+pub(crate) fn anthropic_usage_to_responses_usage(usage: Option<&Value>) -> Value {
+    let Some(usage) = usage else {
+        return json!({"input_tokens": 0, "output_tokens": 0, "total_tokens": 0});
+    };
+    let input = usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let output = usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let cached = usage
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    // input_tokens 原样透传（cached_tokens 作为其明细字段，不重复计入总数）。
+    // 注意：Anthropic 的 cache_creation_input_tokens 暂不计入 input_tokens，见 task-3 报告。
+    json!({
+        "input_tokens": input,
+        "output_tokens": output,
+        "total_tokens": input + output,
+        "input_tokens_details": {"cached_tokens": cached},
+        "output_tokens_details": {"reasoning_tokens": 0}
+    })
+}
