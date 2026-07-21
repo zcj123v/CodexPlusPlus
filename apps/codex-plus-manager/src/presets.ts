@@ -21,6 +21,35 @@ export interface ProviderPreset {
   protocol: RelayProtocol;
   model: string;
   modelList?: string[];
+  modelWindows?: Record<string, string>;
+}
+
+export interface PresetPatch {
+  name: string;
+  baseUrl: string;
+  upstreamBaseUrl: string;
+  protocol: RelayProtocol;
+  model: string;
+  testModel: string;
+  modelList: string;
+  modelWindows: string;
+  relayMode: "official" | "pureApi";
+  officialMixApiKey: false;
+}
+
+export function createPresetPatch(preset: ProviderPreset): PresetPatch {
+  return {
+    name: preset.name,
+    baseUrl: preset.baseUrl,
+    upstreamBaseUrl: preset.baseUrl,
+    protocol: preset.protocol,
+    model: preset.model,
+    testModel: preset.model,
+    modelList: preset.modelList?.join("\n") ?? "",
+    modelWindows: JSON.stringify(preset.modelWindows ?? {}),
+    relayMode: preset.category === "official" ? "official" : "pureApi",
+    officialMixApiKey: false,
+  };
 }
 
 /**
@@ -86,7 +115,8 @@ export const PRESETS: ProviderPreset[] = [
     baseUrl: "https://api.kimi.com/coding",
     protocol: "anthropic",
     model: "k3",
-    modelList: ["k3[1M]", "kimi-for-coding", "kimi-for-coding-highspeed"],
+    modelList: ["k3", "kimi-for-coding", "kimi-for-coding-highspeed"],
+    modelWindows: { k3: "1M" },
   },
   {
     id: "bailian",
