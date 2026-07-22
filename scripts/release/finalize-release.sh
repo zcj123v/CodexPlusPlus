@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Wait for Linux release packages, then append generated notes without losing the current body.
+# Append generated notes without losing the current release body.
 set -euo pipefail
 
 if [[ $# -ne 1 ]]; then
@@ -15,47 +15,6 @@ if [[ ! -f "$notes_file" ]]; then
   echo "error: notes file does not exist: $notes_file" >&2
   exit 2
 fi
-
-max_attempts="${RELEASE_ASSET_MAX_ATTEMPTS:-30}"
-poll_seconds="${RELEASE_ASSET_POLL_SECONDS:-10}"
-if [[ ! "$max_attempts" =~ ^[1-9][0-9]*$ ]]; then
-  echo "error: RELEASE_ASSET_MAX_ATTEMPTS must be a positive integer" >&2
-  exit 2
-fi
-if [[ ! "$poll_seconds" =~ ^[0-9]+$ ]]; then
-  echo "error: RELEASE_ASSET_POLL_SECONDS must be a non-negative integer" >&2
-  exit 2
-fi
-
-assets=""
-for ((attempt = 1; attempt <= max_attempts; attempt++)); do
-  assets="$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name')"
-  have_arch=false
-  have_deb=false
-  while IFS= read -r asset; do
-    [[ "$asset" == *.pkg.tar.zst ]] && have_arch=true
-    [[ "$asset" == *.deb ]] && have_deb=true
-  done <<<"$assets"
-
-  if [[ "$have_arch" == true && "$have_deb" == true ]]; then
-    echo "Release assets ready on attempt $attempt/$max_attempts."
-    break
-  fi
-
-  if ((attempt == max_attempts)); then
-    echo "error: timed out waiting for both a .pkg.tar.zst and a .deb release asset after $max_attempts attempts" >&2
-    echo "Last observed release assets:" >&2
-    if [[ -n "$assets" ]]; then
-      printf '%s\n' "$assets" >&2
-    else
-      echo "(none)" >&2
-    fi
-    exit 1
-  fi
-
-  echo "Waiting for Linux release assets (attempt $attempt/$max_attempts; arch=$have_arch, deb=$have_deb)..."
-  sleep "$poll_seconds"
-done
 
 marker='<!-- codexplusplus-fork-notes -->'
 work_dir="$(mktemp -d)"
