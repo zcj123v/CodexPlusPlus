@@ -21,7 +21,7 @@ permissions:
 jobs:
   build-binaries:
     name: Build Linux binaries
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -52,6 +52,12 @@ jobs:
 
       - name: Build release binaries
         run: cargo build --release --workspace
+
+      - name: Verify Linux binary ABI baseline
+        run: |
+          scripts/installer/debian/verify-amd64-elf.sh --max-glibc GLIBC_2.35 \
+            target/release/codex-plus-plus \
+            target/release/codex-plus-plus-manager
 
       - name: Upload Linux binaries
         uses: actions/upload-artifact@v4
@@ -136,7 +142,9 @@ jobs:
 
       - name: Build Debian package
         run: |
-          chmod +x pkg-bin/codex-plus-plus pkg-bin/codex-plus-plus-manager
+          scripts/installer/debian/verify-amd64-elf.sh \
+            pkg-bin/codex-plus-plus \
+            pkg-bin/codex-plus-plus-manager
           scripts/installer/debian/build-package.sh --binaries-dir pkg-bin dist/debian
 
       - name: Upload Debian package
