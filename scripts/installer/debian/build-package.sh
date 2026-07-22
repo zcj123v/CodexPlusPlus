@@ -48,11 +48,14 @@ while [[ $# -gt 0 ]]; do
 done
 out_dir="${out_dir_arg:-$repo_root/dist/debian}"
 
-version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo_root/Cargo.toml" | head -1)"
+version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo_root/Cargo.toml")"
+version="${version%%$'\n'*}"
 if [[ -z "$version" ]]; then
   echo "failed to read workspace version from Cargo.toml" >&2
   exit 1
 fi
+# Cargo prereleases sort before the corresponding final release in Debian.
+deb_version="$("$pkg_dir/cargo-version-to-deb.sh" "$version")"
 
 # 无预编译产物时本地全量构建（前端先构建，Tauri manager 编译期内嵌它）。
 if [[ -z "$binaries_dir" ]]; then
@@ -62,6 +65,14 @@ if [[ -z "$binaries_dir" ]]; then
   (cd "$repo_root" && cargo build --release --workspace)
   binaries_dir="$repo_root/target/release"
 fi
+
+if [[ ! -d "$binaries_dir" ]]; then
+  echo "error: binaries directory does not exist: $binaries_dir" >&2
+  exit 1
+fi
+"$pkg_dir/verify-amd64-elf.sh" \
+  "$binaries_dir/codex-plus-plus" \
+  "$binaries_dir/codex-plus-plus-manager"
 
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
@@ -77,15 +88,18 @@ install -Dm644 "$repo_root/apps/codex-plus-manager/src-tauri/icons/icon.png" \
   "$stage/usr/share/icons/hicolor/256x256/apps/codexplusplus.png"
 
 mkdir -p "$stage/DEBIAN"
-sed "s/^Version: @VERSION@$/Version: $version/" "$pkg_dir/control" > "$stage/DEBIAN/control"
+sed "s/^Version: @VERSION@$/Version: $deb_version/" "$pkg_dir/control" > "$stage/DEBIAN/control"
 
 mkdir -p "$out_dir"
-package="$out_dir/codexplusplus_${version}_amd64.deb"
+package="$out_dir/codexplusplus_${deb_version}_amd64.deb"
 dpkg-deb --build --root-owner-group "$stage" "$package"
 
 # 自检：control 元数据与包内文件清单。
-dpkg-deb --info "$package" | grep -q "^ Package: codexplusplus$"
-dpkg-deb --info "$package" | grep -q "^ Version: $version$"
+package_info="$(dpkg-deb --info "$package")"
+grep -q "^ Package: codexplusplus$" <<<"$package_info"
+grep -q "^ Version: $deb_version$" <<<"$package_info"
+grep -q "^ Architecture: amd64$" <<<"$package_info"
+grep -q "^ Maintainer: zcj123v <noreply@github.com>$" <<<"$package_info"
 contents="$(dpkg-deb --contents "$package")"
 for path in \
   ./usr/bin/codex-plus-plus \
