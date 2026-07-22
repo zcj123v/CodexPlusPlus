@@ -34,21 +34,28 @@ for binary in "$@"; do
   echo "verified x86-64 ELF: $binary"
 
   if [[ -n "$max_glibc" ]]; then
-    glibc_versions="$(objdump -T "$binary" | awk '
+    glibc_versions="$(readelf --version-info --wide "$binary" | awk '
       {
         line = $0
-        while (match(line, /GLIBC_[0-9]+([.][0-9]+)*/)) {
+        while (match(line, /GLIBC_[A-Za-z0-9_.]+/)) {
           print substr(line, RSTART, RLENGTH)
           line = substr(line, RSTART + RLENGTH)
         }
       }
-    ' | sort -Vu)"
+    ' | sort -u)"
     if [[ -z "$glibc_versions" ]]; then
-      echo "error: no GLIBC symbol versions found in $binary" >&2
+      echo "error: no GLIBC version needs found in $binary" >&2
       exit 1
     fi
 
-    highest_glibc="$(printf '%s\n' "$glibc_versions" | tail -n 1)"
+    while IFS= read -r glibc_version; do
+      if [[ ! "$glibc_version" =~ ^GLIBC_[0-9]+([.][0-9]+)*$ ]]; then
+        echo "error: $binary requires unsupported non-numeric GLIBC version $glibc_version; cannot prove compatibility with $max_glibc" >&2
+        exit 1
+      fi
+    done <<<"$glibc_versions"
+
+    highest_glibc="$(printf '%s\n' "$glibc_versions" | sort -Vu | tail -n 1)"
     highest_allowed="$(printf '%s\n%s\n' "$max_glibc" "$highest_glibc" | sort -Vu | tail -n 1)"
     if [[ "$highest_allowed" != "$max_glibc" ]]; then
       echo "error: $binary requires $highest_glibc, newer than allowed $max_glibc" >&2
