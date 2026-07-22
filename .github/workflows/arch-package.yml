@@ -41,6 +41,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-22.04
 
       - name: Install Tauri Linux system dependencies
         run: |
