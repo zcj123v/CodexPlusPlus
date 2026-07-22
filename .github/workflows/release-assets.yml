@@ -8,6 +8,48 @@ permissions:
   contents: write
 
 jobs:
+  release-notes:
+    name: Append fork notes to release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+
+      - name: Generate fork notes
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/BigPizzaV3/CodexPlusPlus.git
+          git fetch upstream main
+          {
+            echo
+            echo "---"
+            echo
+            echo "## 与上游 BigPizzaV3/CodexPlusPlus 的差异"
+            echo
+            diff_lines="$(git log --no-merges --oneline upstream/main..HEAD)"
+            if [[ -n "$diff_lines" ]]; then
+              echo '```'
+              echo "$diff_lines"
+              echo '```'
+            else
+              echo "无差异"
+            fi
+            echo
+            echo "## 兼容性"
+            echo
+            cat docs/release/compatibility.md
+          } > fork-notes.md
+          cat fork-notes.md
+
+      - name: Append notes to release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: fork-notes.md
+          append_body: true
+
   windows-installer:
     runs-on: windows-latest
     steps:
@@ -154,6 +196,7 @@ jobs:
     name: Upload static latest.json
     runs-on: ubuntu-latest
     needs:
+      - release-notes
       - windows-installer
       - macos-dmg
     steps:
