@@ -12,15 +12,36 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 pkg_dir="$repo_root/scripts/installer/debian"
 binaries_dir=""
 out_dir_arg=""
+out_dir_set=false
+
+usage() {
+  echo "Usage: scripts/installer/debian/build-package.sh [--binaries-dir <dir>] [output-dir]" >&2
+}
+
+argument_error() {
+  echo "error: $*" >&2
+  usage
+  exit 2
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --binaries-dir)
+      if [[ $# -lt 2 || "$2" == -* ]]; then
+        argument_error "--binaries-dir requires a directory"
+      fi
       binaries_dir="$2"
       shift 2
       ;;
+    -*)
+      argument_error "unknown option: $1"
+      ;;
     *)
+      if [[ "$out_dir_set" == true ]]; then
+        argument_error "only one output-dir may be specified"
+      fi
       out_dir_arg="$1"
+      out_dir_set=true
       shift
       ;;
   esac
