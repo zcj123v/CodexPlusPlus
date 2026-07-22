@@ -3,7 +3,7 @@ Version: @VERSION@
 Section: devel
 Priority: optional
 Architecture: amd64
-Maintainer: zcj123v
+Maintainer: zcj123v <noreply@github.com>
 Homepage: https://github.com/zcj123v/CodexPlusPlus
 Depends: libwebkit2gtk-4.1-0, libayatana-appindicator3-1, libgtk-3-0, libglib2.0-0, libsoup-3.0-0, libgdk-pixbuf-2.0-0, libcairo2, libpango-1.0-0, libgcc-s1, hicolor-icon-theme
 Description: External enhancement launcher and manager for the Codex desktop app (Linux port)
