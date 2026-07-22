@@ -18,7 +18,26 @@ jobs:
           ref: ${{ github.event.release.tag_name }}
           fetch-depth: 0
 
+      - name: Check whether fork notes already exist
+        id: fork_notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          marker='<!-- codexplusplus-fork-notes -->'
+          release_body="$(gh release view "$TAG" --repo "$REPO" --json body --jq .body)"
+          if [[ "$release_body" == *"$marker"* ]]; then
+            printf '%s\n' 'append=false' >> "$GITHUB_OUTPUT"
+            echo "Fork notes marker already exists; skipping append."
+          else
+            printf '%s\n' 'append=true' >> "$GITHUB_OUTPUT"
+            echo "Fork notes marker not found; notes will be appended."
+          fi
+
       - name: Generate fork notes
+        if: steps.fork_notes.outputs.append == 'true'
         run: |
           set -euo pipefail
           git remote add upstream https://github.com/BigPizzaV3/CodexPlusPlus.git
@@ -26,6 +45,8 @@ jobs:
           {
             echo
             echo "---"
+            echo
+            echo '<!-- codexplusplus-fork-notes -->'
             echo
             echo "## 与上游 BigPizzaV3/CodexPlusPlus 的差异"
             echo
@@ -45,6 +66,7 @@ jobs:
           cat fork-notes.md
 
       - name: Append notes to release
+        if: steps.fork_notes.outputs.append == 'true'
         uses: softprops/action-gh-release@v2
         with:
           body_path: fork-notes.md
