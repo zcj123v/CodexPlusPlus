@@ -70,7 +70,7 @@ if [[ ! -d "$binaries_dir" ]]; then
   echo "error: binaries directory does not exist: $binaries_dir" >&2
   exit 1
 fi
-"$pkg_dir/verify-amd64-elf.sh" \
+"$pkg_dir/verify-amd64-elf.sh" --max-glibc GLIBC_2.35 \
   "$binaries_dir/codex-plus-plus" \
   "$binaries_dir/codex-plus-plus-manager"
 

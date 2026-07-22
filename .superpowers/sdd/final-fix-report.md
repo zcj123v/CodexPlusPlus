@@ -125,3 +125,104 @@ architecture failure exit=1: error: expected an x86-64 ELF binary: <tmp>/fake (A
 
 - 未触发真实 `release.published`，符合测试约束。
 - 当前机器没有 `dpkg-deb`，所以 archive 构建用临时严格 stub 验证脚本控制流、metadata 和文件名；GitHub `ubuntu-22.04` job 会使用真实 `dpkg-deb` 完成包构建与既有 archive 自检。
+
+## Follow-up final fix（基线 `3d07a9c`）
+
+### Important 1：用 reusable workflow 建立真实依赖
+
+- `.github/workflows/arch-package.yml` 新增 `workflow_call`，声明默认 `false` 的 boolean input `attach_to_release`；删除直接 `release.published` trigger，保留 push、PR 与无上传选项的 `workflow_dispatch`。
+- Arch 与 Debian 的 release upload 只在 `inputs.attach_to_release` 为 true 时运行，并显式使用 caller release 的 `${{ github.event.release.tag_name }}`。push、PR、manual dispatch 都使用默认 false，不会上传 release。
+- `.github/workflows/release-assets.yml` 新增 `linux-packages` reusable workflow job，传 `attach_to_release: true`、`secrets: inherit` 与 `permissions: contents: write`。
+- `release-notes` 现在严格 `needs: [windows-installer, macos-dmg, linux-packages]`；三个平台的全部 `softprops` asset writer 成功结束后才读取并编辑 body。
+- `scripts/release/finalize-release.sh` 删除全部扩展名 polling、timeout 和 sleep 逻辑，只负责读取当前 body、marker 幂等判断、保留完整手写 body 并 `gh release edit --notes-file`。
+- `latest-json` 继续只依赖 `release-notes`，通过传递依赖读取 notes 后且所有 assets 已完成的 release。
+
+### Important 2：拒绝所有无法证明兼容的 GLIBC version need
+
+- `verify-amd64-elf.sh` 改用 `readelf --version-info --wide`，读取 `.gnu.version_r` 中的全部 version needs，而不是只看动态符号表。
+- 提取所有 `GLIBC_[A-Za-z0-9_.]+`；任何不匹配 `GLIBC_<纯数字点版本>` 的需求（包括 `GLIBC_ABI_DT_RELR`）立即明确失败。纯数字版本继续以 `sort -V` 比较 `GLIBC_2.35` ceiling。
+- `build-package.sh` 调 helper 时也传入 `--max-glibc GLIBC_2.35`，因此本地/CI `--binaries-dir` 打包路径不能绕过 ABI ceiling。
+- Reviewer 提到的手写其他 libc version namespace 与 executable subtype 细化记录为 Minor，未扩大本次指定范围；现有逻辑仍严格要求 x86-64 ELF，并拒绝所有检测到的非 numeric GLIBC needs。
+
+### Follow-up 验证
+
+Workflow YAML 与 reusable 结构：
+
+```bash
+npx --yes js-yaml .github/workflows/arch-package.yml
+npx --yes js-yaml .github/workflows/release-assets.yml
+# 用 Node 对解析后的 JSON 断言 workflow_call、无 release trigger、input 默认 false、
+# 两个 upload guard/tag、caller permissions/secrets、release-notes needs 与 latest-json needs。
+```
+
+输出：
+
+```text
+workflow_call triggers, guard, tag, permissions and needs: ok
+YAML parse: ok
+```
+
+全部相关 shell 与静态检查：
+
+```bash
+bash -n scripts/release/finalize-release.sh \
+  scripts/installer/debian/verify-amd64-elf.sh \
+  scripts/installer/debian/cargo-version-to-deb.sh \
+  scripts/installer/debian/build-package.sh
+git diff --check
+```
+
+输出：
+
+```text
+bash syntax: ok
+git diff --check: ok
+```
+
+Finalize fake `gh` marker absent/present：
+
+```text
+Fork notes appended while preserving the existing release body.
+Fork notes marker already exists; release body is unchanged.
+finalize marker absent/present: passed
+```
+
+断言 absent 时完整保留 `Handwritten release body`、marker 恰好一个、edit 一次；present 时 edit 零次。脚本已无 asset query/poll/sleep。
+
+GLIBC 模拟 numeric pass / above ceiling / non-numeric：
+
+```text
+verified GLIBC ceiling: <tmp>/binary requires at most GLIBC_2.35 (allowed GLIBC_2.35)
+numeric above exit=1: error: <tmp>/binary requires GLIBC_2.36, newer than allowed GLIBC_2.35
+non-numeric exit=1: error: <tmp>/binary requires unsupported non-numeric GLIBC version GLIBC_ABI_DT_RELR; cannot prove compatibility with GLIBC_2.35
+```
+
+真实 DT_RELR 回归：
+
+```bash
+cc main.c -Wl,-z,pack-relative-relocs -o relr
+readelf --version-info --wide relr | grep GLIBC_ABI_DT_RELR
+scripts/installer/debian/verify-amd64-elf.sh --max-glibc GLIBC_2.35 relr
+```
+
+输出与断言：
+
+```text
+Name: GLIBC_ABI_DT_RELR
+real DT_RELR binary exit=1: error: relr requires unsupported non-numeric GLIBC version GLIBC_ABI_DT_RELR; cannot prove compatibility with GLIBC_2.35
+```
+
+`build-package.sh` ceiling 传递回归（fake `file`/`readelf` 报 GLIBC_2.36）：
+
+```text
+build-package GLIBC ceiling exit=1: error: <tmp>/bin/codex-plus-plus requires GLIBC_2.36, newer than allowed GLIBC_2.35
+```
+
+版本回归：
+
+```text
+formal=1.2.41
+prerelease=1.2.42~beta.1
+```
+
+仍未执行真实 release。
