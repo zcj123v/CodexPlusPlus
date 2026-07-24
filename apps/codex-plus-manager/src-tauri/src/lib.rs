@@ -370,11 +370,11 @@ fn install_panic_logger() {
 }
 
 fn acquire_single_instance_guard() -> Option<codex_plus_core::ports::LoopbackPortGuard> {
-    match codex_plus_core::ports::acquire_resilient_loopback_port_guard(
+    match codex_plus_core::ports::acquire_resilient_guard_with_port_fallback(
         codex_plus_core::ports::manager_guard_port(),
     ) {
-        Ok(guard) => {
-            if let Some(fallback_lock_path) = guard.fallback_path() {
+        Ok(acquisition) => {
+            if let Some(fallback_lock_path) = acquisition.guard.fallback_path() {
                 let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
                     "manager.guard_fallback",
                     serde_json::json!({
@@ -383,7 +383,17 @@ fn acquire_single_instance_guard() -> Option<codex_plus_core::ports::LoopbackPor
                     }),
                 );
             }
-            Some(guard)
+            if acquisition.effective_port != acquisition.requested_port {
+                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                    "manager.guard_port_fallback",
+                    serde_json::json!({
+                        "requested_guard_port": acquisition.requested_port,
+                        "effective_guard_port": acquisition.effective_port,
+                        "attempts": acquisition.attempts
+                    }),
+                );
+            }
+            Some(acquisition.guard)
         }
         Err(error)
             if matches!(
@@ -402,7 +412,7 @@ fn acquire_single_instance_guard() -> Option<codex_plus_core::ports::LoopbackPor
         }
         Err(error) => {
             let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-                "manager.guard_failed",
+                "manager.guard_fallback_failed",
                 serde_json::json!({
                     "guard_port": codex_plus_core::ports::manager_guard_port(),
                     "error": error.to_string()

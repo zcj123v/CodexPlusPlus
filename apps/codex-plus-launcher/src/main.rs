@@ -67,11 +67,14 @@ fn acquire_single_instance_guard_with_retry(
     allow_stale_recovery: bool,
 ) -> anyhow::Result<Option<codex_plus_core::ports::LoopbackPortGuard>> {
     match try_acquire_single_instance_guard() {
-        Ok(guard) => {
-            if let Some(fallback_lock_path) = guard.fallback_path() {
+        Ok(acquisition) => {
+            if let Some(fallback_lock_path) = acquisition.guard.fallback_path() {
                 log_launcher_guard_fallback(fallback_lock_path);
             }
-            Ok(Some(guard))
+            if acquisition.effective_port != acquisition.requested_port {
+                log_launcher_guard_port_fallback(&acquisition);
+            }
+            Ok(Some(acquisition.guard))
         }
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
             log_launcher_already_running(debug_port);
@@ -97,11 +100,24 @@ fn acquire_single_instance_guard_with_retry(
     }
 }
 
-fn try_acquire_single_instance_guard() -> std::io::Result<codex_plus_core::ports::LoopbackPortGuard>
-{
-    codex_plus_core::ports::acquire_resilient_loopback_port_guard(
+fn try_acquire_single_instance_guard(
+) -> std::io::Result<codex_plus_core::ports::ResilientGuardAcquisition> {
+    codex_plus_core::ports::acquire_resilient_guard_with_port_fallback(
         codex_plus_core::ports::launcher_guard_port(),
     )
+}
+
+fn log_launcher_guard_port_fallback(
+    acquisition: &codex_plus_core::ports::ResilientGuardAcquisition,
+) {
+    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+        "launcher.guard_port_fallback",
+        json!({
+            "requested_guard_port": acquisition.requested_port,
+            "effective_guard_port": acquisition.effective_port,
+            "attempts": acquisition.attempts
+        }),
+    );
 }
 
 fn log_launcher_guard_fallback(fallback_lock_path: &Path) {
@@ -799,6 +815,15 @@ mod tests {
         assert!(source.contains("acquire_single_instance_guard(options.debug_port)?"));
         assert!(source.contains("launcher_guard_port"));
         assert!(source.contains("launcher.already_running"));
+    }
+
+    #[test]
+    fn launcher_guard_uses_unified_port_fallback() {
+        let source = include_str!("main.rs");
+
+        assert!(source.contains("acquire_resilient_guard_with_port_fallback"));
+        assert!(source.contains("launcher.guard_port_fallback"));
+        assert!(source.contains("effective_guard_port"));
     }
 
     #[test]
