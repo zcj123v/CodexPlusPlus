@@ -791,7 +791,8 @@ async fn default_helper_serves_backend_status_over_http() {
     let port = listener.local_addr().unwrap().port();
     drop(listener);
 
-    hooks.start_helper(port).await.unwrap();
+    let effective = hooks.start_helper(port).await.unwrap();
+    assert_eq!(effective, port);
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let response = client
         .post(format!("http://127.0.0.1:{port}/backend/status"))
@@ -825,7 +826,8 @@ async fn default_helper_accepts_diagnostic_log_events_over_http() {
     let port = listener.local_addr().unwrap().port();
     drop(listener);
 
-    hooks.start_helper(port).await.unwrap();
+    let effective = hooks.start_helper(port).await.unwrap();
+    assert_eq!(effective, port);
     let response = reqwest::Client::builder()
         .no_proxy()
         .build()
@@ -1394,6 +1396,57 @@ async fn launch_starts_helper_when_chat_protocol_proxy_is_enabled() {
 }
 
 #[tokio::test]
+async fn launch_lifecycle_uses_effective_helper_port_after_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    // 模拟 Windows helper 回退：requested 57321，effective 57328。
+    let hooks = FakeHooks::new(events.clone()).with_helper_port_fallback(7);
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store,
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+
+    // injection、LaunchHandle、LaunchStatus 都必须使用 effective port。
+    assert_eq!(handle.helper_port, 57328);
+    assert_eq!(
+        handle.status_store.load_latest().unwrap().unwrap().helper_port,
+        Some(57328)
+    );
+    let before_stop = events.lock().unwrap().clone();
+    assert!(before_stop.contains(&"start-helper:57321".to_string()));
+    assert!(before_stop.contains(&"inject:9229:57328".to_string()));
+    assert!(!before_stop.contains(&"inject:9229:57321".to_string()));
+
+    handle.wait_for_codex_exit().await.unwrap();
+
+    let after_stop = events.lock().unwrap().clone();
+    assert!(after_stop.contains(&"shutdown-helper:57328".to_string()));
+}
+
+#[test]
+fn launcher_protocol_proxy_disables_helper_port_fallback() {
+    let source =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/launcher.rs")).unwrap();
+
+    // protocol proxy 的 relay config 已生成并固定指向 57321，绑定失败必须
+    // 直接报错而不允许回退到其他端口。
+    assert!(source.contains("active_relay_uses_protocol_proxy()"));
+    assert!(source.contains("protocol proxy 需要"));
+    assert!(source.contains("bind_helper_loopback_with_fallback"));
+}
+
+#[tokio::test]
 async fn launch_lifecycle_cleans_helper_and_codex_when_status_save_fails() {
     let temp = tempfile::tempdir().unwrap();
     let app_dir = temp.path().join("Codex.app");
@@ -1581,6 +1634,7 @@ struct FakeHooks {
     inject_error: Option<String>,
     provider_sync_unsupported: bool,
     plugin_marketplace_error: Option<String>,
+    helper_port_fallback_offset: u16,
 }
 
 impl FakeHooks {
@@ -1597,6 +1651,7 @@ impl FakeHooks {
             inject_error: None,
             provider_sync_unsupported: false,
             plugin_marketplace_error: None,
+            helper_port_fallback_offset: 0,
         }
     }
 
@@ -1627,6 +1682,11 @@ impl FakeHooks {
 
     fn with_plugin_marketplace_error(mut self, message: &str) -> Self {
         self.plugin_marketplace_error = Some(message.to_string());
+        self
+    }
+
+    fn with_helper_port_fallback(mut self, offset: u16) -> Self {
+        self.helper_port_fallback_offset = offset;
         self
     }
 
@@ -1694,9 +1754,9 @@ impl LaunchHooks for FakeHooks {
         Ok(())
     }
 
-    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()> {
+    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<u16> {
         self.event(format!("start-helper:{helper_port}"));
-        Ok(())
+        Ok(helper_port + self.helper_port_fallback_offset)
     }
 
     async fn launch_codex(

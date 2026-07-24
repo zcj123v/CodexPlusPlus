@@ -144,7 +144,7 @@ pub trait LaunchHooks: Send + Sync {
     ) -> anyhow::Result<()> {
         Ok(())
     }
-    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()>;
+    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<u16>;
     async fn launch_codex(
         &self,
         app_dir: &Path,
@@ -219,6 +219,8 @@ pub struct DefaultLaunchHooks {
     bridge_watchdog: Mutex<Option<BridgeWatchdogRuntime>>,
     computer_use_guard_watchdog: Mutex<Option<ComputerUseGuardWatchdogRuntime>>,
     computer_use_guard_artifacts: Mutex<Option<crate::computer_use_guard::GuardArtifacts>>,
+    // load_settings 缓存，供 start_helper 判断 protocol proxy 边界用。
+    settings: Mutex<Option<BackendSettings>>,
 }
 
 struct HelperRuntime {
@@ -309,7 +311,9 @@ where
             helper_port = crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT;
         }
         if settings.enhancements_enabled || protocol_proxy_enabled {
-            hooks.start_helper(helper_port).await?;
+            // start_helper 返回 effective port（Windows 上 helper 可能从
+            // excluded port range 回退），后续注入/状态/关停都用 effective。
+            helper_port = hooks.start_helper(helper_port).await?;
             helper_started = true;
         }
 
@@ -512,7 +516,9 @@ impl LaunchHooks for DefaultLaunchHooks {
     }
 
     async fn load_settings(&self) -> anyhow::Result<BackendSettings> {
-        SettingsStore::default().load()
+        let settings = SettingsStore::default().load()?;
+        *self.settings.lock().await = Some(settings.clone());
+        Ok(settings)
     }
 
     async fn run_provider_sync(&self) -> anyhow::Result<()> {
@@ -621,19 +627,44 @@ impl LaunchHooks for DefaultLaunchHooks {
         Ok(())
     }
 
-    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()> {
+    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<u16> {
         let bind_host = helper_bind_host();
-        let listener = tokio::net::TcpListener::bind((bind_host.as_str(), helper_port))
+        let protocol_proxy_enabled = self
+            .settings
+            .lock()
             .await
-            .with_context(|| {
-                format!("failed to bind helper runtime on {bind_host}:{helper_port}")
-            })?;
+            .as_ref()
+            .is_some_and(|settings| settings.active_relay_uses_protocol_proxy());
+        let (listener, effective_port, attempts) = if protocol_proxy_enabled {
+            // protocol proxy 的 relay config 已生成并固定指向该端口，禁止回退。
+            let listener = tokio::net::TcpListener::bind((bind_host.as_str(), helper_port))
+                .await
+                .with_context(|| {
+                    format!(
+                        "protocol proxy 需要 {helper_port}，请释放该端口或避开 Windows excluded port range"
+                    )
+                })?;
+            (listener, helper_port, 1usize)
+        } else {
+            let bind = crate::ports::bind_helper_loopback_with_fallback(helper_port, &bind_host)
+                .with_context(|| {
+                    format!("failed to bind helper runtime on {bind_host}:{helper_port}")
+                })?;
+            bind.listener
+                .set_nonblocking(true)
+                .context("failed to set helper listener non-blocking")?;
+            let listener = tokio::net::TcpListener::from_std(bind.listener)
+                .context("failed to convert helper listener to tokio")?;
+            (listener, bind.effective_port, bind.attempts)
+        };
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "helper.listening",
             serde_json::json!({
-                "helper_port": helper_port,
+                "helper_port": effective_port,
+                "requested_helper_port": helper_port,
+                "attempts": attempts,
                 "bind_host": bind_host,
-                "address": format!("http://{bind_host}:{helper_port}")
+                "address": format!("http://{bind_host}:{effective_port}")
             }),
         );
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
@@ -655,7 +686,7 @@ impl LaunchHooks for DefaultLaunchHooks {
             shutdown: shutdown_tx,
             task,
         });
-        Ok(())
+        Ok(effective_port)
     }
 
     async fn launch_codex(

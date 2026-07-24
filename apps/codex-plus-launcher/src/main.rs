@@ -320,7 +320,7 @@ impl LaunchHooks for LauncherHooks {
         self.core.ensure_plugin_marketplace_config(settings).await
     }
 
-    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()> {
+    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<u16> {
         self.core.start_helper(helper_port).await
     }
 
