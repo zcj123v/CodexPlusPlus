@@ -4364,7 +4364,7 @@ fn default_helper_port() -> u16 {
 
 // 优先使用最近一次启动状态里记录的 effective helper 端口（fallback 后的实际端口），
 // 无状态或端口为 0 时回退到请求值。
-fn effective_helper_port(requested: u16) -> u16 {
+pub(crate) fn effective_helper_port(requested: u16) -> u16 {
     effective_helper_port_with_store(&StatusStore::default(), requested)
 }
 

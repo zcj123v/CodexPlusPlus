@@ -294,7 +294,9 @@ async fn apply_dream_skin_from_tray() -> anyhow::Result<()> {
     )?;
     codex_plus_core::dream_skin_runtime::apply_dream_skin_live(
         DREAM_SKIN_DEBUG_PORT,
-        codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+        commands::effective_helper_port(
+            codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+        ),
     )
     .await?;
     Ok(())

@@ -375,3 +375,15 @@ fn manager_update_install_keeps_visible_progress_bar() {
     assert!(app_tsx.contains("completedTitle={t(\"上次更新结果\")}"));
     assert!(app_tsx.contains("progress={updateInstallProgress}"));
 }
+
+#[test]
+fn tray_dream_skin_uses_effective_helper_port() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let lib_rs =
+        std::fs::read_to_string(manifest_dir.join("src/lib.rs")).expect("read manager lib.rs");
+
+    assert!(
+        lib_rs.contains("commands::effective_helper_port("),
+        "tray apply_dream_skin_from_tray must route through commands::effective_helper_port"
+    );
+}
