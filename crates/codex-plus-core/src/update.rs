@@ -95,16 +95,14 @@ pub fn release_from_github_payload(payload: &Value) -> anyhow::Result<Release> {
         .filter_map(|asset| {
             Some((
                 asset.get("name")?.as_str()?.to_string(),
-                asset.get("browser_download_url")?.as_str()?.to_string(),
+                first_non_empty_string(asset, &["browser_download_url", "url"])?.to_string(),
             ))
         })
         .collect::<Vec<_>>();
     let selected = select_update_asset(&assets);
     Ok(Release {
         version,
-        url: payload
-            .get("html_url")
-            .and_then(Value::as_str)
+        url: first_non_empty_string(payload, &["html_url", "url"])
             .unwrap_or_default()
             .to_string(),
         body: payload
@@ -138,21 +136,14 @@ pub fn release_from_latest_json_payload_for_platform(
         .flatten()
         .filter_map(|asset| {
             let name = asset.get("name")?.as_str()?.to_string();
-            let url = asset
-                .get("url")
-                .or_else(|| asset.get("browser_download_url"))?
-                .as_str()?
-                .to_string();
+            let url = first_non_empty_string(asset, &["url", "browser_download_url"])?.to_string();
             Some((name, url))
         })
         .collect::<Vec<_>>();
     let selected = select_update_asset_for_platform(&assets, platform);
     Ok(Release {
         version,
-        url: payload
-            .get("url")
-            .or_else(|| payload.get("html_url"))
-            .and_then(Value::as_str)
+        url: first_non_empty_string(payload, &["url", "html_url"])
             .unwrap_or_default()
             .to_string(),
         body: payload
@@ -165,6 +156,13 @@ pub fn release_from_latest_json_payload_for_platform(
         asset_name: selected.as_ref().map(|asset| asset.name.clone()),
         asset_url: selected.map(|asset| asset.browser_download_url),
     })
+}
+
+fn first_non_empty_string<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .filter_map(|key| value.get(key).and_then(Value::as_str))
+        .map(str::trim)
+        .find(|candidate| !candidate.is_empty())
 }
 
 pub fn select_update_asset(assets: &[(String, String)]) -> Option<ReleaseAsset> {
@@ -314,7 +312,7 @@ fn read_linux_package_family(path: &Path) -> LinuxPackageFamily {
 
 fn platform_asset_rank(name: &str, platform: UpdatePlatform) -> Option<u8> {
     // 0 = exact match (current OS + native arch)
-    // 1 = same OS, other arch (acceptable fallback, e.g. x86_64 on arm64 or vice versa)
+    // 1 = same OS and compatible arch, non-native package family
     // None = wrong platform
     if platform.os == UpdateOs::Macos {
         if !is_macos_installer_asset(name) {
@@ -339,31 +337,29 @@ fn platform_asset_rank(name: &str, platform: UpdatePlatform) -> Option<u8> {
     } else {
         return None;
     };
+    if !is_native_arch_asset(name, platform.arch) {
+        return None;
+    }
     let family_rank = match platform.linux_family {
         LinuxPackageFamily::Unknown => 1,
         family if family == package_family => 0,
         _ => 1,
     };
-    let arch_rank = if is_native_arch_asset(name, platform.arch) {
-        0
-    } else {
-        2
-    };
-    Some(family_rank + arch_rank)
+    Some(family_rank)
 }
 
 fn is_native_arch_asset(name: &str, arch: UpdateArch) -> bool {
-    let native_tokens: &[&str] = match arch {
-        UpdateArch::X86_64 => &["x64", "x86_64", "amd64"],
-        UpdateArch::Aarch64 => &["arm64", "aarch64"],
-        _ => return true, // unknown arch — accept anything
-    };
     let all_tokens = ["x64", "x86_64", "amd64", "arm64", "aarch64"];
     let mentioned = |token: &str| {
         name.contains(&format!("-{token}."))
             || name.contains(&format!("_{token}."))
             || name.contains(&format!("-{token}-"))
             || name.contains(&format!("_{token}-"))
+    };
+    let native_tokens: &[&str] = match arch {
+        UpdateArch::X86_64 => &["x64", "x86_64", "amd64"],
+        UpdateArch::Aarch64 => &["arm64", "aarch64"],
+        UpdateArch::Other => return !all_tokens.iter().any(|token| mentioned(token)),
     };
     native_tokens.iter().any(|token| mentioned(token))
         || !all_tokens.iter().any(|token| mentioned(token))

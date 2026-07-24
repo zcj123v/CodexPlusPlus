@@ -15,6 +15,14 @@ fn linux(family: LinuxPackageFamily) -> UpdatePlatform {
     }
 }
 
+fn linux_with_arch(family: LinuxPackageFamily, arch: UpdateArch) -> UpdatePlatform {
+    UpdatePlatform {
+        os: UpdateOs::Linux,
+        arch,
+        linux_family: family,
+    }
+}
+
 #[test]
 fn classifies_linux_package_families() {
     assert_eq!(
@@ -257,4 +265,106 @@ fn download_asset_to_writes_bytes() {
 
     assert_eq!(path, dir.path().join("pkg.zip"));
     assert_eq!(std::fs::read(path).unwrap(), b"abcdef");
+}
+
+#[test]
+fn linux_aarch64_and_other_arches_reject_explicit_x86_assets() {
+    let release_url = "https://example.test/releases/v1.2.42";
+    let payload = json!({
+        "version": "v1.2.42",
+        "url": release_url,
+        "assets": [
+            {"name": "codexplusplus-1.2.42-1-x64.pkg.tar.zst", "url": "https://example.test/x64.pkg.tar.zst"},
+            {"name": "codexplusplus-1.2.42-1-x86_64.pkg.tar.zst", "url": "https://example.test/x86_64.pkg.tar.zst"},
+            {"name": "codexplusplus_1.2.42_amd64.deb", "url": "https://example.test/amd64.deb"}
+        ]
+    });
+
+    for family in [
+        LinuxPackageFamily::Arch,
+        LinuxPackageFamily::Debian,
+        LinuxPackageFamily::Unknown,
+    ] {
+        for arch in [UpdateArch::Aarch64, UpdateArch::Other] {
+            let release = release_from_latest_json_payload_for_platform(
+                &payload,
+                linux_with_arch(family, arch),
+            )
+            .unwrap();
+            assert_eq!(release.url, release_url);
+            assert_eq!(release.asset_name, None, "family={family:?}, arch={arch:?}");
+            assert_eq!(release.asset_url, None, "family={family:?}, arch={arch:?}");
+        }
+    }
+}
+
+#[test]
+fn linux_aarch64_selects_arm64_asset() {
+    let assets = vec![
+        (
+            "codexplusplus_1.2.42_amd64.deb".to_string(),
+            "https://example.test/amd64.deb".to_string(),
+        ),
+        (
+            "codexplusplus_1.2.42_arm64.deb".to_string(),
+            "https://example.test/arm64.deb".to_string(),
+        ),
+    ];
+    let selected = select_update_asset_for_platform(
+        &assets,
+        linux_with_arch(LinuxPackageFamily::Debian, UpdateArch::Aarch64),
+    )
+    .unwrap();
+    assert_eq!(selected.name, "codexplusplus_1.2.42_arm64.deb");
+}
+
+#[test]
+fn latest_json_url_candidates_fall_back_after_type_and_blank_validation() {
+    for invalid in [json!(null), json!(42), json!("   ")] {
+        let release = release_from_latest_json_payload_for_platform(
+            &json!({
+                "version": "v1.2.42",
+                "url": invalid,
+                "html_url": "  https://example.test/releases/v1.2.42  ",
+                "assets": [{
+                    "name": "codexplusplus_1.2.42_amd64.deb",
+                    "url": invalid,
+                    "browser_download_url": "  https://example.test/amd64.deb  "
+                }]
+            }),
+            linux(LinuxPackageFamily::Debian),
+        )
+        .unwrap();
+
+        assert_eq!(release.url, "https://example.test/releases/v1.2.42");
+        assert_eq!(
+            release.asset_url.as_deref(),
+            Some("https://example.test/amd64.deb")
+        );
+    }
+}
+
+#[test]
+fn github_url_candidates_fall_back_after_type_and_blank_validation() {
+    for invalid in [json!(null), json!(42), json!("   ")] {
+        let release = release_from_github_payload(&json!({
+            "tag_name": "v1.2.42",
+            "html_url": invalid,
+            "url": "  https://api.example.test/releases/42  ",
+            "assets": [{
+                "name": "codexplusplus-1.2.42.deb",
+                "browser_download_url": invalid,
+                "url": "  https://api.example.test/assets/42  "
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(release.url, "https://api.example.test/releases/42");
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                release.asset_url.as_deref(),
+                Some("https://api.example.test/assets/42")
+            );
+        }
+    }
 }
