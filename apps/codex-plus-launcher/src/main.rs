@@ -73,11 +73,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn launcher_main(
-    args: Vec<String>,
-    helper_only: bool,
-    options: LaunchOptions,
-) -> Result<()> {
+async fn launcher_main(args: Vec<String>, helper_only: bool, options: LaunchOptions) -> Result<()> {
     if helper_only {
         let hooks = LauncherHooks::default();
         hooks.start_helper(options.helper_port).await?;
@@ -159,8 +155,8 @@ fn acquire_single_instance_guard_with_retry(
     }
 }
 
-fn try_acquire_single_instance_guard(
-) -> std::io::Result<codex_plus_core::ports::ResilientGuardAcquisition> {
+fn try_acquire_single_instance_guard()
+-> std::io::Result<codex_plus_core::ports::ResilientGuardAcquisition> {
     codex_plus_core::ports::acquire_resilient_guard_with_port_fallback(
         codex_plus_core::ports::launcher_guard_port(),
     )
@@ -207,7 +203,17 @@ fn should_recover_stale_launcher(debug_port: u16) -> bool {
 }
 
 async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<()> {
-    let hooks = LauncherHooks::default();
+    activate_existing_codex_app_with_hooks(options, LauncherHooks::default()).await
+}
+
+async fn activate_existing_codex_app_with_hooks<H>(
+    options: &LaunchOptions,
+    hooks: H,
+) -> anyhow::Result<()>
+where
+    H: LaunchHooks + Clone,
+{
+    let mut helper_port = hooks.select_helper_port(options.helper_port);
     let settings = hooks.load_settings().await?;
     let app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings)?;
     let has_pending_recovery = hooks.has_pending_remote_control_session_recoveries();
@@ -233,6 +239,11 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
             &settings.codex_extra_args,
         )
         .await;
+    if settings.enhancements_enabled {
+        // 接住 effective port（Windows helper 可能从 excluded port range 回退），
+        // 后续注入与 watchdog 必须使用 effective，否则桥接会连错端口。
+        helper_port = hooks.start_helper(helper_port).await?;
+    }
     let process_ids = codex_plus_core::watcher::find_codex_processes();
     #[cfg(windows)]
     let activated = process_ids
@@ -1088,6 +1099,8 @@ fn default_user_scripts_config_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_plus_core::launcher::CodexLaunch;
+    use codex_plus_core::settings::BackendSettings;
 
     #[test]
     fn parse_launch_options_accepts_manager_forwarded_ports_and_app_path() {
@@ -1261,6 +1274,149 @@ mod tests {
             codex_plus_core::routes::handle_bridge_request(ctx, "/backend/status", json!({})).await;
 
         assert_ne!(result["message"], "Unknown bridge path");
+    }
+
+    #[test]
+    fn activate_existing_codex_app_propagates_effective_helper_port() {
+        let source = include_str!("main.rs");
+
+        // start_helper 返回的 effective port 必须传递给注入与 watchdog。
+        assert!(source.contains("helper_port = hooks.start_helper(helper_port).await?"));
+        assert!(source.contains("ensure_injection(options.debug_port, helper_port, &app_dir)"));
+        assert!(source.contains("start_bridge_watchdog(options.debug_port, helper_port)"));
+    }
+
+    #[tokio::test]
+    async fn activate_existing_codex_app_uses_effective_helper_port_for_injection() {
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        // 模拟 Windows helper 回退：requested 57321，effective 57328。
+        let hooks = ActivateFakeHooks::new(events.clone()).with_helper_port_fallback(7);
+        let options = LaunchOptions {
+            app_dir: Some(PathBuf::from("Codex.app")),
+            debug_port: 9229,
+            helper_port: 57321,
+            ..LaunchOptions::default()
+        };
+
+        activate_existing_codex_app_with_hooks(&options, hooks)
+            .await
+            .unwrap();
+
+        let events = events.lock().unwrap().clone();
+        assert!(events.contains(&"start-helper:57321".to_string()));
+        assert!(events.contains(&"inject:9229:57328".to_string()));
+        assert!(events.contains(&"bridge-watchdog:9229:57328".to_string()));
+        assert!(!events.contains(&"inject:9229:57321".to_string()));
+        assert!(!events.contains(&"bridge-watchdog:9229:57321".to_string()));
+    }
+
+    #[derive(Clone)]
+    struct ActivateFakeHooks {
+        events: Arc<Mutex<Vec<String>>>,
+        helper_port_fallback_offset: u16,
+    }
+
+    impl ActivateFakeHooks {
+        fn new(events: Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                events,
+                helper_port_fallback_offset: 0,
+            }
+        }
+
+        fn with_helper_port_fallback(mut self, offset: u16) -> Self {
+            self.helper_port_fallback_offset = offset;
+            self
+        }
+
+        fn event(&self, event: impl Into<String>) {
+            self.events.lock().unwrap().push(event.into());
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl LaunchHooks for ActivateFakeHooks {
+        fn resolve_app_dir(
+            &self,
+            app_dir: Option<&Path>,
+            _settings: &BackendSettings,
+        ) -> anyhow::Result<PathBuf> {
+            app_dir
+                .map(Path::to_path_buf)
+                .ok_or_else(|| anyhow::anyhow!("missing app dir"))
+        }
+
+        fn select_debug_port(&self, requested: u16) -> u16 {
+            requested
+        }
+
+        fn select_helper_port(&self, requested: u16) -> u16 {
+            requested
+        }
+
+        async fn load_settings(&self) -> anyhow::Result<BackendSettings> {
+            Ok(BackendSettings::default())
+        }
+
+        async fn run_provider_sync(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn start_helper(&self, helper_port: u16) -> anyhow::Result<u16> {
+            self.event(format!("start-helper:{helper_port}"));
+            Ok(helper_port + self.helper_port_fallback_offset)
+        }
+
+        async fn launch_codex(
+            &self,
+            _app_dir: &Path,
+            debug_port: u16,
+            _settings: &BackendSettings,
+            _extra_args: &[String],
+        ) -> anyhow::Result<CodexLaunch> {
+            self.event(format!("launch:{debug_port}"));
+            Ok(CodexLaunch::Process {
+                command: vec!["codex".to_string()],
+                wait_strategy: codex_plus_core::launcher::ProcessWaitStrategy::TrackedChild,
+                macos_cleanup_policy: None,
+            })
+        }
+
+        async fn inject(&self, debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
+            self.event(format!("inject:{debug_port}:{helper_port}"));
+            Ok(())
+        }
+
+        async fn ensure_injection(
+            &self,
+            debug_port: u16,
+            helper_port: u16,
+            _app_dir: &Path,
+        ) -> bool {
+            self.event(format!("inject:{debug_port}:{helper_port}"));
+            true
+        }
+
+        async fn start_bridge_watchdog(
+            &self,
+            debug_port: u16,
+            helper_port: u16,
+        ) -> anyhow::Result<()> {
+            self.event(format!("bridge-watchdog:{debug_port}:{helper_port}"));
+            Ok(())
+        }
+
+        async fn write_status(&self, status: &str) {
+            self.event(format!("status:{status}"));
+        }
+
+        async fn wait_for_codex_exit(&self, _launch: &CodexLaunch) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn shutdown_helper(&self, _helper_port: u16) {}
+
+        async fn terminate_codex(&self, _launch: &CodexLaunch) {}
     }
 }
 
