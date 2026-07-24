@@ -2154,12 +2154,12 @@ pub fn delete_user_script(key: String) -> CommandResult<SettingsPayload> {
 }
 
 #[tauri::command]
-pub fn open_external_url(url: String) -> CommandResult<Value> {
+pub async fn open_external_url(url: String) -> CommandResult<Value> {
     let trimmed = match validate_external_http_url(&url) {
         Ok(url) => url,
         Err(error) => return failed(&error.to_string(), json!({})),
     };
-    match open_url(trimmed) {
+    match open_url(trimmed).await {
         Ok(()) => ok("已在系统浏览器打开链接。", json!({ "url": trimmed })),
         Err(error) => failed(&format!("打开链接失败：{error}"), json!({ "url": trimmed })),
     }
@@ -2453,7 +2453,7 @@ pub async fn perform_update(
                 );
             }
         };
-        return match open_url(update_url) {
+        return match open_url(update_url).await {
             Ok(()) => ok(
                 "已在系统浏览器打开更新下载链接。",
                 json!({
@@ -3943,6 +3943,62 @@ fn verify_url_opener_status(opener: &str, status: std::process::ExitStatus) -> a
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum BoundedWait<T> {
+    Completed(T),
+    TimedOut,
+}
+
+#[cfg(target_os = "linux")]
+async fn bounded_url_opener_wait<F, T>(timeout: std::time::Duration, wait: F) -> BoundedWait<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    match tokio::time::timeout(timeout, wait).await {
+        Ok(output) => BoundedWait::Completed(output),
+        Err(_) => BoundedWait::TimedOut,
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_url_opener(
+    opener: &str,
+    child: &mut tokio::process::Child,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    match bounded_url_opener_wait(timeout, child.wait()).await {
+        BoundedWait::Completed(status) => verify_url_opener_status(
+            opener,
+            status.map_err(|error| anyhow::anyhow!("等待 {opener} 失败：{error}"))?,
+        ),
+        BoundedWait::TimedOut => {
+            let kill_result = child.kill().await;
+            let wait_result = child.wait().await;
+            match (kill_result, wait_result) {
+                (Ok(()), Ok(_)) => anyhow::bail!(
+                    "等待 {opener} 打开链接超过 {} 秒，已终止并回收进程",
+                    timeout.as_secs()
+                ),
+                (kill_result, wait_result) => anyhow::bail!(
+                    "等待 {opener} 打开链接超过 {} 秒；终止结果：{}；回收结果：{}",
+                    timeout.as_secs(),
+                    cleanup_result(&kill_result),
+                    cleanup_result(&wait_result)
+                ),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_result<T>(result: &std::io::Result<T>) -> String {
+    match result {
+        Ok(_) => "成功".to_string(),
+        Err(error) => format!("失败（{error}）"),
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn linux_update_url(release: &codex_plus_core::update::Release) -> anyhow::Result<&str> {
     let url = release
         .asset_url
@@ -3952,7 +4008,7 @@ fn linux_update_url(release: &codex_plus_core::update::Release) -> anyhow::Resul
     validate_external_http_url(url)
 }
 
-fn open_url(url: &str) -> anyhow::Result<()> {
+async fn open_url(url: &str) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
         codex_plus_core::windows_open_url(url)
@@ -3967,11 +4023,13 @@ fn open_url(url: &str) -> anyhow::Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        let status = std::process::Command::new("xdg-open")
+        const URL_OPENER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+        let mut child = tokio::process::Command::new("xdg-open")
             .arg(url)
-            .status()
+            .spawn()
             .map_err(|error| anyhow::anyhow!("启动 xdg-open 失败：{error}"))?;
-        verify_url_opener_status("xdg-open", status)
+        wait_for_url_opener("xdg-open", &mut child, URL_OPENER_TIMEOUT).await
     }
 }
 
@@ -5320,9 +5378,9 @@ model_reasoning_effort = "high"
         assert_eq!(payload.ads[0]["id"], json!("ad-1"));
     }
 
-    #[test]
-    fn open_external_url_rejects_non_http_urls() {
-        let result = open_external_url("file:///C:/Windows/win.ini".to_string());
+    #[tokio::test]
+    async fn open_external_url_rejects_non_http_urls() {
+        let result = open_external_url("file:///C:/Windows/win.ini".to_string()).await;
 
         assert_eq!(result.status, "failed");
         assert!(result.message.contains("只允许打开 http 或 https 链接"));
@@ -5373,6 +5431,28 @@ model_reasoning_effort = "high"
 
         let status = std::process::ExitStatus::from_raw(0);
         assert!(verify_url_opener_status("xdg-open", status).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_opener_bounded_wait_returns_completed_value() {
+        let result =
+            bounded_url_opener_wait(std::time::Duration::from_millis(50), std::future::ready(17))
+                .await;
+
+        assert_eq!(result, BoundedWait::Completed(17));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_opener_bounded_wait_times_out_without_starting_browser() {
+        let result = bounded_url_opener_wait(
+            std::time::Duration::from_millis(1),
+            std::future::pending::<()>(),
+        )
+        .await;
+
+        assert_eq!(result, BoundedWait::TimedOut);
     }
 
     #[cfg(target_os = "linux")]
