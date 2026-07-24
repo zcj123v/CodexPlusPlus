@@ -4820,11 +4820,29 @@ function AboutScreen({
             <Metric label={t("资源")} value={update?.assetName ?? "-"} />
             <Metric label={t("进度")} value={`${update?.progress ?? 0}%`} />
           </div>
-          <Textarea className="log-view" readOnly value={update?.releaseSummary || update?.message || t("尚未检查 GitHub Release；更新会下载并启动安装包。")} />
-          <TaskProgressBox completedTitle={t("上次更新结果")} progress={updateInstallProgress} title={t("安装包更新进度")} />
+          <Textarea
+            className="log-view"
+            readOnly
+            value={
+              update?.releaseSummary
+              || update?.message
+              || (isLinuxPlatform
+                ? t("尚未检查 GitHub Release；更新会打开安全的下载安装页面。")
+                : t("尚未检查 GitHub Release；更新会下载并启动安装包。"))
+            }
+          />
+          <TaskProgressBox
+            completedTitle={t("上次更新结果")}
+            progress={updateInstallProgress}
+            title={isLinuxPlatform ? t("下载页面打开进度") : t("安装包更新进度")}
+          />
           <Toolbar>
             <Button onClick={() => void actions.checkUpdate()}>{t("检查更新")}</Button>
-            <Button disabled={updateInstallProgress.active} variant="secondary" onClick={() => void actions.performUpdate()}>
+            <Button
+              disabled={updateInstallProgress.active || !update?.updateAvailable || !update?.latestVersion || !(update.assetUrl || update.releaseUrl)}
+              variant="secondary"
+              onClick={() => void actions.performUpdate()}
+            >
               {updateInstallProgress.active
                 ? isLinuxPlatform
                   ? t("正在打开下载页面…")

@@ -382,6 +382,7 @@ export const EN_PLAIN: Record<string, string> = {
   "安装入口": "Install entrypoints",
   "安装包更新失败，请查看错误提示后重试。": "Installer update failed. Check the error message and retry.",
   "安装包更新进度": "Installer update progress",
+  "下载页面打开进度": "Download page opening progress",
   "安装维护": "Install & maintenance",
   "完整增强": "Full enhancement",
   "官方": "Official",
@@ -397,6 +398,8 @@ export const EN_PLAIN: Record<string, string> = {
   "尚未加载推荐内容": "Recommendations not loaded yet",
   "尚未检查 Codex 应用路径。": "Codex app path not checked yet.",
   "尚未检查 GitHub Release；更新会下载并启动安装包。": "GitHub Release not checked yet; updating downloads and launches the installer.",
+  "尚未检查 GitHub Release；更新会打开安全的下载安装页面。":
+    "GitHub Release not checked yet; updating opens a safe download and installation page.",
   "尚未生成诊断报告。": "No diagnostic report generated yet.",
   "尚未运行安装包更新。": "Installer update has not run yet.",
   "尚未运行历史会话修复。": "Historical session repair hasn't run yet.",

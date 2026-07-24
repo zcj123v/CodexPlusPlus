@@ -31,4 +31,18 @@ describe("update and ecosystem links", () => {
     assert.match(appSource, /打开 Release 页面/);
     assert.match(appSource, /正在打开下载页面…/);
   });
+
+  it("disables unavailable updates and explains the platform-specific flow", async () => {
+    const appSource = await readSource("./App.tsx");
+
+    assert.match(
+      appSource,
+      /disabled=\{updateInstallProgress\.active \|\| !update\?\.updateAvailable \|\| !update\?\.latestVersion \|\| !\(update\.assetUrl \|\| update\.releaseUrl\)\}/,
+    );
+    assert.match(
+      appSource,
+      /isLinuxPlatform\s*\?\s*t\("尚未检查 GitHub Release；更新会打开安全的下载安装页面。"\)\s*:\s*t\("尚未检查 GitHub Release；更新会下载并启动安装包。"\)/,
+    );
+    assert.match(appSource, /isLinuxPlatform\s*\?\s*t\("下载页面打开进度"\)\s*:\s*t\("安装包更新进度"\)/);
+  });
 });
