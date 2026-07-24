@@ -239,6 +239,235 @@ fn normalize_lock_error(error: std::io::Error) -> std::io::Error {
     }
 }
 
+/// Windows 下确定性候选端口数量：requested 及其后 7 个端口。
+const PORT_FALLBACK_CANDIDATE_SPAN: u16 = 8;
+/// `find_rebindable_loopback_port` 验证 ephemeral 端口可重绑的最大尝试次数。
+const REBINDABLE_PORT_MAX_ATTEMPTS: usize = 3;
+
+/// 判断错误是否为 Windows excluded port range 导致的拒绝绑定
+/// （`WSAEACCES` / `os error 10013`，跨平台归一化为 `PermissionDenied`）。
+pub fn is_excluded_port_error(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(10013) || error.kind() == std::io::ErrorKind::PermissionDenied
+}
+
+/// guard 获取结果：除 guard 本体外携带 requested/effective 端口与尝试次数，供日志记录。
+#[derive(Debug)]
+pub struct ResilientGuardAcquisition {
+    pub guard: LoopbackPortGuard,
+    pub requested_port: u16,
+    pub effective_port: u16,
+    pub attempts: usize,
+}
+
+/// 获取单实例 guard；Windows 下 requested 端口不可绑定（如落入 excluded port
+/// range）时按确定性候选回退，最后尝试 ephemeral 端口。非 Windows 保持单次获取。
+pub fn acquire_resilient_guard_with_port_fallback(
+    requested_port: u16,
+) -> std::io::Result<ResilientGuardAcquisition> {
+    let state_dir = crate::paths::default_app_state_dir();
+    acquire_resilient_guard_with_port_fallback_with(
+        requested_port,
+        cfg!(windows),
+        &state_dir,
+        acquire_resilient_loopback_port_guard_at,
+        || acquire_loopback_port_guard(0),
+    )
+}
+
+fn acquire_resilient_guard_with_port_fallback_with(
+    requested_port: u16,
+    is_windows: bool,
+    state_dir: &Path,
+    acquire: impl Fn(u16, &Path) -> std::io::Result<LoopbackPortGuard>,
+    bind_ephemeral: impl Fn() -> std::io::Result<TcpListener>,
+) -> std::io::Result<ResilientGuardAcquisition> {
+    let candidate_count = if is_windows {
+        PORT_FALLBACK_CANDIDATE_SPAN as usize
+    } else {
+        1
+    };
+    let mut attempts = 0usize;
+    let mut last_error: Option<std::io::Error> = None;
+
+    for offset in 0..candidate_count {
+        let port = requested_port.wrapping_add(offset as u16);
+        attempts += 1;
+        match acquire(port, state_dir) {
+            Ok(guard) => {
+                return Ok(ResilientGuardAcquisition {
+                    guard,
+                    requested_port,
+                    effective_port: port,
+                    attempts,
+                });
+            }
+            // AddrInUse/WouldBlock 表示真实实例或锁冲突，保留单实例语义立即上抛。
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AddrInUse
+                    || error.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                return Err(error);
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    if is_windows {
+        // 先拿到 ephemeral 端口并释放，再对同一端口走完整 acquire，保持锁文件语义。
+        let ephemeral = bind_ephemeral()?;
+        let port = ephemeral.local_addr()?.port();
+        drop(ephemeral);
+        attempts += 1;
+        match acquire(port, state_dir) {
+            Ok(guard) => {
+                return Ok(ResilientGuardAcquisition {
+                    guard,
+                    requested_port,
+                    effective_port: port,
+                    attempts,
+                });
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AddrInUse
+                    || error.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                return Err(error);
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(exhausted_port_fallback_error(
+        requested_port,
+        attempts,
+        last_error,
+    ))
+}
+
+fn exhausted_port_fallback_error(
+    requested_port: u16,
+    attempts: usize,
+    last_error: Option<std::io::Error>,
+) -> std::io::Error {
+    let (kind, source) = match last_error {
+        Some(error) => (error.kind(), error.to_string()),
+        None => (
+            std::io::ErrorKind::PermissionDenied,
+            "no candidate was attempted".to_string(),
+        ),
+    };
+    std::io::Error::new(
+        kind,
+        format!(
+            "failed to bind any loopback candidate near requested port {requested_port} \
+             after {attempts} attempt(s): {source}; os error 10013 usually means the port \
+             sits in the Windows excluded port range (often caused by Docker/WSL/WinNAT)"
+        ),
+    )
+}
+
+/// helper bind 结果：listener 之外携带 requested/effective 端口与尝试次数，
+/// effective port 需沿 LaunchStatus 写回给 Manager。
+#[derive(Debug)]
+pub struct HelperBindResult {
+    pub listener: TcpListener,
+    pub requested_port: u16,
+    pub effective_port: u16,
+    pub attempts: usize,
+}
+
+/// 绑定 helper 端口；仅 Windows 且 bind_host 为 `127.0.0.1` 时启用候选回退，
+/// 其他情况保持原有单次 bind 行为。
+pub fn bind_helper_loopback_with_fallback(
+    requested_port: u16,
+    bind_host: &str,
+) -> std::io::Result<HelperBindResult> {
+    bind_helper_loopback_with_fallback_with(
+        requested_port,
+        cfg!(windows),
+        bind_host,
+        |host, port| TcpListener::bind((host, port)),
+    )
+}
+
+fn bind_helper_loopback_with_fallback_with(
+    requested_port: u16,
+    is_windows: bool,
+    bind_host: &str,
+    bind: impl Fn(&str, u16) -> std::io::Result<TcpListener>,
+) -> std::io::Result<HelperBindResult> {
+    let use_fallback = is_windows && bind_host == "127.0.0.1";
+    let candidate_count = if use_fallback {
+        PORT_FALLBACK_CANDIDATE_SPAN as usize
+    } else {
+        1
+    };
+    let mut attempts = 0usize;
+    let mut last_error: Option<std::io::Error> = None;
+
+    for offset in 0..candidate_count {
+        let port = requested_port.wrapping_add(offset as u16);
+        attempts += 1;
+        match bind(bind_host, port) {
+            Ok(listener) => {
+                return Ok(HelperBindResult {
+                    listener,
+                    requested_port,
+                    effective_port: port,
+                    attempts,
+                });
+            }
+            Err(error) => {
+                // 非回退场景保持原行为：任何错误直接上抛。
+                if !use_fallback {
+                    return Err(error);
+                }
+                // helper 无单实例语义：AddrInUse、excluded 及其他错误都继续候选，耗尽再上抛。
+                last_error = Some(error);
+            }
+        }
+    }
+
+    if use_fallback {
+        // 确定性候选耗尽后，尝试一个经验证可重绑的 ephemeral 端口。
+        if let Some(port) = find_rebindable_loopback_port() {
+            attempts += 1;
+            match bind(bind_host, port) {
+                Ok(listener) => {
+                    return Ok(HelperBindResult {
+                        listener,
+                        requested_port,
+                        effective_port: port,
+                        attempts,
+                    });
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+    }
+
+    Err(exhausted_port_fallback_error(
+        requested_port,
+        attempts,
+        last_error,
+    ))
+}
+
+/// 通过 bind 0 获取 ephemeral 端口并确认释放后可再次绑定，最多尝试
+/// `REBINDABLE_PORT_MAX_ATTEMPTS` 次；避免直接使用 Windows 可能从 excluded
+/// port range 分配的端口。
+pub fn find_rebindable_loopback_port() -> Option<u16> {
+    for _ in 0..REBINDABLE_PORT_MAX_ATTEMPTS {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).ok()?;
+        let port = listener.local_addr().ok()?.port();
+        drop(listener);
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return Some(port);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,6 +549,64 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(second.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn excluded_guard_port_falls_back_to_next_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let calls = Mutex::new(0usize);
+        let acquisition = acquire_resilient_guard_with_port_fallback_with(
+            57745,
+            true,
+            temp.path(),
+            |port, state_dir| {
+                *calls.lock().unwrap() += 1;
+                if port == 57745 {
+                    Err(std::io::Error::from_raw_os_error(10013))
+                } else {
+                    acquire_resilient_loopback_port_guard_at(port, state_dir)
+                }
+            },
+            || acquire_loopback_port_guard(0),
+        )
+        .unwrap();
+        assert_eq!(acquisition.requested_port, 57745);
+        assert_eq!(acquisition.effective_port, 57746);
+        assert_eq!(acquisition.attempts, 2);
+    }
+
+    #[test]
+    fn addr_in_use_guard_port_does_not_try_later_candidates() {
+        let calls = Mutex::new(0usize);
+        let error = acquire_resilient_guard_with_port_fallback_with(
+            57745,
+            true,
+            Path::new("/unused"),
+            |_, _| {
+                *calls.lock().unwrap() += 1;
+                Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, "in use"))
+            },
+            || panic!("must not bind ephemeral"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn excluded_helper_port_falls_back_to_next_candidate() {
+        let result =
+            bind_helper_loopback_with_fallback_with(57321, true, "127.0.0.1", |_, port| {
+                if port == 57321 {
+                    Err(std::io::Error::from_raw_os_error(10013))
+                } else {
+                    TcpListener::bind(("127.0.0.1", 0))
+                }
+            })
+            .unwrap();
+        assert_eq!(result.requested_port, 57321);
+        assert!(result.effective_port != 0);
+        assert_eq!(result.attempts, 2);
     }
 
     #[test]
