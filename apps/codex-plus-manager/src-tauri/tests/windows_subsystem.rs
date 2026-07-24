@@ -32,6 +32,16 @@ fn manager_uses_single_instance_guard_before_starting_tauri() {
 }
 
 #[test]
+fn manager_guard_uses_unified_port_fallback() {
+    let lib_rs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+        .expect("read manager lib.rs");
+
+    assert!(lib_rs.contains("manager.guard_port_fallback"));
+    assert!(lib_rs.contains("manager.guard_fallback_failed"));
+    assert!(lib_rs.contains("manager.already_running"));
+}
+
+#[test]
 fn manager_repeated_launch_activates_existing_window() {
     let lib_rs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
         .expect("read manager lib.rs");
