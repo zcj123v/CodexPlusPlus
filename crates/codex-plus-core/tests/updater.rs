@@ -1,8 +1,97 @@
 use codex_plus_core::update::{
-    Release, download_asset_to, is_newer_version, parse_version_tag, release_from_github_payload,
-    release_from_latest_json_payload, safe_asset_name, select_update_asset,
+    DEFAULT_LATEST_JSON_URL, DEFAULT_UPDATE_REPOSITORY, LinuxPackageFamily, Release, UpdateArch,
+    UpdateOs, UpdatePlatform, classify_linux_os_release, download_asset_to, is_newer_version,
+    parse_version_tag, release_from_github_payload, release_from_latest_json_payload,
+    release_from_latest_json_payload_for_platform, safe_asset_name, select_update_asset,
+    select_update_asset_for_platform,
 };
 use serde_json::json;
+
+fn linux(family: LinuxPackageFamily) -> UpdatePlatform {
+    UpdatePlatform {
+        os: UpdateOs::Linux,
+        arch: UpdateArch::X86_64,
+        linux_family: family,
+    }
+}
+
+#[test]
+fn classifies_linux_package_families() {
+    assert_eq!(
+        classify_linux_os_release("ID=cachyos\nID_LIKE=arch\n"),
+        LinuxPackageFamily::Arch
+    );
+    assert_eq!(
+        classify_linux_os_release("ID=linuxmint\nID_LIKE=\"ubuntu debian\"\n"),
+        LinuxPackageFamily::Debian
+    );
+    assert_eq!(
+        classify_linux_os_release("NAME=Other\n"),
+        LinuxPackageFamily::Unknown
+    );
+}
+
+#[test]
+fn linux_families_choose_native_non_debug_packages() {
+    let assets = [
+        "codexplusplus-debug-1.2.42-1-x86_64.pkg.tar.zst",
+        "codexplusplus-1.2.42-1-x86_64.pkg.tar.zst",
+        "codexplusplus_1.2.42_amd64.deb",
+        "CodexPlusPlus-1.2.42-macos-x64.dmg",
+    ]
+    .into_iter()
+    .map(|name| (name.to_string(), format!("https://example.test/{name}")))
+    .collect::<Vec<_>>();
+    assert_eq!(
+        select_update_asset_for_platform(&assets, linux(LinuxPackageFamily::Arch))
+            .unwrap()
+            .name,
+        "codexplusplus-1.2.42-1-x86_64.pkg.tar.zst"
+    );
+    assert_eq!(
+        select_update_asset_for_platform(&assets, linux(LinuxPackageFamily::Debian))
+            .unwrap()
+            .name,
+        "codexplusplus_1.2.42_amd64.deb"
+    );
+}
+
+#[test]
+fn source_only_manifest_preserves_release_url_without_selecting_asset() {
+    let release_url = "https://github.com/zcj123v/CodexPlusPlus/releases/tag/v1.2.42-linux.1";
+    let release = release_from_latest_json_payload_for_platform(
+        &json!({
+            "version": "v1.2.42-linux.1",
+            "url": release_url,
+            "assets": [
+                {"name": "source.zip", "url": "https://example.test/source.zip"}
+            ]
+        }),
+        linux(LinuxPackageFamily::Arch),
+    )
+    .unwrap();
+
+    assert_eq!(release.url, release_url);
+    assert_eq!(release.asset_name, None);
+    assert_eq!(release.asset_url, None);
+}
+#[test]
+fn update_source_points_to_fork() {
+    assert_eq!(DEFAULT_UPDATE_REPOSITORY, "zcj123v/CodexPlusPlus");
+    assert_eq!(
+        DEFAULT_LATEST_JSON_URL,
+        "https://github.com/zcj123v/CodexPlusPlus/releases/latest/download/latest.json"
+    );
+}
+
+#[test]
+fn fork_linux_revisions_sort_after_base_version() {
+    assert!(is_newer_version("1.2.42-linux.1", "1.2.41").unwrap());
+    assert!(is_newer_version("1.2.42-linux.1", "1.2.42").unwrap());
+    assert!(is_newer_version("1.2.42-linux.2", "1.2.42-linux.1").unwrap());
+    assert!(!is_newer_version("1.2.42-linux.1", "1.2.42-linux.1").unwrap());
+    assert!(!is_newer_version("v1.2.42", "1.2.42").unwrap());
+}
 
 #[test]
 fn parse_version_tag_accepts_prefix_and_suffix() {
