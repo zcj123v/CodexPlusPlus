@@ -3902,10 +3902,43 @@ fn ads_payload(payload: Value) -> AdsPayload {
 
 fn validate_external_http_url(url: &str) -> anyhow::Result<&str> {
     let trimmed = url.trim();
-    if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
-        Ok(trimmed)
+    let authority = if let Some(rest) = trimmed.strip_prefix("https://") {
+        rest.split(['/', '?', '#']).next().unwrap_or_default()
+    } else if let Some(rest) = trimmed.strip_prefix("http://") {
+        rest.split(['/', '?', '#']).next().unwrap_or_default()
     } else {
         anyhow::bail!("只允许打开 http 或 https 链接。")
+    };
+
+    if trimmed.chars().any(|character| {
+        character.is_ascii_control() || character.is_whitespace() || character == '\\'
+    }) {
+        anyhow::bail!("更新链接包含不安全的空白或控制字符。")
+    }
+
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let has_host = if let Some(ipv6) = host.strip_prefix('[') {
+        ipv6.split_once(']').is_some_and(|(address, suffix)| {
+            !address.is_empty() && (suffix.is_empty() || suffix.starts_with(':'))
+        })
+    } else {
+        host.split_once(':').map_or(host, |(host, _)| host).len() > 0
+    };
+    if !has_host {
+        anyhow::bail!("http 或 https 链接必须包含有效主机名。")
+    }
+
+    Ok(trimmed)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_url_opener_status(opener: &str, status: std::process::ExitStatus) -> anyhow::Result<()> {
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("{opener} 打开链接失败，退出状态：{status}")
     }
 }
 
@@ -3934,11 +3967,11 @@ fn open_url(url: &str) -> anyhow::Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        std::process::Command::new("xdg-open")
+        let status = std::process::Command::new("xdg-open")
             .arg(url)
-            .spawn()
-            .map(|_| ())
-            .map_err(|error| anyhow::anyhow!("启动系统浏览器失败：{error}"))
+            .status()
+            .map_err(|error| anyhow::anyhow!("启动 xdg-open 失败：{error}"))?;
+        verify_url_opener_status("xdg-open", status)
     }
 }
 
@@ -5303,6 +5336,43 @@ model_reasoning_effort = "high"
         );
         assert!(validate_external_http_url("file:///etc/passwd").is_err());
         assert!(validate_external_http_url("javascript:alert(1)").is_err());
+    }
+
+    #[test]
+    fn external_url_validation_rejects_missing_hosts_and_unsafe_characters() {
+        for url in [
+            "https://",
+            "https:///pkg",
+            "https://example.test/pkg with-space",
+            "https://example.test/pkg\nnext",
+            "https://example.test/pkg\targ",
+            "HTTP://example.test/pkg",
+        ] {
+            assert!(
+                validate_external_http_url(url).is_err(),
+                "expected URL to be rejected: {url:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_opener_status_rejects_non_zero_exit() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let status = std::process::ExitStatus::from_raw(7 << 8);
+        let error = verify_url_opener_status("xdg-open", status).unwrap_err();
+        assert!(error.to_string().contains("xdg-open"));
+        assert!(error.to_string().contains("7"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_opener_status_accepts_success() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let status = std::process::ExitStatus::from_raw(0);
+        assert!(verify_url_opener_status("xdg-open", status).is_ok());
     }
 
     #[cfg(target_os = "linux")]
