@@ -177,7 +177,7 @@ pub trait LaunchHooks: Send + Sync {
     ) -> anyhow::Result<()> {
         Ok(())
     }
-    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()>;
+    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<u16>;
     async fn launch_codex(
         &self,
         app_dir: &Path,
@@ -249,6 +249,8 @@ pub struct DefaultLaunchHooks {
     helper: Mutex<Option<HelperRuntime>>,
     bridge_watchdog: Mutex<Option<BridgeWatchdogRuntime>>,
     bridge_reinjector: Mutex<Option<BridgeReinjector>>,
+    // load_settings 缓存，供 start_helper 判断 protocol proxy 边界用。
+    settings: Mutex<Option<BackendSettings>>,
 }
 
 struct HelperRuntime {
@@ -276,21 +278,21 @@ fn error_is_address_in_use(error: &anyhow::Error) -> bool {
 }
 
 /// 端口被占用时按 `interval_ms` 重试启动 helper，直到成功或超过 `timeout_ms`。
-async fn start_helper_waiting_for_busy_port<F, Fut>(
+async fn start_helper_waiting_for_busy_port<F, Fut, T>(
     mut start: F,
     timeout_ms: u64,
     interval_ms: u64,
-) -> anyhow::Result<()>
+) -> anyhow::Result<T>
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output = anyhow::Result<()>>,
+    Fut: Future<Output = anyhow::Result<T>>,
 {
     let mut waited_ms = 0;
     let mut attempts = 0;
     loop {
         attempts += 1;
         let error = match start().await {
-            Ok(()) => {
+            Ok(value) => {
                 if attempts > 1 {
                     let _ = crate::diagnostic_log::append_diagnostic_log(
                         "helper.bind_recovered_after_busy_port",
@@ -300,7 +302,7 @@ where
                         }),
                     );
                 }
-                return Ok(());
+                return Ok(value);
             }
             Err(error) => error,
         };
@@ -390,13 +392,15 @@ where
             helper_port = crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT;
         }
         if settings.enhancements_enabled || protocol_proxy_enabled {
-            // 只有被固定成协议代理端口时才需要等：普通 helper 端口上面已经挑过空闲的了。
+// 只有被固定成协议代理端口时才需要等：普通 helper 端口上面已经挑过空闲的了。
             let bind_retry_timeout_ms = if protocol_proxy_enabled {
                 HELPER_BIND_RETRY_TIMEOUT_MS
             } else {
                 0
             };
-            start_helper_waiting_for_busy_port(
+            // start_helper 返回 effective port（Windows 上 helper 可能从
+            // excluded port range 回退），后续注入/状态/关停都用 effective。
+            helper_port = start_helper_waiting_for_busy_port(
                 || hooks.start_helper(helper_port),
                 bind_retry_timeout_ms,
                 HELPER_BIND_RETRY_INTERVAL_MS,
@@ -629,7 +633,9 @@ impl LaunchHooks for DefaultLaunchHooks {
     }
 
     async fn load_settings(&self) -> anyhow::Result<BackendSettings> {
-        SettingsStore::default().load()
+        let settings = SettingsStore::default().load()?;
+        *self.settings.lock().await = Some(settings.clone());
+        Ok(settings)
     }
 
     fn cleanup_unsupported_config(&self) -> anyhow::Result<()> {
@@ -739,19 +745,44 @@ impl LaunchHooks for DefaultLaunchHooks {
         Ok(())
     }
 
-    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()> {
+    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<u16> {
         let bind_host = helper_bind_host();
-        let listener = tokio::net::TcpListener::bind((bind_host.as_str(), helper_port))
+        let protocol_proxy_enabled = self
+            .settings
+            .lock()
             .await
-            .with_context(|| {
-                format!("failed to bind helper runtime on {bind_host}:{helper_port}")
-            })?;
+            .as_ref()
+            .is_some_and(|settings| settings.active_relay_uses_protocol_proxy());
+        let (listener, effective_port, attempts) = if protocol_proxy_enabled {
+            // protocol proxy 的 relay config 已生成并固定指向该端口，禁止回退。
+            let listener = tokio::net::TcpListener::bind((bind_host.as_str(), helper_port))
+                .await
+                .with_context(|| {
+                    format!(
+                        "protocol proxy 需要 {helper_port}，请释放该端口或避开 Windows excluded port range"
+                    )
+                })?;
+            (listener, helper_port, 1usize)
+        } else {
+            let bind = crate::ports::bind_helper_loopback_with_fallback(helper_port, &bind_host)
+                .with_context(|| {
+                    format!("failed to bind helper runtime on {bind_host}:{helper_port}")
+                })?;
+            bind.listener
+                .set_nonblocking(true)
+                .context("failed to set helper listener non-blocking")?;
+            let listener = tokio::net::TcpListener::from_std(bind.listener)
+                .context("failed to convert helper listener to tokio")?;
+            (listener, bind.effective_port, bind.attempts)
+        };
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "helper.listening",
             serde_json::json!({
-                "helper_port": helper_port,
+                "helper_port": effective_port,
+                "requested_helper_port": helper_port,
+                "attempts": attempts,
                 "bind_host": bind_host,
-                "address": format!("http://{bind_host}:{helper_port}")
+                "address": format!("http://{bind_host}:{effective_port}")
             }),
         );
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
@@ -773,7 +804,7 @@ impl LaunchHooks for DefaultLaunchHooks {
             shutdown: shutdown_tx,
             task,
         });
-        Ok(())
+        Ok(effective_port)
     }
 
     async fn launch_codex(
