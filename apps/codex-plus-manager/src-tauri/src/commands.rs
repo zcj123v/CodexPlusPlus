@@ -925,7 +925,7 @@ pub async fn activate_dream_skin_theme(
         } else {
             match codex_plus_core::dream_skin_runtime::apply_dream_skin_live(
                 request.debug_port,
-                request.helper_port,
+                effective_helper_port(request.helper_port),
             )
             .await
             {
@@ -1000,7 +1000,7 @@ pub async fn apply_dream_skin(
     }
     match codex_plus_core::dream_skin_runtime::apply_dream_skin_live(
         request.debug_port,
-        request.helper_port,
+        effective_helper_port(request.helper_port),
     )
     .await
     {
@@ -4362,6 +4362,22 @@ fn default_helper_port() -> u16 {
     57321
 }
 
+// 优先使用最近一次启动状态里记录的 effective helper 端口（fallback 后的实际端口），
+// 无状态或端口为 0 时回退到请求值。
+fn effective_helper_port(requested: u16) -> u16 {
+    effective_helper_port_with_store(&StatusStore::default(), requested)
+}
+
+fn effective_helper_port_with_store(store: &StatusStore, requested: u16) -> u16 {
+    store
+        .load_latest()
+        .ok()
+        .flatten()
+        .and_then(|status| status.helper_port)
+        .filter(|port| *port != 0)
+        .unwrap_or(requested)
+}
+
 fn default_log_lines() -> usize {
     200
 }
@@ -5465,6 +5481,47 @@ model_reasoning_effort = "high"
         );
         release.asset_url = None;
         assert_eq!(linux_update_url(&release).unwrap(), release.url);
+    }
+
+    fn launch_status_with_helper_port(helper_port: Option<u16>) -> LaunchStatus {
+        LaunchStatus {
+            status: "running".to_string(),
+            message: "ready".to_string(),
+            started_at_ms: 1,
+            debug_port: None,
+            helper_port,
+            codex_app: None,
+        }
+    }
+
+    #[test]
+    fn effective_helper_port_prefers_latest_launch_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StatusStore::new(temp.path().join("latest-status.json"));
+        store
+            .save_latest(&launch_status_with_helper_port(Some(57399)))
+            .unwrap();
+
+        assert_eq!(effective_helper_port_with_store(&store, 57321), 57399);
+    }
+
+    #[test]
+    fn effective_helper_port_falls_back_to_requested() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = StatusStore::new(temp.path().join("latest-status.json"));
+        assert_eq!(effective_helper_port_with_store(&missing, 57321), 57321);
+
+        let none_store = StatusStore::new(temp.path().join("none-status.json"));
+        none_store
+            .save_latest(&launch_status_with_helper_port(None))
+            .unwrap();
+        assert_eq!(effective_helper_port_with_store(&none_store, 57321), 57321);
+
+        let zero_store = StatusStore::new(temp.path().join("zero-status.json"));
+        zero_store
+            .save_latest(&launch_status_with_helper_port(Some(0)))
+            .unwrap();
+        assert_eq!(effective_helper_port_with_store(&zero_store, 57321), 57321);
     }
 
     #[cfg(target_os = "linux")]
