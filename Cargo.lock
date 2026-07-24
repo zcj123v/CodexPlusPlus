@@ -419,10 +419,14 @@ dependencies = [
 [[package]]
 name = "codex-plus-core"
 <<<<<<< HEAD
+<<<<<<< HEAD
 version = "1.2.52"
 =======
 version = "1.2.42-linux.1"
 >>>>>>> 9efb02f (chore(release): align package version with v1.2.42-linux.1)
+=======
+version = "1.2.42-linux.2"
+>>>>>>> d97f8f9 (chore(release): bump fork version to v1.2.42-linux.2)
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -453,10 +457,14 @@ dependencies = [
 [[package]]
 name = "codex-plus-data"
 <<<<<<< HEAD
+<<<<<<< HEAD
 version = "1.2.52"
 =======
 version = "1.2.42-linux.1"
 >>>>>>> 9efb02f (chore(release): align package version with v1.2.42-linux.1)
+=======
+version = "1.2.42-linux.2"
+>>>>>>> d97f8f9 (chore(release): bump fork version to v1.2.42-linux.2)
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -474,10 +482,14 @@ dependencies = [
 [[package]]
 name = "codex-plus-launcher"
 <<<<<<< HEAD
+<<<<<<< HEAD
 version = "1.2.52"
 =======
 version = "1.2.42-linux.1"
 >>>>>>> 9efb02f (chore(release): align package version with v1.2.42-linux.1)
+=======
+version = "1.2.42-linux.2"
+>>>>>>> d97f8f9 (chore(release): bump fork version to v1.2.42-linux.2)
 dependencies = [
  "anyhow",
  "async-trait",
@@ -492,10 +504,14 @@ dependencies = [
 [[package]]
 name = "codex-plus-manager"
 <<<<<<< HEAD
+<<<<<<< HEAD
 version = "1.2.52"
 =======
 version = "1.2.42-linux.1"
 >>>>>>> 9efb02f (chore(release): align package version with v1.2.42-linux.1)
+=======
+version = "1.2.42-linux.2"
+>>>>>>> d97f8f9 (chore(release): bump fork version to v1.2.42-linux.2)
 dependencies = [
  "anyhow",
  "async-trait",
