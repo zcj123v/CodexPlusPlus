@@ -8,7 +8,11 @@ members = [
 ]
 
 [workspace.package]
+<<<<<<< HEAD
 version = "1.2.52"
+=======
+version = "1.2.42-linux.1"
+>>>>>>> 9efb02f (chore(release): align package version with v1.2.42-linux.1)
 edition = "2024"
 license = "AGPL-3.0-only"
 repository = "https://github.com/BigPizzaV3/CodexPlusPlus"

@@ -418,7 +418,11 @@ dependencies = [
 
 [[package]]
 name = "codex-plus-core"
+<<<<<<< HEAD
 version = "1.2.52"
+=======
+version = "1.2.42-linux.1"
+>>>>>>> 9efb02f (chore(release): align package version with v1.2.42-linux.1)
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -448,7 +452,11 @@ dependencies = [
 
 [[package]]
 name = "codex-plus-data"
+<<<<<<< HEAD
 version = "1.2.52"
+=======
+version = "1.2.42-linux.1"
+>>>>>>> 9efb02f (chore(release): align package version with v1.2.42-linux.1)
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -465,7 +473,11 @@ dependencies = [
 
 [[package]]
 name = "codex-plus-launcher"
+<<<<<<< HEAD
 version = "1.2.52"
+=======
+version = "1.2.42-linux.1"
+>>>>>>> 9efb02f (chore(release): align package version with v1.2.42-linux.1)
 dependencies = [
  "anyhow",
  "async-trait",
@@ -479,7 +491,11 @@ dependencies = [
 
 [[package]]
 name = "codex-plus-manager"
+<<<<<<< HEAD
 version = "1.2.52"
+=======
+version = "1.2.42-linux.1"
+>>>>>>> 9efb02f (chore(release): align package version with v1.2.42-linux.1)
 dependencies = [
  "anyhow",
  "async-trait",
