@@ -2155,10 +2155,10 @@ pub fn delete_user_script(key: String) -> CommandResult<SettingsPayload> {
 
 #[tauri::command]
 pub fn open_external_url(url: String) -> CommandResult<Value> {
-    let trimmed = url.trim();
-    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
-        return failed("只允许打开 http 或 https 链接。", json!({}));
-    }
+    let trimmed = match validate_external_http_url(&url) {
+        Ok(url) => url,
+        Err(error) => return failed(&error.to_string(), json!({})),
+    };
     match open_url(trimmed) {
         Ok(()) => ok("已在系统浏览器打开链接。", json!({ "url": trimmed })),
         Err(error) => failed(&format!("打开链接失败：{error}"), json!({ "url": trimmed })),
@@ -2397,6 +2397,7 @@ pub async fn check_update() -> CommandResult<Value> {
                     "currentVersion": update.current_version,
                     "latestVersion": update.latest_version,
                     "releaseSummary": update.release_summary,
+                    "releaseUrl": update.release_url,
                     "assetName": update.asset_name,
                     "assetUrl": update.asset_url,
                     "updateAvailable": update.update_available,
@@ -2410,6 +2411,7 @@ pub async fn check_update() -> CommandResult<Value> {
                 "currentVersion": codex_plus_core::version::VERSION,
                 "latestVersion": Value::Null,
                 "releaseSummary": "",
+                "releaseUrl": "",
                 "assetName": Value::Null,
                 "assetUrl": Value::Null,
                 "updateAvailable": false,
@@ -2428,32 +2430,84 @@ pub async fn perform_update(
             "请先检查更新并选择可下载的 Release asset。",
             json!({
                 "currentVersion": codex_plus_core::version::VERSION,
+                "releaseUrl": "",
                 "progress": 0
             }),
         );
     };
-    let download_dir = codex_plus_core::paths::default_app_state_dir().join("updates");
-    match codex_plus_core::update::perform_update(&release, &download_dir).await {
-        Ok(result) => ok(
-            "安装包已下载并启动，请按安装向导完成更新。",
-            json!({
-                "currentVersion": codex_plus_core::version::VERSION,
-                "latestVersion": result.release.version,
-                "releaseSummary": result.release.body,
-                "installedPath": result.installer_path.to_string_lossy(),
-                "launched": result.launched,
-                "progress": 100
-            }),
-        ),
-        Err(error) => failed(
-            &format!("安装更新失败：{error}"),
-            json!({
-                "currentVersion": codex_plus_core::version::VERSION,
-                "latestVersion": release.version,
-                "releaseSummary": release.body,
-                "progress": 0
-            }),
-        ),
+
+    #[cfg(target_os = "linux")]
+    {
+        let update_url = match linux_update_url(&release) {
+            Ok(url) => url,
+            Err(error) => {
+                return failed(
+                    &format!("打开更新链接失败：{error}"),
+                    json!({
+                        "currentVersion": codex_plus_core::version::VERSION,
+                        "latestVersion": release.version,
+                        "releaseSummary": release.body,
+                        "releaseUrl": release.url,
+                        "progress": 0
+                    }),
+                );
+            }
+        };
+        return match open_url(update_url) {
+            Ok(()) => ok(
+                "已在系统浏览器打开更新下载链接。",
+                json!({
+                    "currentVersion": codex_plus_core::version::VERSION,
+                    "latestVersion": release.version,
+                    "releaseSummary": release.body,
+                    "releaseUrl": release.url,
+                    "openedUrl": update_url,
+                    "launched": false,
+                    "progress": 100
+                }),
+            ),
+            Err(error) => failed(
+                &format!("打开更新链接失败：{error}"),
+                json!({
+                    "currentVersion": codex_plus_core::version::VERSION,
+                    "latestVersion": release.version,
+                    "releaseSummary": release.body,
+                    "releaseUrl": release.url,
+                    "openedUrl": update_url,
+                    "launched": false,
+                    "progress": 0
+                }),
+            ),
+        };
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let download_dir = codex_plus_core::paths::default_app_state_dir().join("updates");
+        match codex_plus_core::update::perform_update(&release, &download_dir).await {
+            Ok(result) => ok(
+                "安装包已下载并启动，请按安装向导完成更新。",
+                json!({
+                    "currentVersion": codex_plus_core::version::VERSION,
+                    "latestVersion": result.release.version,
+                    "releaseSummary": result.release.body,
+                    "releaseUrl": result.release.url,
+                    "installedPath": result.installer_path.to_string_lossy(),
+                    "launched": result.launched,
+                    "progress": 100
+                }),
+            ),
+            Err(error) => failed(
+                &format!("安装更新失败：{error}"),
+                json!({
+                    "currentVersion": codex_plus_core::version::VERSION,
+                    "latestVersion": release.version,
+                    "releaseSummary": release.body,
+                    "releaseUrl": release.url,
+                    "progress": 0
+                }),
+            ),
+        }
     }
 }
 
@@ -3846,14 +3900,41 @@ fn ads_payload(payload: Value) -> AdsPayload {
     }
 }
 
+fn validate_external_http_url(url: &str) -> anyhow::Result<&str> {
+    let trimmed = url.trim();
+    if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+        Ok(trimmed)
+    } else {
+        anyhow::bail!("只允许打开 http 或 https 链接。")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_update_url(release: &codex_plus_core::update::Release) -> anyhow::Result<&str> {
+    let url = release
+        .asset_url
+        .as_deref()
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or(&release.url);
+    validate_external_http_url(url)
+}
+
 fn open_url(url: &str) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
         codex_plus_core::windows_open_url(url)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| anyhow::anyhow!("启动系统浏览器失败：{error}"))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
             .arg(url)
             .spawn()
             .map(|_| ())
@@ -5212,5 +5293,38 @@ model_reasoning_effort = "high"
 
         assert_eq!(result.status, "failed");
         assert!(result.message.contains("只允许打开 http 或 https 链接"));
+    }
+
+    #[test]
+    fn external_url_validation_accepts_http_and_rejects_local_schemes() {
+        assert_eq!(
+            validate_external_http_url(" https://example.test/pkg ").unwrap(),
+            "https://example.test/pkg"
+        );
+        assert!(validate_external_http_url("file:///etc/passwd").is_err());
+        assert!(validate_external_http_url("javascript:alert(1)").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_update_url_prefers_asset_then_release() {
+        let mut release = test_release();
+        assert_eq!(
+            linux_update_url(&release).unwrap(),
+            release.asset_url.as_deref().unwrap()
+        );
+        release.asset_url = None;
+        assert_eq!(linux_update_url(&release).unwrap(), release.url);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_release() -> codex_plus_core::update::Release {
+        codex_plus_core::update::Release {
+            version: "v1.2.3-linux.1".to_string(),
+            url: "https://example.test/releases/v1.2.3-linux.1".to_string(),
+            body: "Release notes".to_string(),
+            asset_name: Some("codex-plus-manager.AppImage".to_string()),
+            asset_url: Some("https://example.test/codex-plus-manager.AppImage".to_string()),
+        }
     }
 }
