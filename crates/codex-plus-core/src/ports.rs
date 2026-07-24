@@ -308,7 +308,13 @@ fn acquire_resilient_guard_with_port_fallback_with(
             {
                 return Err(error);
             }
-            Err(error) => last_error = Some(error),
+            Err(error) => {
+                // 非 Windows 不做候选回退：单次 acquire 失败原样上抛，不包装耗尽错误。
+                if !is_windows {
+                    return Err(error);
+                }
+                last_error = Some(error);
+            }
         }
     }
 
@@ -607,6 +613,105 @@ mod tests {
         assert_eq!(result.requested_port, 57321);
         assert!(result.effective_port != 0);
         assert_eq!(result.attempts, 2);
+    }
+
+    #[test]
+    fn would_block_guard_port_does_not_try_later_candidates() {
+        let calls = Mutex::new(0usize);
+        let error = acquire_resilient_guard_with_port_fallback_with(
+            57745,
+            true,
+            Path::new("/unused"),
+            |_, _| {
+                *calls.lock().unwrap() += 1;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "lock held",
+                ))
+            },
+            || panic!("must not bind ephemeral"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn non_windows_guard_error_is_returned_unwrapped() {
+        let calls = Mutex::new(0usize);
+        let error = acquire_resilient_guard_with_port_fallback_with(
+            57745,
+            false,
+            Path::new("/unused"),
+            |_, _| {
+                *calls.lock().unwrap() += 1;
+                Err(std::io::Error::new(std::io::ErrorKind::Other, "boom"))
+            },
+            || panic!("must not bind ephemeral"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "boom");
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn permission_denied_guard_port_continues_to_next_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let calls = Mutex::new(0usize);
+        let acquisition = acquire_resilient_guard_with_port_fallback_with(
+            57745,
+            true,
+            temp.path(),
+            |port, state_dir| {
+                *calls.lock().unwrap() += 1;
+                if port == 57745 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "access denied",
+                    ))
+                } else {
+                    acquire_resilient_loopback_port_guard_at(port, state_dir)
+                }
+            },
+            || acquire_loopback_port_guard(0),
+        )
+        .unwrap();
+        assert_eq!(acquisition.requested_port, 57745);
+        assert_eq!(acquisition.effective_port, 57746);
+        assert_eq!(acquisition.attempts, 2);
+    }
+
+    #[test]
+    fn helper_bind_on_non_loopback_host_does_not_fall_back() {
+        let calls = Mutex::new(0usize);
+        let error = bind_helper_loopback_with_fallback_with(57321, true, "0.0.0.0", |_, port| {
+            *calls.lock().unwrap() += 1;
+            assert_eq!(port, 57321);
+            Err(std::io::Error::from_raw_os_error(10013))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(10013));
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn is_excluded_port_error_matches_wsa_eacces_and_permission_denied() {
+        assert!(is_excluded_port_error(&std::io::Error::from_raw_os_error(
+            10013
+        )));
+        assert!(is_excluded_port_error(&std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "access denied",
+        )));
+        assert!(!is_excluded_port_error(&std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "in use",
+        )));
+        assert!(!is_excluded_port_error(&std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "boom",
+        )));
     }
 
     #[test]
