@@ -18,6 +18,13 @@ if [[ -z "$version" ]]; then
   exit 1
 fi
 
+# Arch pkgver 不允许连字符；Cargo 的 1.2.42-linux.1 转为 1.2.42.linux.1。
+arch_version="${version//-/.}"
+if [[ ! "$arch_version" =~ ^[0-9][A-Za-z0-9._+]*$ ]]; then
+  echo "version cannot be converted to a valid Arch pkgver: $version" >&2
+  exit 1
+fi
+
 # 1. Build the frontend (the Tauri manager embeds it at compile time).
 if [[ ! -d "$repo_root/apps/codex-plus-manager/dist" ]]; then
   (cd "$repo_root/apps/codex-plus-manager" && npm install --package-lock=false && npm run vite:build)
@@ -35,7 +42,7 @@ cp "$pkg_dir/codex-plus-plus.desktop" "$stage/"
 cp "$pkg_dir/codex-plus-plus-manager.desktop" "$stage/"
 cp "$repo_root/apps/codex-plus-manager/src-tauri/icons/icon.png" "$stage/codexplusplus.png"
 cp "$pkg_dir/PKGBUILD" "$stage/"
-sed -i "s/^pkgver=.*/pkgver=$version/" "$stage/PKGBUILD"
+sed -i "s/^pkgver=.*/pkgver=$arch_version/" "$stage/PKGBUILD"
 
 # 4. Build the package.
 mkdir -p "$out_dir"
