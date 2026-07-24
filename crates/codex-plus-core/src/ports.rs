@@ -110,11 +110,10 @@ pub fn can_bind_loopback_port(port: u16) -> bool {
     TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
 
+/// 找一个经「释放后可再次绑定」验证的 loopback 端口，找不到时返回 0
+/// （保持原签名语义：调用方将 0 视为 bind ephemeral）。
 pub fn find_available_loopback_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .and_then(|listener| listener.local_addr())
-        .map(|address| address.port())
-        .unwrap_or(0)
+    find_rebindable_loopback_port().unwrap_or(0)
 }
 
 pub fn can_connect_loopback_port(port: u16) -> bool {
@@ -246,7 +245,9 @@ const REBINDABLE_PORT_MAX_ATTEMPTS: usize = 3;
 
 /// 判断错误是否为 Windows excluded port range 导致的拒绝绑定
 /// （`WSAEACCES` / `os error 10013`，跨平台归一化为 `PermissionDenied`）。
-pub fn is_excluded_port_error(error: &std::io::Error) -> bool {
+/// 目前仅用于测试断言候选回退覆盖的错误类型，不作为公开 API。
+#[cfg(test)]
+fn is_excluded_port_error(error: &std::io::Error) -> bool {
     error.raw_os_error() == Some(10013) || error.kind() == std::io::ErrorKind::PermissionDenied
 }
 
@@ -290,7 +291,11 @@ fn acquire_resilient_guard_with_port_fallback_with(
     let mut last_error: Option<std::io::Error> = None;
 
     for offset in 0..candidate_count {
-        let port = requested_port.wrapping_add(offset as u16);
+        // checked_add：requested+offset 溢出（回绕到 0）时结束确定性区间，
+        // port 0 永远不作为确定性候选，剩余回退交给 ephemeral 路径。
+        let Some(port) = requested_port.checked_add(offset as u16) else {
+            break;
+        };
         attempts += 1;
         match acquire(port, state_dir) {
             Ok(guard) => {
@@ -412,7 +417,11 @@ fn bind_helper_loopback_with_fallback_with(
     let mut last_error: Option<std::io::Error> = None;
 
     for offset in 0..candidate_count {
-        let port = requested_port.wrapping_add(offset as u16);
+        // checked_add：requested+offset 溢出（回绕到 0）时结束确定性区间，
+        // port 0 永远不作为确定性候选，剩余回退交给 ephemeral 路径。
+        let Some(port) = requested_port.checked_add(offset as u16) else {
+            break;
+        };
         attempts += 1;
         match bind(bind_host, port) {
             Ok(listener) => {
@@ -712,6 +721,75 @@ mod tests {
             std::io::ErrorKind::Other,
             "boom",
         )));
+    }
+
+    #[test]
+    fn find_rebindable_loopback_port_returns_verified_port() {
+        // 真实 loopback：bind 0 → drop → 同端口可再 bind。
+        let port = find_rebindable_loopback_port().expect("loopback should yield a port");
+        assert!(port > 0);
+        let listener = TcpListener::bind(("127.0.0.1", port))
+            .expect("rebindable port must bind again after release");
+        drop(listener);
+    }
+
+    #[test]
+    fn find_available_loopback_port_returns_verified_port() {
+        // find_available_loopback_port 复用 rebindable 验证逻辑，
+        // 返回的端口必须释放后可再绑定（或极端情况下为 0，本机不应出现）。
+        let port = find_available_loopback_port();
+        assert!(port > 0);
+        assert!(TcpListener::bind(("127.0.0.1", port)).is_ok());
+    }
+
+    #[test]
+    fn helper_candidates_near_u16_max_never_wrap_to_port_zero() {
+        let attempted = Mutex::new(Vec::new());
+        let result = bind_helper_loopback_with_fallback_with(65530, true, "127.0.0.1", |_, port| {
+            attempted.lock().unwrap().push(port);
+            if (65530..=65535).contains(&port) {
+                Err(std::io::Error::from_raw_os_error(10013))
+            } else {
+                // ephemeral 路径：find_rebindable_loopback_port 给出的已验证端口应可绑定
+                TcpListener::bind(("127.0.0.1", port))
+            }
+        })
+        .unwrap();
+        let attempted = attempted.lock().unwrap();
+        // 65530+6 溢出后停止确定性候选：仅 6 个确定性尝试，且从不出现 port 0
+        assert_eq!(attempted.len(), 7);
+        assert!(!attempted.contains(&0));
+        assert!(result.effective_port != 0);
+        assert_eq!(result.attempts, 7);
+    }
+
+    #[test]
+    fn guard_candidates_near_u16_max_never_wrap_to_port_zero() {
+        let temp = tempfile::tempdir().unwrap();
+        let attempted = Mutex::new(Vec::new());
+        let acquisition = acquire_resilient_guard_with_port_fallback_with(
+            65530,
+            true,
+            temp.path(),
+            |port, state_dir| {
+                attempted.lock().unwrap().push(port);
+                if (65530..=65535).contains(&port) {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "access denied",
+                    ))
+                } else {
+                    acquire_resilient_loopback_port_guard_at(port, state_dir)
+                }
+            },
+            || acquire_loopback_port_guard(0),
+        )
+        .unwrap();
+        let attempted = attempted.lock().unwrap();
+        assert_eq!(attempted.len(), 7);
+        assert!(!attempted.contains(&0));
+        assert!(acquisition.effective_port != 0);
+        assert_eq!(acquisition.attempts, 7);
     }
 
     #[test]
