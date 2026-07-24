@@ -104,6 +104,7 @@ import {
 import { getLanguage, t, tf, toggleLanguage } from "@/i18n";
 
 const isWindowsPlatform = /\bWindows\b/i.test(navigator.userAgent);
+const isLinuxPlatform = /\bLinux\b/i.test(navigator.userAgent);
 const dreamSkinWindowsPreviewUrl = new URL("../../../assets/inject/upstream/dream-skin/windows/dream-reference.jpg", import.meta.url).href;
 const dreamSkinMacPreviewUrl = new URL("../../../assets/inject/upstream/dream-skin/macos/portal-hero.png", import.meta.url).href;
 
@@ -625,6 +626,7 @@ type UpdateResult = CommandResult<{
   currentVersion: string;
   latestVersion?: string | null;
   releaseSummary?: string;
+  releaseUrl?: string;
   assetName?: string | null;
   assetUrl?: string | null;
   updateAvailable?: boolean;
@@ -1806,33 +1808,35 @@ export function App() {
   const performUpdate = async () => {
     if (updateInstallProgress.active) return;
     const release =
-      update?.latestVersion && update.assetName && update.assetUrl
+      update?.latestVersion && (update.assetUrl || update.releaseUrl)
         ? {
             version: update.latestVersion,
-            url: "",
+            url: update.releaseUrl ?? "",
             body: update.releaseSummary ?? "",
-            asset_name: update.assetName,
-            asset_url: update.assetUrl,
+            asset_name: update.assetName ?? null,
+            asset_url: update.assetUrl ?? null,
           }
         : null;
     setUpdateInstallProgress({
       active: true,
-      percent: 8,
-      message: t("正在准备安装包下载…"),
+      percent: isLinuxPlatform ? 0 : 8,
+      message: isLinuxPlatform ? t("正在打开下载页面…") : t("正在准备安装包下载…"),
     });
-    const progressTimer = window.setInterval(() => {
-      setUpdateInstallProgress((current) => {
-        if (!current.active) return current;
-        const nextPercent = Math.min(92, current.percent + 10);
-        const message =
-          nextPercent < 32
-            ? t("正在获取 GitHub Release 信息…")
-            : nextPercent < 72
-              ? t("正在下载安装包…")
-              : t("正在启动安装包…");
-        return { ...current, percent: nextPercent, message };
-      });
-    }, 500);
+    const progressTimer = isLinuxPlatform
+      ? null
+      : window.setInterval(() => {
+          setUpdateInstallProgress((current) => {
+            if (!current.active) return current;
+            const nextPercent = Math.min(92, current.percent + 10);
+            const message =
+              nextPercent < 32
+                ? t("正在获取 GitHub Release 信息…")
+                : nextPercent < 72
+                  ? t("正在下载安装包…")
+                  : t("正在启动安装包…");
+            return { ...current, percent: nextPercent, message };
+          });
+        }, 500);
     try {
       const result = await run(() => call<UpdateResult>("perform_update", { release }));
       if (result) {
@@ -1851,7 +1855,7 @@ export function App() {
         });
       }
     } finally {
-      window.clearInterval(progressTimer);
+      if (progressTimer !== null) window.clearInterval(progressTimer);
     }
   };
 
@@ -4821,7 +4825,15 @@ function AboutScreen({
           <Toolbar>
             <Button onClick={() => void actions.checkUpdate()}>{t("检查更新")}</Button>
             <Button disabled={updateInstallProgress.active} variant="secondary" onClick={() => void actions.performUpdate()}>
-              {updateInstallProgress.active ? t("正在下载安装包…") : t("下载并运行安装包")}
+              {updateInstallProgress.active
+                ? isLinuxPlatform
+                  ? t("正在打开下载页面…")
+                  : t("正在下载安装包…")
+                : isLinuxPlatform
+                  ? update?.assetUrl
+                    ? t("打开安装包下载")
+                    : t("打开 Release 页面")
+                  : t("下载并运行安装包")}
             </Button>
           </Toolbar>
         </CardContent>
