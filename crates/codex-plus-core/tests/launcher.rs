@@ -1565,7 +1565,7 @@ async fn launch_protocol_proxy_port_fallback_syncs_config_without_enhancements()
 }
 
 #[tokio::test]
-async fn launch_protocol_proxy_without_fallback_does_not_sync_config() {
+async fn launch_protocol_proxy_without_fallback_still_syncs_to_restore_default() {
     let temp = tempfile::tempdir().unwrap();
     let app_dir = temp.path().join("Codex.app");
     std::fs::create_dir_all(&app_dir).unwrap();
@@ -1582,7 +1582,9 @@ async fn launch_protocol_proxy_without_fallback_does_not_sync_config() {
         active_relay_id: "relay-anthropic".to_string(),
         ..BackendSettings::default()
     };
-    // 正常路径：57321 可绑定，无回退，不应产生配置 churn。
+    // 正常路径：57321 可绑定、无回退。上一次启动可能已把 config.toml 改写为
+    // 回退端口，因此 sync 仍必须以 effective（57321）被调用一次，由 sync
+    // 内部 no-op 保证无 churn。
     let hooks = FakeHooks::new(events.clone()).with_settings(settings);
 
     let handle = launch_and_inject_with_hooks(
@@ -1600,10 +1602,12 @@ async fn launch_protocol_proxy_without_fallback_does_not_sync_config() {
     assert_eq!(handle.helper_port, 57321);
     let before_stop = events.lock().unwrap().clone();
     assert!(before_stop.contains(&"start-helper:57321".to_string()));
-    assert!(
-        !before_stop
+    assert_eq!(
+        before_stop
             .iter()
-            .any(|event| event.starts_with("sync-proxy-port:"))
+            .filter(|event| *event == "sync-proxy-port:57321")
+            .count(),
+        1
     );
 
     handle.wait_for_codex_exit().await.unwrap();

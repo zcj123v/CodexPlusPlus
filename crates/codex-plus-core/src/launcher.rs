@@ -318,11 +318,10 @@ where
             helper_port = hooks.start_helper(helper_port).await?;
             helper_started = true;
         }
-        if protocol_proxy_enabled
-            && helper_port != crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT
-        {
-            // 协议代理端口回退后，relay config 仍指向默认端口，需在 Codex
-            // 启动读取 config.toml 之前把本地代理 base_url 同步为生效端口。
+        if protocol_proxy_enabled {
+            // 无论是否回退都同步：上一次启动可能已把 config.toml 改写为回退
+            // 端口，本次 57321 恢复可绑定时必须回写；端口一致时 sync 内部
+            // no-op，零写入零 churn。Codex 启动时才读 config.toml，时序安全。
             hooks.sync_protocol_proxy_port(helper_port).await?;
         }
 
@@ -683,16 +682,17 @@ impl LaunchHooks for DefaultLaunchHooks {
 
     async fn sync_protocol_proxy_port(&self, proxy_port: u16) -> anyhow::Result<bool> {
         let home = crate::relay_config::default_codex_home_dir();
-        let rewritten = crate::relay_config::sync_local_proxy_port_in_config(&home, proxy_port)?;
+        let outcome = crate::relay_config::sync_local_proxy_port_in_config(&home, proxy_port)?;
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "launcher.protocol_proxy_port_synced",
             serde_json::json!({
                 "requested_helper_port": crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
                 "effective_helper_port": proxy_port,
-                "rewritten": rewritten,
+                "rewritten": outcome.changed,
+                "reason": outcome.reason,
             }),
         );
-        Ok(rewritten)
+        Ok(outcome.changed)
     }
 
     async fn launch_codex(

@@ -489,12 +489,39 @@ fn sync_local_proxy_port_rewrites_fallback_port_in_config() {
     )
     .unwrap();
 
-    let rewritten = sync_local_proxy_port_in_config(temp.path(), 57974).unwrap();
+    let outcome = sync_local_proxy_port_in_config(temp.path(), 57974).unwrap();
 
-    assert!(rewritten);
+    assert!(outcome.changed);
+    assert_eq!(outcome.reason, "synced");
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
     assert!(config.contains(r#"base_url = "http://127.0.0.1:57974/v1""#));
     assert!(!config.contains("57321"));
+}
+
+#[test]
+fn sync_local_proxy_port_rewrites_inline_table_provider_in_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let original = "model_provider = \"custom\"\nmodel = \"k3\"\n\n[model_providers]\ncustom = { name = \"custom\", wire_api = \"responses\", base_url = \"http://127.0.0.1:57321/v1\" }\n";
+    std::fs::write(temp.path().join("config.toml"), original).unwrap();
+
+    let outcome = sync_local_proxy_port_in_config(temp.path(), 57974).unwrap();
+
+    assert!(outcome.changed);
+    assert_eq!(outcome.reason, "synced");
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(config.contains(r#"base_url = "http://127.0.0.1:57974/v1""#));
+    assert!(!config.contains("57321"));
+}
+
+#[test]
+fn sync_local_proxy_port_reports_no_config_when_config_missing() {
+    let temp = tempfile::tempdir().unwrap();
+
+    let outcome = sync_local_proxy_port_in_config(temp.path(), 57974).unwrap();
+
+    assert!(!outcome.changed);
+    assert_eq!(outcome.reason, "no_config");
+    assert!(!temp.path().join("config.toml").exists());
 }
 
 #[test]
@@ -506,9 +533,10 @@ fn sync_local_proxy_port_restores_default_port_in_config() {
     )
     .unwrap();
 
-    let rewritten = sync_local_proxy_port_in_config(temp.path(), 57321).unwrap();
+    let outcome = sync_local_proxy_port_in_config(temp.path(), 57321).unwrap();
 
-    assert!(rewritten);
+    assert!(outcome.changed);
+    assert_eq!(outcome.reason, "synced");
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
     assert!(config.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
     assert!(!config.contains("57974"));
@@ -520,9 +548,10 @@ fn sync_local_proxy_port_is_noop_when_port_already_matches() {
     let original = "model_provider = \"custom\"\nmodel = \"k3\"\n\n[model_providers.custom]\nname = \"custom\"\nwire_api = \"responses\"\nbase_url = \"http://127.0.0.1:57321/v1\"\n";
     std::fs::write(temp.path().join("config.toml"), original).unwrap();
 
-    let rewritten = sync_local_proxy_port_in_config(temp.path(), 57321).unwrap();
+    let outcome = sync_local_proxy_port_in_config(temp.path(), 57321).unwrap();
 
-    assert!(!rewritten);
+    assert!(!outcome.changed);
+    assert_eq!(outcome.reason, "already_current");
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
     assert_eq!(config, original);
 }
@@ -533,9 +562,10 @@ fn sync_local_proxy_port_leaves_remote_base_url_untouched() {
     let original = "model_provider = \"custom\"\nmodel = \"k3\"\n\n[model_providers.custom]\nname = \"custom\"\nwire_api = \"responses\"\nbase_url = \"https://api.example.com/v1\"\n";
     std::fs::write(temp.path().join("config.toml"), original).unwrap();
 
-    let rewritten = sync_local_proxy_port_in_config(temp.path(), 57974).unwrap();
+    let outcome = sync_local_proxy_port_in_config(temp.path(), 57974).unwrap();
 
-    assert!(!rewritten);
+    assert!(!outcome.changed);
+    assert_eq!(outcome.reason, "not_local_proxy_url");
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
     assert_eq!(config, original);
 }

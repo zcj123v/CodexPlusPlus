@@ -781,13 +781,36 @@ pub fn is_local_proxy_base_url(value: &str) -> bool {
     !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+/// 协议代理端口同步结果：changed 表示是否写入，reason 供诊断日志区分
+/// 健康 no-op（already_current）与静默跳过（no_config / not_local_proxy_url /
+/// no_base_url）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProxyPortSyncOutcome {
+    pub changed: bool,
+    pub reason: &'static str,
+}
+
+impl ProxyPortSyncOutcome {
+    fn skipped(reason: &'static str) -> Self {
+        Self {
+            changed: false,
+            reason,
+        }
+    }
+}
+
 /// 协议代理端口回退时，把 config.toml 中本地代理 base_url 同步为生效端口；
-/// 已一致或非本地代理 URL 时返回 false 且不写入。
-pub fn sync_local_proxy_port_in_config(home: &Path, proxy_port: u16) -> anyhow::Result<bool> {
+/// 已一致或非本地代理 URL 时不写入（changed=false），reason 标明原因。
+pub fn sync_local_proxy_port_in_config(
+    home: &Path,
+    proxy_port: u16,
+) -> anyhow::Result<ProxyPortSyncOutcome> {
     let config_path = home.join("config.toml");
     let existing = match std::fs::read_to_string(&config_path) {
         Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ProxyPortSyncOutcome::skipped("no_config"));
+        }
         Err(error) => return Err(error.into()),
     };
     let mut doc = parse_toml_document(&existing)?;
@@ -796,22 +819,28 @@ pub fn sync_local_proxy_port_in_config(home: &Path, proxy_port: u16) -> anyhow::
         .get("model_providers")
         .and_then(Item::as_table)
         .and_then(|providers| providers.get(&provider_id))
-        .and_then(Item::as_table)
+        .and_then(Item::as_table_like)
         .and_then(|provider| provider.get("base_url"))
         .and_then(Item::as_str)
         .map(str::trim)
         .map(ToString::to_string);
     let target = crate::protocol_proxy::local_responses_proxy_base_url(proxy_port);
     let Some(current) = current else {
-        return Ok(false);
+        return Ok(ProxyPortSyncOutcome::skipped("no_base_url"));
     };
-    if !is_local_proxy_base_url(&current) || current == target {
-        return Ok(false);
+    if !is_local_proxy_base_url(&current) {
+        return Ok(ProxyPortSyncOutcome::skipped("not_local_proxy_url"));
+    }
+    if current == target {
+        return Ok(ProxyPortSyncOutcome::skipped("already_current"));
     }
     ensure_provider_table(&mut doc, &provider_id)?["base_url"] = toml_edit::value(target);
     let updated = ensure_trailing_newline(doc.to_string());
     crate::settings::atomic_write(&config_path, updated.as_bytes())?;
-    Ok(true)
+    Ok(ProxyPortSyncOutcome {
+        changed: true,
+        reason: "synced",
+    })
 }
 
 pub fn extract_common_config_from_config(config_text: &str) -> anyhow::Result<String> {
