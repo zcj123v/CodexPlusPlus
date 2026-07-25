@@ -2425,6 +2425,19 @@ fn ensure_provider_table<'a>(
     provider_id: &str,
 ) -> anyhow::Result<&'a mut Table> {
     let providers = table_mut_or_insert(doc, "model_providers")?;
+    // inline table 的 provider 先迁移为标准 table，保留全部既有键
+    // （name/wire_api 等），避免后续修改丢失配置。
+    if let Some(inline) = providers
+        .get(provider_id)
+        .and_then(Item::as_inline_table)
+        .cloned()
+    {
+        let mut migrated = toml_edit::Table::new();
+        for (key, value) in inline.iter() {
+            migrated[key] = toml_edit::value(value.clone());
+        }
+        providers.insert(provider_id, Item::Table(migrated));
+    }
     if !providers.contains_key(provider_id)
         || providers
             .get(provider_id)

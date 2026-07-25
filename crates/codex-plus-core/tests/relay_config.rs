@@ -511,6 +511,9 @@ fn sync_local_proxy_port_rewrites_inline_table_provider_in_config() {
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
     assert!(config.contains(r#"base_url = "http://127.0.0.1:57974/v1""#));
     assert!(!config.contains("57321"));
+    // inline table 迁移为标准 table 后，既有键必须存活。
+    assert!(config.contains(r#"name = "custom""#));
+    assert!(config.contains(r#"wire_api = "responses""#));
 }
 
 #[test]
