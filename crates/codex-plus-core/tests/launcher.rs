@@ -1420,7 +1420,12 @@ async fn launch_lifecycle_uses_effective_helper_port_after_fallback() {
     // injection、LaunchHandle、LaunchStatus 都必须使用 effective port。
     assert_eq!(handle.helper_port, 57328);
     assert_eq!(
-        handle.status_store.load_latest().unwrap().unwrap().helper_port,
+        handle
+            .status_store
+            .load_latest()
+            .unwrap()
+            .unwrap()
+            .helper_port,
         Some(57328)
     );
     let before_stop = events.lock().unwrap().clone();
@@ -1435,15 +1440,173 @@ async fn launch_lifecycle_uses_effective_helper_port_after_fallback() {
 }
 
 #[test]
-fn launcher_protocol_proxy_disables_helper_port_fallback() {
+fn launcher_protocol_proxy_uses_helper_port_fallback_and_syncs_config() {
     let source =
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/launcher.rs")).unwrap();
 
-    // protocol proxy 的 relay config 已生成并固定指向 57321，绑定失败必须
-    // 直接报错而不允许回退到其他端口。
-    assert!(source.contains("active_relay_uses_protocol_proxy()"));
-    assert!(source.contains("protocol proxy 需要"));
+    // protocol proxy 端口被占用时同样走统一回退，回退后由
+    // sync_protocol_proxy_port 把 config.toml 的本地代理 base_url
+    // 改写为生效端口。
     assert!(source.contains("bind_helper_loopback_with_fallback"));
+    assert!(source.contains("sync_protocol_proxy_port"));
+    assert!(!source.contains("protocol proxy 需要"));
+}
+
+#[tokio::test]
+async fn launch_protocol_proxy_port_fallback_syncs_config_and_uses_effective_port() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    // anthropic/pureApi profile 使 active_relay_uses_protocol_proxy 为 true。
+    let mut profile = RelayProfile {
+        relay_mode: codex_plus_core::settings::RelayMode::PureApi,
+        ..RelayProfile::default()
+    };
+    profile.id = "relay-anthropic".to_string();
+    profile.protocol = RelayProtocol::Anthropic;
+    let settings = BackendSettings {
+        relay_profiles: vec![profile],
+        active_relay_id: "relay-anthropic".to_string(),
+        ..BackendSettings::default()
+    };
+    // 模拟 helper 回退：requested 57321，effective 57328。
+    let hooks = FakeHooks::new(events.clone())
+        .with_settings(settings)
+        .with_helper_port_fallback(7);
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 58000,
+            status_store,
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+
+    // inject、status、LaunchHandle 都用 effective port，config 同步以 effective
+    // 被调用且只调用一次。
+    assert_eq!(handle.helper_port, 57328);
+    assert_eq!(
+        handle
+            .status_store
+            .load_latest()
+            .unwrap()
+            .unwrap()
+            .helper_port,
+        Some(57328)
+    );
+    let before_stop = events.lock().unwrap().clone();
+    assert!(before_stop.contains(&"start-helper:57321".to_string()));
+    assert!(before_stop.contains(&"inject:9229:57328".to_string()));
+    assert_eq!(
+        before_stop
+            .iter()
+            .filter(|event| *event == "sync-proxy-port:57328")
+            .count(),
+        1
+    );
+
+    handle.wait_for_codex_exit().await.unwrap();
+
+    let after_stop = events.lock().unwrap().clone();
+    assert!(after_stop.contains(&"shutdown-helper:57328".to_string()));
+}
+
+#[tokio::test]
+async fn launch_protocol_proxy_port_fallback_syncs_config_without_enhancements() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut profile = RelayProfile {
+        relay_mode: codex_plus_core::settings::RelayMode::PureApi,
+        ..RelayProfile::default()
+    };
+    profile.id = "relay-anthropic".to_string();
+    profile.protocol = RelayProtocol::Anthropic;
+    let settings = BackendSettings {
+        enhancements_enabled: false,
+        relay_profiles: vec![profile],
+        active_relay_id: "relay-anthropic".to_string(),
+        ..BackendSettings::default()
+    };
+    let hooks = FakeHooks::new(events.clone())
+        .with_settings(settings)
+        .with_helper_port_fallback(7);
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 58000,
+            status_store,
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+
+    // enhancements 关闭时 proxy 分支同样启动 helper 并同步回退端口。
+    let before_stop = events.lock().unwrap().clone();
+    assert!(before_stop.contains(&"start-helper:57321".to_string()));
+    assert!(before_stop.contains(&"sync-proxy-port:57328".to_string()));
+    assert!(!before_stop.contains(&"inject:9229:57328".to_string()));
+
+    handle.wait_for_codex_exit().await.unwrap();
+
+    let after_stop = events.lock().unwrap().clone();
+    assert!(after_stop.contains(&"shutdown-helper:57328".to_string()));
+}
+
+#[tokio::test]
+async fn launch_protocol_proxy_without_fallback_does_not_sync_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut profile = RelayProfile {
+        relay_mode: codex_plus_core::settings::RelayMode::PureApi,
+        ..RelayProfile::default()
+    };
+    profile.id = "relay-anthropic".to_string();
+    profile.protocol = RelayProtocol::Anthropic;
+    let settings = BackendSettings {
+        relay_profiles: vec![profile],
+        active_relay_id: "relay-anthropic".to_string(),
+        ..BackendSettings::default()
+    };
+    // 正常路径：57321 可绑定，无回退，不应产生配置 churn。
+    let hooks = FakeHooks::new(events.clone()).with_settings(settings);
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 58000,
+            status_store,
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(handle.helper_port, 57321);
+    let before_stop = events.lock().unwrap().clone();
+    assert!(before_stop.contains(&"start-helper:57321".to_string()));
+    assert!(
+        !before_stop
+            .iter()
+            .any(|event| event.starts_with("sync-proxy-port:"))
+    );
+
+    handle.wait_for_codex_exit().await.unwrap();
 }
 
 #[tokio::test]
@@ -1757,6 +1920,11 @@ impl LaunchHooks for FakeHooks {
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<u16> {
         self.event(format!("start-helper:{helper_port}"));
         Ok(helper_port + self.helper_port_fallback_offset)
+    }
+
+    async fn sync_protocol_proxy_port(&self, proxy_port: u16) -> anyhow::Result<bool> {
+        self.event(format!("sync-proxy-port:{proxy_port}"));
+        Ok(true)
     }
 
     async fn launch_codex(

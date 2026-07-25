@@ -145,6 +145,10 @@ pub trait LaunchHooks: Send + Sync {
         Ok(())
     }
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<u16>;
+    /// 协议代理端口回退后，把 config.toml 中本地代理 base_url 同步为生效端口。
+    async fn sync_protocol_proxy_port(&self, _proxy_port: u16) -> anyhow::Result<bool> {
+        Ok(false)
+    }
     async fn launch_codex(
         &self,
         app_dir: &Path,
@@ -219,8 +223,6 @@ pub struct DefaultLaunchHooks {
     bridge_watchdog: Mutex<Option<BridgeWatchdogRuntime>>,
     computer_use_guard_watchdog: Mutex<Option<ComputerUseGuardWatchdogRuntime>>,
     computer_use_guard_artifacts: Mutex<Option<crate::computer_use_guard::GuardArtifacts>>,
-    // load_settings 缓存，供 start_helper 判断 protocol proxy 边界用。
-    settings: Mutex<Option<BackendSettings>>,
 }
 
 struct HelperRuntime {
@@ -315,6 +317,13 @@ where
             // excluded port range 回退），后续注入/状态/关停都用 effective。
             helper_port = hooks.start_helper(helper_port).await?;
             helper_started = true;
+        }
+        if protocol_proxy_enabled
+            && helper_port != crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT
+        {
+            // 协议代理端口回退后，relay config 仍指向默认端口，需在 Codex
+            // 启动读取 config.toml 之前把本地代理 base_url 同步为生效端口。
+            hooks.sync_protocol_proxy_port(helper_port).await?;
         }
 
         let launch = hooks
@@ -516,9 +525,7 @@ impl LaunchHooks for DefaultLaunchHooks {
     }
 
     async fn load_settings(&self) -> anyhow::Result<BackendSettings> {
-        let settings = SettingsStore::default().load()?;
-        *self.settings.lock().await = Some(settings.clone());
-        Ok(settings)
+        SettingsStore::default().load()
     }
 
     async fn run_provider_sync(&self) -> anyhow::Result<()> {
@@ -629,34 +636,19 @@ impl LaunchHooks for DefaultLaunchHooks {
 
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<u16> {
         let bind_host = helper_bind_host();
-        let protocol_proxy_enabled = self
-            .settings
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|settings| settings.active_relay_uses_protocol_proxy());
-        let (listener, effective_port, attempts) = if protocol_proxy_enabled {
-            // protocol proxy 的 relay config 已生成并固定指向该端口，禁止回退。
-            let listener = tokio::net::TcpListener::bind((bind_host.as_str(), helper_port))
-                .await
-                .with_context(|| {
-                    format!(
-                        "protocol proxy 需要 {helper_port}，请释放该端口或避开 Windows excluded port range"
-                    )
-                })?;
-            (listener, helper_port, 1usize)
-        } else {
-            let bind = crate::ports::bind_helper_loopback_with_fallback(helper_port, &bind_host)
-                .with_context(|| {
-                    format!("failed to bind helper runtime on {bind_host}:{helper_port}")
-                })?;
-            bind.listener
-                .set_nonblocking(true)
-                .context("failed to set helper listener non-blocking")?;
-            let listener = tokio::net::TcpListener::from_std(bind.listener)
-                .context("failed to convert helper listener to tokio")?;
-            (listener, bind.effective_port, bind.attempts)
-        };
+        // protocol proxy 与非 proxy 统一走回退绑定；proxy 回退后由
+        // sync_protocol_proxy_port 把 config.toml 的 base_url 同步为生效端口。
+        let bind = crate::ports::bind_helper_loopback_with_fallback(helper_port, &bind_host)
+            .with_context(|| {
+                format!("failed to bind helper runtime on {bind_host}:{helper_port}")
+            })?;
+        bind.listener
+            .set_nonblocking(true)
+            .context("failed to set helper listener non-blocking")?;
+        let listener = tokio::net::TcpListener::from_std(bind.listener)
+            .context("failed to convert helper listener to tokio")?;
+        let effective_port = bind.effective_port;
+        let attempts = bind.attempts;
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "helper.listening",
             serde_json::json!({
@@ -687,6 +679,20 @@ impl LaunchHooks for DefaultLaunchHooks {
             task,
         });
         Ok(effective_port)
+    }
+
+    async fn sync_protocol_proxy_port(&self, proxy_port: u16) -> anyhow::Result<bool> {
+        let home = crate::relay_config::default_codex_home_dir();
+        let rewritten = crate::relay_config::sync_local_proxy_port_in_config(&home, proxy_port)?;
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "launcher.protocol_proxy_port_synced",
+            serde_json::json!({
+                "requested_helper_port": crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+                "effective_helper_port": proxy_port,
+                "rewritten": rewritten,
+            }),
+        );
+        Ok(rewritten)
     }
 
     async fn launch_codex(

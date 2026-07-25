@@ -770,6 +770,50 @@ pub fn backfill_relay_profile_from_home_with_common(
     Ok(())
 }
 
+/// 判断是否为本地协议代理 base_url（任意端口的 127.0.0.1:/v1）。
+pub fn is_local_proxy_base_url(value: &str) -> bool {
+    let Some(rest) = value.trim().strip_prefix("http://127.0.0.1:") else {
+        return false;
+    };
+    let Some(port) = rest.strip_suffix("/v1") else {
+        return false;
+    };
+    !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// 协议代理端口回退时，把 config.toml 中本地代理 base_url 同步为生效端口；
+/// 已一致或非本地代理 URL 时返回 false 且不写入。
+pub fn sync_local_proxy_port_in_config(home: &Path, proxy_port: u16) -> anyhow::Result<bool> {
+    let config_path = home.join("config.toml");
+    let existing = match std::fs::read_to_string(&config_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let mut doc = parse_toml_document(&existing)?;
+    let provider_id = active_or_default_provider_id(&doc);
+    let current = doc
+        .get("model_providers")
+        .and_then(Item::as_table)
+        .and_then(|providers| providers.get(&provider_id))
+        .and_then(Item::as_table)
+        .and_then(|provider| provider.get("base_url"))
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .map(ToString::to_string);
+    let target = crate::protocol_proxy::local_responses_proxy_base_url(proxy_port);
+    let Some(current) = current else {
+        return Ok(false);
+    };
+    if !is_local_proxy_base_url(&current) || current == target {
+        return Ok(false);
+    }
+    ensure_provider_table(&mut doc, &provider_id)?["base_url"] = toml_edit::value(target);
+    let updated = ensure_trailing_newline(doc.to_string());
+    crate::settings::atomic_write(&config_path, updated.as_bytes())?;
+    Ok(true)
+}
+
 pub fn extract_common_config_from_config(config_text: &str) -> anyhow::Result<String> {
     let mut doc = parse_toml_document(config_text)?;
     for key in [

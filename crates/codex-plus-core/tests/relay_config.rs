@@ -11,7 +11,8 @@ use codex_plus_core::relay_config::{
     list_context_entries_from_common_config, normalize_relay_profile_for_storage,
     relay_config_status_from_home, sanitize_common_config_contents,
     set_codex_goals_feature_in_home, strip_common_config_from_config,
-    sync_live_config_context_entries, upsert_context_entry_in_common_config,
+    sync_live_config_context_entries, sync_local_proxy_port_in_config,
+    upsert_context_entry_in_common_config,
 };
 use codex_plus_core::settings::{RelayContextSelection, RelayMode, RelayProfile, RelayProtocol};
 
@@ -477,6 +478,66 @@ base_url = "http://127.0.0.1:57321/v1"
     let live = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
     assert!(!live.contains("codex_plus_chat_base_url"));
     assert!(live.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
+}
+
+#[test]
+fn sync_local_proxy_port_rewrites_fallback_port_in_config() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        "model_provider = \"custom\"\nmodel = \"k3\"\n\n[model_providers.custom]\nname = \"custom\"\nwire_api = \"responses\"\nbase_url = \"http://127.0.0.1:57321/v1\"\n",
+    )
+    .unwrap();
+
+    let rewritten = sync_local_proxy_port_in_config(temp.path(), 57974).unwrap();
+
+    assert!(rewritten);
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(config.contains(r#"base_url = "http://127.0.0.1:57974/v1""#));
+    assert!(!config.contains("57321"));
+}
+
+#[test]
+fn sync_local_proxy_port_restores_default_port_in_config() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        "model_provider = \"custom\"\nmodel = \"k3\"\n\n[model_providers.custom]\nname = \"custom\"\nwire_api = \"responses\"\nbase_url = \"http://127.0.0.1:57974/v1\"\n",
+    )
+    .unwrap();
+
+    let rewritten = sync_local_proxy_port_in_config(temp.path(), 57321).unwrap();
+
+    assert!(rewritten);
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(config.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
+    assert!(!config.contains("57974"));
+}
+
+#[test]
+fn sync_local_proxy_port_is_noop_when_port_already_matches() {
+    let temp = tempfile::tempdir().unwrap();
+    let original = "model_provider = \"custom\"\nmodel = \"k3\"\n\n[model_providers.custom]\nname = \"custom\"\nwire_api = \"responses\"\nbase_url = \"http://127.0.0.1:57321/v1\"\n";
+    std::fs::write(temp.path().join("config.toml"), original).unwrap();
+
+    let rewritten = sync_local_proxy_port_in_config(temp.path(), 57321).unwrap();
+
+    assert!(!rewritten);
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert_eq!(config, original);
+}
+
+#[test]
+fn sync_local_proxy_port_leaves_remote_base_url_untouched() {
+    let temp = tempfile::tempdir().unwrap();
+    let original = "model_provider = \"custom\"\nmodel = \"k3\"\n\n[model_providers.custom]\nname = \"custom\"\nwire_api = \"responses\"\nbase_url = \"https://api.example.com/v1\"\n";
+    std::fs::write(temp.path().join("config.toml"), original).unwrap();
+
+    let rewritten = sync_local_proxy_port_in_config(temp.path(), 57974).unwrap();
+
+    assert!(!rewritten);
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert_eq!(config, original);
 }
 
 #[test]

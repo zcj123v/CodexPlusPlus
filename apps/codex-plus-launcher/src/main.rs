@@ -100,8 +100,8 @@ fn acquire_single_instance_guard_with_retry(
     }
 }
 
-fn try_acquire_single_instance_guard(
-) -> std::io::Result<codex_plus_core::ports::ResilientGuardAcquisition> {
+fn try_acquire_single_instance_guard()
+-> std::io::Result<codex_plus_core::ports::ResilientGuardAcquisition> {
     codex_plus_core::ports::acquire_resilient_guard_with_port_fallback(
         codex_plus_core::ports::launcher_guard_port(),
     )
@@ -335,6 +335,10 @@ impl LaunchHooks for LauncherHooks {
 
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<u16> {
         self.core.start_helper(helper_port).await
+    }
+
+    async fn sync_protocol_proxy_port(&self, proxy_port: u16) -> anyhow::Result<bool> {
+        self.core.sync_protocol_proxy_port(proxy_port).await
     }
 
     async fn launch_codex(
@@ -957,8 +961,7 @@ mod tests {
             self.event(format!("launch:{debug_port}"));
             Ok(CodexLaunch::Process {
                 command: vec!["codex".to_string()],
-                wait_strategy:
-                    codex_plus_core::launcher::ProcessWaitStrategy::TrackedChild,
+                wait_strategy: codex_plus_core::launcher::ProcessWaitStrategy::TrackedChild,
                 macos_cleanup_policy: None,
             })
         }
