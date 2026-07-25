@@ -73,11 +73,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn launcher_main(
-    args: Vec<String>,
-    helper_only: bool,
-    options: LaunchOptions,
-) -> Result<()> {
+async fn launcher_main(args: Vec<String>, helper_only: bool, options: LaunchOptions) -> Result<()> {
     if helper_only {
         let hooks = LauncherHooks::default();
         hooks.start_helper(options.helper_port).await?;
@@ -159,8 +155,8 @@ fn acquire_single_instance_guard_with_retry(
     }
 }
 
-fn try_acquire_single_instance_guard(
-) -> std::io::Result<codex_plus_core::ports::ResilientGuardAcquisition> {
+fn try_acquire_single_instance_guard()
+-> std::io::Result<codex_plus_core::ports::ResilientGuardAcquisition> {
     codex_plus_core::ports::acquire_resilient_guard_with_port_fallback(
         codex_plus_core::ports::launcher_guard_port(),
     )
@@ -549,6 +545,10 @@ impl LaunchHooks for LauncherHooks {
 
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<u16> {
         self.core.start_helper(helper_port).await
+    }
+
+    async fn sync_protocol_proxy_port(&self, proxy_port: u16) -> anyhow::Result<bool> {
+        self.core.sync_protocol_proxy_port(proxy_port).await
     }
 
     async fn launch_codex(
@@ -1361,6 +1361,10 @@ mod tests {
             Ok(())
         }
 
+        async fn run_remote_control_session_recovery(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
         async fn start_helper(&self, helper_port: u16) -> anyhow::Result<u16> {
             self.event(format!("start-helper:{helper_port}"));
             Ok(helper_port + self.helper_port_fallback_offset)
@@ -1376,8 +1380,7 @@ mod tests {
             self.event(format!("launch:{debug_port}"));
             Ok(CodexLaunch::Process {
                 command: vec!["codex".to_string()],
-                wait_strategy:
-                    codex_plus_core::launcher::ProcessWaitStrategy::TrackedChild,
+                wait_strategy: codex_plus_core::launcher::ProcessWaitStrategy::TrackedChild,
                 macos_cleanup_policy: None,
             })
         }
@@ -1410,7 +1413,11 @@ mod tests {
             self.event(format!("status:{status}"));
         }
 
-        async fn wait_for_codex_exit(&self, _launch: &CodexLaunch) -> anyhow::Result<()> {
+        async fn wait_for_codex_exit(
+            &self,
+            _launch: &CodexLaunch,
+            _debug_port: u16,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
 
