@@ -207,11 +207,18 @@ fn acquire_resilient_loopback_port_guard_with(
         Err(error) if error.kind() == std::io::ErrorKind::AddrInUse && can_connect(port) => {
             Err(error)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+        Err(error)
+            if error.kind() == std::io::ErrorKind::AddrInUse || port_bind_forbidden(&error) =>
+        {
             Ok(LoopbackPortGuard::fallback_lock(file, path))
         }
         Err(error) => Err(error),
     }
+}
+
+fn port_bind_forbidden(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::PermissionDenied
+        || matches!(error.raw_os_error(), Some(10013))
 }
 
 fn acquire_lock_guard(port: u16, state_dir: &Path) -> std::io::Result<(File, PathBuf)> {
