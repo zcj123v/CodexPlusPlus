@@ -318,6 +318,61 @@ fn provider_sync_rewrites_all_session_meta_model_providers() {
 }
 
 #[test]
+fn provider_sync_removes_non_msg_message_ids_for_openai() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join(".codex");
+    fs::create_dir(&home).unwrap();
+    fs::write(home.join("config.toml"), "model_provider = \"openai\"\n").unwrap();
+    let rollout = home.join("sessions/2026/rollout-message-id.jsonl");
+    fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+    let session_meta = json!({
+        "type": "session_meta",
+        "payload": {
+            "id": "thread-1",
+            "model_provider": "custom",
+            "cwd": "C:/workspace"
+        }
+    });
+    let message = json!({
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "id": "chatcmpl-example_msg_0",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "reply"}]
+        }
+    });
+    let tool_call = json!({
+        "type": "response_item",
+        "payload": {
+            "type": "function_call",
+            "id": "fc_123",
+            "call_id": "call_123",
+            "name": "shell",
+            "arguments": "{}"
+        }
+    });
+    fs::write(
+        &rollout,
+        format!("{session_meta}\n{message}\n{tool_call}\n"),
+    )
+    .unwrap();
+    create_state_db(&home.join("state_5.sqlite"));
+
+    let result = run_provider_sync(Some(&home));
+
+    assert_eq!(result.status, ProviderSyncStatus::Synced);
+    let records = fs::read_to_string(&rollout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(records[1]["payload"].get("id").is_none());
+    assert_eq!(records[2]["payload"]["id"], "fc_123");
+    assert_eq!(records[2]["payload"]["call_id"], "call_123");
+}
+
+#[test]
 fn provider_sync_target_discovery_reads_all_session_meta_providers() {
     let tmp = tempdir().unwrap();
     let home = tmp.path().join(".codex");

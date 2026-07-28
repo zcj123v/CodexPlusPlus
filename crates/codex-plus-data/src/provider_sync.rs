@@ -773,6 +773,23 @@ fn rewrite_rollout_session_meta_providers(
                         next_line = serde_json::to_string(&record)?;
                         rewrite.rewrite_needed = true;
                     }
+                } else if target_provider == DEFAULT_PROVIDER
+                    && record.get("type").and_then(Value::as_str) == Some("response_item")
+                {
+                    let Some(payload) = record.get_mut("payload").and_then(Value::as_object_mut)
+                    else {
+                        rewrite.next_text.push_str(&next_line);
+                        rewrite.next_text.push_str(line_ending);
+                        continue;
+                    };
+                    let message_id = payload.get("id").and_then(Value::as_str);
+                    if payload.get("type").and_then(Value::as_str) == Some("message")
+                        && message_id.is_some_and(|id| !id.starts_with("msg"))
+                    {
+                        payload.remove("id");
+                        next_line = serde_json::to_string(&record)?;
+                        rewrite.rewrite_needed = true;
+                    }
                 }
             }
         }
