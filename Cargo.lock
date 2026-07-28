@@ -420,6 +420,7 @@ dependencies = [
 name = "codex-plus-core"
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
 version = "1.2.52"
 =======
 version = "1.2.42-linux.1"
@@ -427,6 +428,9 @@ version = "1.2.42-linux.1"
 =======
 version = "1.2.42-linux.2"
 >>>>>>> d97f8f9 (chore(release): bump fork version to v1.2.42-linux.2)
+=======
+version = "1.2.44-linux.1"
+>>>>>>> 2f0a4b1 (fix: harden Windows historical session repair)
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -458,6 +462,7 @@ dependencies = [
 name = "codex-plus-data"
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
 version = "1.2.52"
 =======
 version = "1.2.42-linux.1"
@@ -465,6 +470,9 @@ version = "1.2.42-linux.1"
 =======
 version = "1.2.42-linux.2"
 >>>>>>> d97f8f9 (chore(release): bump fork version to v1.2.42-linux.2)
+=======
+version = "1.2.44-linux.1"
+>>>>>>> 2f0a4b1 (fix: harden Windows historical session repair)
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -483,6 +491,7 @@ dependencies = [
 name = "codex-plus-launcher"
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
 version = "1.2.52"
 =======
 version = "1.2.42-linux.1"
@@ -490,6 +499,9 @@ version = "1.2.42-linux.1"
 =======
 version = "1.2.42-linux.2"
 >>>>>>> d97f8f9 (chore(release): bump fork version to v1.2.42-linux.2)
+=======
+version = "1.2.44-linux.1"
+>>>>>>> 2f0a4b1 (fix: harden Windows historical session repair)
 dependencies = [
  "anyhow",
  "async-trait",
@@ -505,6 +517,7 @@ dependencies = [
 name = "codex-plus-manager"
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
 version = "1.2.52"
 =======
 version = "1.2.42-linux.1"
@@ -512,6 +525,9 @@ version = "1.2.42-linux.1"
 =======
 version = "1.2.42-linux.2"
 >>>>>>> d97f8f9 (chore(release): bump fork version to v1.2.42-linux.2)
+=======
+version = "1.2.44-linux.1"
+>>>>>>> 2f0a4b1 (fix: harden Windows historical session repair)
 dependencies = [
  "anyhow",
  "async-trait",

@@ -1,4 +1,8 @@
+<<<<<<< HEAD
 use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value as SqlValue};
+=======
+use rusqlite::{Connection, DatabaseName, params_from_iter, types::Value as SqlValue};
+>>>>>>> 2f0a4b1 (fix: harden Windows historical session repair)
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -6,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_PROVIDER: &str = "openai";
 const SESSION_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
@@ -590,6 +594,7 @@ pub fn run_provider_sync_with_target(
                 );
             }
         };
+<<<<<<< HEAD
     if require_stopped_app {
         let running_processes =
             codex_plus_core::watcher::find_session_index_cleanup_blocking_processes();
@@ -604,6 +609,14 @@ pub fn run_provider_sync_with_target(
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
+=======
+    let enforce_process_guard = codex_home.is_none() || home == dirs_home().join(".codex");
+    if enforce_process_guard {
+        if let Some(message) = provider_sync_blocking_process_message() {
+            return result(
+                ProviderSyncStatus::Skipped,
+                message,
+>>>>>>> 2f0a4b1 (fix: harden Windows historical session repair)
                 &target_provider,
                 None,
                 0,
@@ -622,7 +635,9 @@ pub fn run_provider_sync_with_target(
             0,
         );
     }
+    let mut failure_backup_dir = None;
     let sync_result = (|| -> anyhow::Result<ProviderSyncResult> {
+<<<<<<< HEAD
         let sqlite_paths = provider_sync_db_paths(&home);
         let thread_kinds = sqlite_provider_sync_thread_kinds(&sqlite_paths)?;
         let repair_audit = match audit_provider_sync_state(&home, &sqlite_paths) {
@@ -648,6 +663,11 @@ pub fn run_provider_sync_with_target(
         )?;
         let mut subagent_thread_ids = thread_kinds.subagent_thread_ids;
         subagent_thread_ids.extend(collected.subagent_thread_ids.iter().cloned());
+=======
+        let extended_cwd_count =
+            codex_plus_core::codex_sqlite::count_windows_extended_thread_cwds(&home)?;
+        let collected = collect_session_changes(&home, &target_provider)?;
+>>>>>>> 2f0a4b1 (fix: harden Windows historical session repair)
         let encrypted_content_warning =
             build_encrypted_content_warning(&collected.encrypted_content_counts, &target_provider);
         let rewrite_changes = collected
@@ -685,6 +705,7 @@ pub fn run_provider_sync_with_target(
             && sqlite_update_count == 0
             && catalog_repair_count == 0
             && global_state_update_count == 0
+            && extended_cwd_count == 0
         {
             let mut synced = result(
                 ProviderSyncStatus::Synced,
@@ -701,8 +722,36 @@ pub fn run_provider_sync_with_target(
                 provider_sync_message_with_audit(&synced.message, &synced.repair_audit);
             return Ok(synced);
         }
-        let backup_dir = create_backup(&home, &target_provider, &rewrite_changes)?;
-        let applied = apply_session_changes(&rewrite_changes)?;
+        let backup = create_backup(&home, &target_provider, &rewrite_changes)?;
+        failure_backup_dir = Some(backup.directory.clone());
+        if enforce_process_guard {
+            if let Some(message) = provider_sync_blocking_process_message() {
+                return Err(anyhow::anyhow!(message));
+            }
+        }
+        let sanitized_cwds =
+            match codex_plus_core::codex_sqlite::sanitize_windows_extended_thread_cwds(&home) {
+                Ok(result) => result,
+                Err(error) => {
+                    return Err(error_after_restore(
+                        error,
+                        &backup,
+                        &[],
+                        enforce_process_guard,
+                    ));
+                }
+            };
+        let applied = match apply_session_changes(&rewrite_changes) {
+            Ok(applied) => applied,
+            Err(ApplySessionChangesError { error, applied }) => {
+                return Err(error_after_restore(
+                    error,
+                    &backup,
+                    &applied.changes,
+                    enforce_process_guard,
+                ));
+            }
+        };
         let apply_result = (|| -> anyhow::Result<(SqliteUpdateCounts, usize)> {
             let sqlite_updates = apply_sqlite_update_for_paths(
                 &sqlite_paths,
@@ -712,7 +761,12 @@ pub fn run_provider_sync_with_target(
                 &subagent_thread_ids,
             )?;
             let mut sqlite_updates = sqlite_updates;
+<<<<<<< HEAD
             let catalog_repairs =
+=======
+            sqlite_updates.cwd_rows += sanitized_cwds.updated;
+            sqlite_updates.catalog_insert_rows =
+>>>>>>> 2f0a4b1 (fix: harden Windows historical session repair)
                 repair_missing_local_thread_catalog_rows(&sqlite_paths, &target_provider)?;
             sqlite_updates.catalog_insert_rows = catalog_repairs.inserted_rows;
             sqlite_updates.catalog_remove_rows = catalog_repairs.removed_rows;
@@ -724,15 +778,19 @@ pub fn run_provider_sync_with_target(
         let (sqlite_updates, updated_workspace_roots) = match apply_result {
             Ok(counts) => counts,
             Err(err) => {
-                let _ = restore_session_changes(&applied.changes);
-                return Err(err);
+                return Err(error_after_restore(
+                    err,
+                    &backup,
+                    &applied.changes,
+                    enforce_process_guard,
+                ));
             }
         };
         let mut synced = result(
             ProviderSyncStatus::Synced,
             "Provider sync complete",
             &target_provider,
-            Some(backup_dir),
+            Some(backup.directory),
             applied.changes.len(),
             sqlite_updates.total(),
         );
@@ -759,9 +817,24 @@ pub fn run_provider_sync_with_target(
             ProviderSyncStatus::Skipped,
             format!("Provider sync skipped: {err}"),
             &target_provider,
-            None,
+            failure_backup_dir,
             0,
             0,
+        )
+    })
+}
+
+fn provider_sync_blocking_process_message() -> Option<String> {
+    let running_processes =
+        codex_plus_core::watcher::find_session_index_cleanup_blocking_processes();
+    (!running_processes.is_empty()).then(|| {
+        format!(
+            "Codex App / ChatGPT 仍在运行（进程：{}）；请完全退出 App 后再修复历史会话",
+            running_processes
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
         )
     })
 }
@@ -2081,12 +2154,10 @@ fn to_desktop_workspace_path(value: &str) -> Option<String> {
     if stripped.is_empty() {
         return None;
     }
-    let lower = stripped.to_ascii_lowercase();
-    if lower.starts_with(r"\\?\unc\") {
-        return Some(format!(r"\\{}", stripped[8..].replace('/', r"\")));
-    }
-    if stripped.starts_with(r"\\?\") {
-        return Some(stripped[4..].replace('\\', "/"));
+    if let Some(normalized) =
+        codex_plus_core::codex_sqlite::normalize_windows_extended_thread_cwd(stripped)
+    {
+        return Some(normalized);
     }
     Some(stripped.to_string())
 }
@@ -2117,11 +2188,36 @@ fn build_encrypted_content_warning(
     ))
 }
 
+#[derive(Debug)]
+struct DatabaseBackupFile {
+    destination: PathBuf,
+    snapshot: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct FileBackup {
+    destination: PathBuf,
+    snapshot: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct ProviderBackup {
+    directory: PathBuf,
+    database_files: Vec<DatabaseBackupFile>,
+    state_files: Vec<FileBackup>,
+}
+
+#[derive(Debug)]
+struct ApplySessionChangesError {
+    error: anyhow::Error,
+    applied: AppliedSessionChanges,
+}
+
 fn create_backup(
     home: &Path,
     target_provider: &str,
     changes: &[SessionChange],
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<ProviderBackup> {
     let backup_root = home.join("backups_state/provider-sync");
     let mut backup_dir = backup_root.join(timestamp_name());
     let mut suffix = 0;
@@ -2130,31 +2226,49 @@ fn create_backup(
         backup_dir = backup_root.join(format!("{}-{suffix}", timestamp_name()));
     }
     fs::create_dir_all(&backup_dir)?;
-    for name in [
-        "config.toml",
-        ".codex-global-state.json",
-        ".codex-global-state.json.bak",
+    let mut state_files = Vec::new();
+    for (name, restore_on_failure) in [
+        ("config.toml", false),
+        (".codex-global-state.json", true),
+        (".codex-global-state.json.bak", true),
     ] {
-        let source = home.join(name);
-        if source.exists() {
-            fs::copy(&source, backup_dir.join(name))?;
+        let destination = home.join(name);
+        let snapshot = backup_dir.join(name);
+        let snapshot = if destination.exists() {
+            fs::copy(&destination, &snapshot)?;
+            Some(snapshot)
+        } else {
+            None
+        };
+        if restore_on_failure {
+            state_files.push(FileBackup {
+                destination,
+                snapshot,
+            });
         }
     }
     let db_dir = backup_dir.join("db");
     let mut db_files = Vec::new();
-    for db_path in provider_sync_db_paths(home) {
-        for source in codex_plus_core::codex_sqlite::codex_sqlite_sidecar_paths(&db_path) {
-            if !source.exists() {
-                continue;
-            }
-            let relative = codex_plus_core::codex_sqlite::relative_to_codex_home(home, &source);
-            let target = db_dir.join(&relative);
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(&source, &target)?;
+    let mut database_files = Vec::new();
+    for destination in provider_sync_db_paths(home) {
+        let relative = codex_plus_core::codex_sqlite::relative_to_codex_home(home, &destination);
+        let snapshot = db_dir.join(&relative);
+        anyhow::ensure!(
+            snapshot != destination,
+            "refusing to back up SQLite file onto itself: {}",
+            destination.to_string_lossy()
+        );
+        let snapshot = if destination.exists() {
+            create_sqlite_snapshot(&destination, &snapshot)?;
             db_files.push(relative.to_string_lossy().replace('\\', "/"));
-        }
+            Some(snapshot)
+        } else {
+            None
+        };
+        database_files.push(DatabaseBackupFile {
+            destination,
+            snapshot,
+        });
     }
     let manifest = changes
         .iter()
@@ -2172,7 +2286,7 @@ fn create_backup(
     fs::write(
         backup_dir.join("metadata.json"),
         serde_json::to_string_pretty(&json!({
-            "version": 1,
+            "version": 2,
             "namespace": "provider-sync",
             "codexHome": home.to_string_lossy(),
             "targetProvider": target_provider,
@@ -2182,7 +2296,136 @@ fn create_backup(
             "managedBy": "Codex++ provider sync"
         }))?,
     )?;
-    Ok(backup_dir)
+    Ok(ProviderBackup {
+        directory: backup_dir,
+        database_files,
+        state_files,
+    })
+}
+
+fn restore_database_backup(backup: &ProviderBackup) -> anyhow::Result<()> {
+    let mut errors = Vec::new();
+    for file in &backup.database_files {
+        let restored = match &file.snapshot {
+            Some(snapshot) => restore_sqlite_snapshot(snapshot, &file.destination),
+            None => remove_created_sqlite_files(&file.destination),
+        };
+        if let Err(error) = restored {
+            errors.push(format!("{}: {error}", file.destination.to_string_lossy()));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", errors.join("; "))
+    }
+}
+
+fn create_sqlite_snapshot(source: &Path, snapshot: &Path) -> anyhow::Result<PathBuf> {
+    if let Some(parent) = snapshot.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let source_db =
+        Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    source_db.backup(DatabaseName::Main, snapshot, None)?;
+    verify_sqlite_quick_check(snapshot)?;
+    Ok(snapshot.to_path_buf())
+}
+
+fn restore_sqlite_snapshot(snapshot: &Path, destination: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut destination_db = Connection::open(destination)?;
+    destination_db.busy_timeout(Duration::from_secs(1))?;
+    destination_db.restore(
+        DatabaseName::Main,
+        snapshot,
+        None::<fn(rusqlite::backup::Progress)>,
+    )?;
+    drop(destination_db);
+    verify_sqlite_quick_check(destination)
+}
+
+fn remove_created_sqlite_files(db_path: &Path) -> anyhow::Result<()> {
+    let mut errors = Vec::new();
+    for path in codex_plus_core::codex_sqlite::codex_sqlite_sidecar_paths(db_path) {
+        if path.exists() {
+            if let Err(error) = fs::remove_file(&path) {
+                errors.push(format!("{}: {error}", path.to_string_lossy()));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", errors.join("; "))
+    }
+}
+
+fn restore_state_files(files: &[FileBackup]) -> anyhow::Result<()> {
+    let mut errors = Vec::new();
+    for file in files {
+        let restored = match &file.snapshot {
+            Some(snapshot) => fs::copy(snapshot, &file.destination).map(|_| ()),
+            None if file.destination.exists() => fs::remove_file(&file.destination),
+            None => Ok(()),
+        };
+        if let Err(error) = restored {
+            errors.push(format!("{}: {error}", file.destination.to_string_lossy()));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", errors.join("; "))
+    }
+}
+
+fn verify_sqlite_quick_check(path: &Path) -> anyhow::Result<()> {
+    let connection = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let quick_check: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    anyhow::ensure!(
+        quick_check == "ok",
+        "SQLite quick_check failed for {}: {quick_check}",
+        path.to_string_lossy()
+    );
+    Ok(())
+}
+
+fn error_after_restore(
+    error: anyhow::Error,
+    backup: &ProviderBackup,
+    applied_session_changes: &[SessionChange],
+    enforce_process_guard: bool,
+) -> anyhow::Error {
+    if enforce_process_guard {
+        if let Some(message) = provider_sync_blocking_process_message() {
+            return anyhow::anyhow!(
+                "{error}; {message}；为避免覆盖运行中的数据库，未自动恢复，请使用备份目录 {}",
+                backup.directory.to_string_lossy()
+            );
+        }
+    }
+    let mut restore_errors = Vec::new();
+    if let Err(restore_error) = restore_session_changes(applied_session_changes) {
+        restore_errors.push(format!("会话文件恢复失败：{restore_error}"));
+    }
+    if let Err(restore_error) = restore_database_backup(backup) {
+        restore_errors.push(format!("数据库恢复失败：{restore_error}"));
+    }
+    if let Err(restore_error) = restore_state_files(&backup.state_files) {
+        restore_errors.push(format!("全局状态恢复失败：{restore_error}"));
+    }
+    if restore_errors.is_empty() {
+        error
+    } else {
+        anyhow::anyhow!(
+            "{error}; {}；请使用备份目录 {}",
+            restore_errors.join("; "),
+            backup.directory.to_string_lossy()
+        )
+    }
 }
 
 fn create_session_index_cleanup_backup(
@@ -2215,7 +2458,9 @@ fn create_session_index_cleanup_backup(
     Ok(backup_dir)
 }
 
-fn apply_session_changes(changes: &[SessionChange]) -> anyhow::Result<AppliedSessionChanges> {
+fn apply_session_changes(
+    changes: &[SessionChange],
+) -> Result<AppliedSessionChanges, ApplySessionChangesError> {
     let mut applied = AppliedSessionChanges::default();
     for change in changes {
         match replace_session_text_if_unchanged(
@@ -2236,7 +2481,12 @@ fn apply_session_changes(changes: &[SessionChange]) -> anyhow::Result<AppliedSes
                     .push(change.path.clone());
                 continue;
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return Err(ApplySessionChangesError {
+                    error: error.into(),
+                    applied,
+                });
+            }
         }
         restore_file_mtime(&change.path, change.original_mtime);
         applied.changes.push(change.clone());
@@ -2245,7 +2495,9 @@ fn apply_session_changes(changes: &[SessionChange]) -> anyhow::Result<AppliedSes
 }
 
 fn restore_session_changes(changes: &[SessionChange]) -> anyhow::Result<()> {
+    let mut errors = Vec::new();
     for change in changes {
+<<<<<<< HEAD
         if replace_session_text_if_unchanged(
             &change.path,
             &change.next_text,
@@ -2253,8 +2505,19 @@ fn restore_session_changes(changes: &[SessionChange]) -> anyhow::Result<()> {
         )? {
             restore_file_mtime(&change.path, change.original_mtime);
         }
+=======
+        if let Err(error) = fs::write(&change.path, &change.original_text) {
+            errors.push(format!("{}: {error}", change.path.to_string_lossy()));
+            continue;
+        }
+        restore_file_mtime(&change.path, change.original_mtime);
+>>>>>>> 2f0a4b1 (fix: harden Windows historical session repair)
     }
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", errors.join("; "))
+    }
 }
 
 fn replace_session_text_if_unchanged(

@@ -10,6 +10,7 @@ members = [
 [workspace.package]
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
 version = "1.2.52"
 =======
 version = "1.2.42-linux.1"
@@ -17,6 +18,9 @@ version = "1.2.42-linux.1"
 =======
 version = "1.2.42-linux.2"
 >>>>>>> d97f8f9 (chore(release): bump fork version to v1.2.42-linux.2)
+=======
+version = "1.2.44-linux.1"
+>>>>>>> 2f0a4b1 (fix: harden Windows historical session repair)
 edition = "2024"
 license = "AGPL-3.0-only"
 repository = "https://github.com/BigPizzaV3/CodexPlusPlus"
@@ -28,8 +32,13 @@ base64 = "0.22"
 directories = "6"
 fs2 = "0.4"
 futures-util = "0.3"
+<<<<<<< HEAD
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "rustls-tls-native-roots", "system-proxy"], default-features = false }
 rusqlite = { version = "0.32", features = ["bundled"] }
+=======
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "system-proxy"], default-features = false }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+>>>>>>> 2f0a4b1 (fix: harden Windows historical session repair)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
