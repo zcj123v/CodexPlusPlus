@@ -1192,6 +1192,32 @@ fn provider_sync_skips_when_home_missing_or_lock_exists_and_prunes_backups() {
 }
 
 #[test]
+fn provider_sync_recovers_stale_lock_owned_by_dead_process() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join(".codex");
+    fs::create_dir(&home).unwrap();
+    fs::write(home.join("config.toml"), "model_provider = \"custom\"\n").unwrap();
+    write_rollout(
+        &home.join("sessions/rollout-stale-lock.jsonl"),
+        "openai",
+        "thread-1",
+        "C:/workspace",
+    );
+    let lock = home.join("tmp/provider-sync.lock");
+    fs::create_dir_all(&lock).unwrap();
+    fs::write(
+        lock.join("owner.json"),
+        json!({"pid": u32::MAX, "startedAt": 0}).to_string(),
+    )
+    .unwrap();
+
+    let result = run_provider_sync(Some(&home));
+
+    assert_eq!(result.status, ProviderSyncStatus::Synced);
+    assert!(!lock.exists());
+}
+
+#[test]
 fn provider_sync_preserves_rollout_mtime() {
     let tmp = tempdir().unwrap();
     let home = tmp.path().join(".codex");

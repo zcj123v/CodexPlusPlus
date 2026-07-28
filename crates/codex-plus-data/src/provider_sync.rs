@@ -616,11 +616,70 @@ fn toml_string_value(raw: &str) -> Option<String> {
 
 fn acquire_lock(path: &Path) -> std::io::Result<()> {
     fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")))?;
-    fs::create_dir(path)?;
+    match fs::create_dir(path) {
+        Ok(()) => write_lock_owner(path),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !recover_stale_lock(path)? {
+                return Err(error);
+            }
+            fs::create_dir(path)?;
+            if let Err(error) = write_lock_owner(path) {
+                let _ = release_lock(path);
+                return Err(error);
+            }
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn write_lock_owner(path: &Path) -> std::io::Result<()> {
     fs::write(
         path.join("owner.json"),
         json!({"pid": std::process::id(), "startedAt": now_secs()}).to_string(),
     )
+}
+
+fn recover_stale_lock(path: &Path) -> std::io::Result<bool> {
+    let Some(owner_pid) = fs::read_to_string(path.join("owner.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|owner| owner.get("pid").and_then(Value::as_u64))
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid != 0)
+    else {
+        return Ok(false);
+    };
+    if process_is_running(owner_pid) {
+        return Ok(false);
+    }
+    fs::remove_dir_all(path)?;
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn process_is_running(process_id: u32) -> bool {
+    codex_plus_core::windows_enumerate_processes()
+        .into_iter()
+        .any(|process| process.process_id == process_id)
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_running(process_id: u32) -> bool {
+    Path::new("/proc").join(process_id.to_string()).is_dir()
+}
+
+#[cfg(target_os = "macos")]
+fn process_is_running(process_id: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &process_id.to_string()])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn process_is_running(_process_id: u32) -> bool {
+    true
 }
 
 fn release_lock(path: &Path) -> std::io::Result<()> {
