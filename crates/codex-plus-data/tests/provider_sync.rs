@@ -574,7 +574,7 @@ fn provider_sync_backup_metadata_contains_reference_fields_and_managed_marker() 
     let metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(backup_dir.join("metadata.json")).unwrap())
             .unwrap();
-    assert_eq!(metadata["version"], 1);
+    assert_eq!(metadata["version"], 2);
     assert_eq!(metadata["namespace"], "provider-sync");
     assert_eq!(metadata["codexHome"], home.to_string_lossy().to_string());
     assert_eq!(metadata["targetProvider"], "apigather");
@@ -587,6 +587,138 @@ fn provider_sync_backup_metadata_contains_reference_fields_and_managed_marker() 
             .unwrap()
             .contains(&json!("state_5.sqlite"))
     );
+}
+
+#[test]
+fn provider_sync_backup_uses_one_logical_snapshot_per_database() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join(".codex");
+    fs::create_dir_all(home.join("sqlite")).unwrap();
+    fs::write(home.join("config.toml"), "model_provider = \"custom\"\n").unwrap();
+    write_rollout(
+        &home.join("sessions/rollout-current.jsonl"),
+        "openai",
+        "thread-1",
+        "C:/workspace",
+    );
+    create_state_db(&home.join("state_5.sqlite"));
+    create_state_db(&home.join("sqlite/state_5.sqlite"));
+
+    let result = run_provider_sync_with_target(Some(&home), Some("custom"));
+
+    assert_eq!(result.status, ProviderSyncStatus::Synced);
+    let backup_dir = result
+        .backup_dir
+        .expect("sync must expose its backup directory");
+    let metadata: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(backup_dir.join("metadata.json")).unwrap())
+            .unwrap();
+    assert_eq!(metadata["version"], 2);
+    let db_files = metadata["dbFiles"].as_array().unwrap();
+    assert_eq!(db_files.len(), 2);
+    for relative in db_files.iter().map(|value| value.as_str().unwrap()) {
+        assert!(relative.ends_with(".sqlite"));
+        assert!(!relative.ends_with("-wal"));
+        assert!(!relative.ends_with("-shm"));
+        let snapshot = Connection::open(backup_dir.join("db").join(relative)).unwrap();
+        let quick_check: String = snapshot
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
+    }
+}
+
+#[test]
+fn provider_sync_restores_wal_database_and_all_rollouts_after_sqlite_failure() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join(".codex");
+    fs::create_dir(&home).unwrap();
+    fs::write(home.join("config.toml"), "model_provider = \"custom\"\n").unwrap();
+    let first_rollout = home.join("sessions/rollout-first.jsonl");
+    let second_rollout = home.join("sessions/rollout-second.jsonl");
+    write_rollout(&first_rollout, "openai", "thread-1", "C:/one");
+    write_rollout(&second_rollout, "openai", "thread-2", "C:/two");
+    let first_before = fs::read(&first_rollout).unwrap();
+    let second_before = fs::read(&second_rollout).unwrap();
+
+    let db_path = home.join("state_5.sqlite");
+    let db = Connection::open(&db_path).unwrap();
+    db.pragma_update(None, "journal_mode", "WAL").unwrap();
+    db.execute(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT, archived INTEGER, has_user_event INTEGER, cwd TEXT)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES ('thread-1', 'old', 0, 0, 'C:/old-one')",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES ('thread-2', 'old', 0, 0, 'C:/old-two')",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TRIGGER fail_provider_sync BEFORE UPDATE OF model_provider ON threads BEGIN SELECT RAISE(ABORT, 'boom'); END",
+        [],
+    )
+    .unwrap();
+    drop(db);
+
+    let result = run_provider_sync_with_target(Some(&home), Some("custom"));
+
+    assert_eq!(result.status, ProviderSyncStatus::Skipped);
+    assert!(result.backup_dir.is_some());
+    assert_eq!(fs::read(&first_rollout).unwrap(), first_before);
+    assert_eq!(fs::read(&second_rollout).unwrap(), second_before);
+    let restored = Connection::open(&db_path).unwrap();
+    let rows = restored
+        .prepare("SELECT model_provider, cwd FROM threads ORDER BY id")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("old".to_string(), "C:/old-one".to_string()),
+            ("old".to_string(), "C:/old-two".to_string()),
+        ]
+    );
+    let quick_check: String = restored
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(quick_check, "ok");
+}
+
+#[test]
+fn provider_sync_is_idempotent_across_both_session_databases() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join(".codex");
+    fs::create_dir_all(home.join("sqlite")).unwrap();
+    fs::write(home.join("config.toml"), "model_provider = \"custom\"\n").unwrap();
+    write_rollout(
+        &home.join("sessions/rollout-current.jsonl"),
+        "openai",
+        "thread-1",
+        "C:/workspace",
+    );
+    create_state_db(&home.join("state_5.sqlite"));
+    create_state_db(&home.join("sqlite/state_5.sqlite"));
+
+    let first = run_provider_sync_with_target(Some(&home), Some("custom"));
+    let second = run_provider_sync_with_target(Some(&home), Some("custom"));
+
+    assert_eq!(first.status, ProviderSyncStatus::Synced);
+    assert_eq!(second.status, ProviderSyncStatus::Synced);
+    assert!(second.message.contains("already up to date"));
+    assert_eq!(second.changed_session_files, 0);
+    assert_eq!(second.sqlite_rows_updated, 0);
+    assert!(second.backup_dir.is_none());
 }
 
 #[test]
@@ -684,20 +816,117 @@ fn provider_sync_repairs_sqlite_when_rollout_provider_matches_and_normalizes_pat
             row.get(0)
         })
         .unwrap();
-    assert_eq!(row, "C:/workspace");
+    assert_eq!(row, r"C:\workspace");
     let state: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(home.join(".codex-global-state.json")).unwrap())
             .unwrap();
     assert_eq!(
         state["electron-saved-workspace-roots"],
-        json!(["C:/workspace"])
+        json!([r"C:\workspace"])
     );
-    assert_eq!(state["project-order"], json!(["C:/workspace"]));
-    assert_eq!(state["active-workspace-roots"], json!("C:/workspace"));
+    assert_eq!(state["project-order"], json!([r"C:\workspace"]));
+    assert_eq!(state["active-workspace-roots"], json!(r"C:\workspace"));
     assert_eq!(
         state["electron-workspace-root-labels"],
-        json!({"C:/workspace": "Workspace"})
+        json!({r"C:\workspace": "Workspace"})
     );
+}
+
+#[test]
+fn provider_sync_repairs_extended_cwds_even_without_matching_rollouts() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join(".codex");
+    fs::create_dir(&home).unwrap();
+    fs::write(home.join("config.toml"), "model_provider = \"apigather\"\n").unwrap();
+    write_rollout(
+        &home.join("sessions/rollout-current.jsonl"),
+        "apigather",
+        "thread-1",
+        r"D:\Workspace\AIGC_Detect",
+    );
+    let db_path = home.join("state_5.sqlite");
+    create_state_db(&db_path);
+    let db = Connection::open(&db_path).unwrap();
+    db.execute(
+        "UPDATE threads SET cwd = ?1 WHERE id = 'thread-1'",
+        [r"\\?\D:\Workspace\AIGC_Detect"],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES ('thread-without-rollout', 'apigather', 0, 1, ?1)",
+        [r"\\?\UNC\server\share\project"],
+    )
+    .unwrap();
+    drop(db);
+
+    let result = run_provider_sync(Some(&home));
+
+    assert_eq!(result.status, ProviderSyncStatus::Synced);
+    let backup_db = result
+        .backup_dir
+        .as_ref()
+        .expect("extended cwd repair must create a backup")
+        .join("db/state_5.sqlite");
+    let backup = Connection::open(backup_db).unwrap();
+    assert_eq!(
+        backup
+            .query_row(
+                "SELECT cwd FROM threads WHERE id = 'thread-without-rollout'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        r"\\?\UNC\server\share\project"
+    );
+    drop(backup);
+    let db = Connection::open(db_path).unwrap();
+    assert_eq!(
+        db.query_row("SELECT cwd FROM threads WHERE id = 'thread-1'", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap(),
+        r"D:\Workspace\AIGC_Detect"
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT cwd FROM threads WHERE id = 'thread-without-rollout'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        r"\\server\share\project"
+    );
+}
+
+#[test]
+fn provider_sync_preserves_unsupported_windows_extended_paths() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join(".codex");
+    fs::create_dir(&home).unwrap();
+    fs::write(home.join("config.toml"), "model_provider = \"apigather\"\n").unwrap();
+    let original = json!({
+        "electron-saved-workspace-roots": [r"\\?\Volume{1234}\project", r"\\?\"],
+        "project-order": [r"\\?\Volume{1234}\project", r"\\?\"],
+        "active-workspace-roots": r"\\?\Volume{1234}\project",
+        "electron-workspace-root-labels": {
+            r"\\?\Volume{1234}\project": "Device",
+            r"\\?\": "Malformed"
+        }
+    });
+    fs::write(
+        home.join(".codex-global-state.json"),
+        serde_json::to_string_pretty(&original).unwrap(),
+    )
+    .unwrap();
+
+    let result = run_provider_sync(Some(&home));
+
+    assert_eq!(result.status, ProviderSyncStatus::Synced);
+    assert!(result.backup_dir.is_none());
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(home.join(".codex-global-state.json")).unwrap())
+            .unwrap();
+    assert_eq!(state, original);
 }
 
 #[test]
@@ -773,7 +1002,7 @@ fn provider_sync_normalizes_open_in_target_preferences_per_path() {
             .unwrap();
     assert_eq!(
         state["open-in-target-preferences"]["perPath"],
-        json!({"C:/workspace": "terminal"})
+        json!({r"C:\workspace": "terminal"})
     );
     assert!(home.join(".codex-global-state.json.bak").exists());
 }
@@ -799,12 +1028,12 @@ fn provider_sync_restores_rollout_first_line_when_later_step_fails() {
     )
     .unwrap();
     db.execute(
-        "INSERT INTO threads VALUES ('thread-1', 'old-provider', 0, 0, 'C:/old')",
-        [],
+        "INSERT INTO threads VALUES ('thread-1', 'old-provider', 0, 0, ?1)",
+        [r"\\?\D:\MCAgentPlugin"],
     )
     .unwrap();
     db.execute(
-        "CREATE TRIGGER fail_provider_sync_update BEFORE UPDATE ON threads BEGIN SELECT RAISE(ABORT, 'boom'); END",
+        "CREATE TRIGGER fail_provider_sync_update BEFORE UPDATE OF model_provider ON threads BEGIN SELECT RAISE(ABORT, 'boom'); END",
         [],
     )
     .unwrap();
@@ -814,6 +1043,20 @@ fn provider_sync_restores_rollout_first_line_when_later_step_fails() {
 
     assert_eq!(result.status, ProviderSyncStatus::Skipped);
     assert!(result.message.contains("Provider sync skipped"));
+    let backup_dir = result
+        .backup_dir
+        .as_ref()
+        .expect("failure after backup must expose the recovery directory");
+    assert!(backup_dir.join("db/state_5.sqlite").exists());
+    let db = Connection::open(home.join("state_5.sqlite")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT cwd FROM threads WHERE id = 'thread-1'", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap(),
+        r"\\?\D:\MCAgentPlugin"
+    );
+    drop(db);
     let restored_first_line = fs::read_to_string(&rollout)
         .unwrap()
         .lines()
@@ -904,6 +1147,7 @@ fn provider_sync_restores_global_state_when_later_step_fails() {
 
     assert_eq!(result.status, ProviderSyncStatus::Skipped);
     assert_eq!(fs::read_to_string(&state_path).unwrap(), original_state);
+    assert!(!home.join(".codex-global-state.json.bak").exists());
 }
 
 #[test]

@@ -1980,7 +1980,8 @@ pub async fn sync_providers_now(target_provider: Option<String>) -> CommandResul
     .map_err(|error| anyhow::anyhow!("provider sync task failed: {error}"));
     match result {
         Ok(sync) => {
-            if is_success_sync_status(&sync.status) {
+            let succeeded = is_success_sync_status(&sync.status);
+            if succeeded {
                 persist_provider_sync_selection(
                     target_for_settings
                         .as_deref()
@@ -1991,29 +1992,34 @@ pub async fn sync_providers_now(target_provider: Option<String>) -> CommandResul
                     "manager.sync_providers_now.after",
                 );
             }
-            ok(
-                &format!(
-                    "供应商已同步一次：{} 个会话文件，{} 行索引，跳过 {} 个占用文件。",
-                    sync.changed_session_files,
-                    sync.sqlite_rows_updated,
-                    sync.skipped_locked_rollout_files.len()
-                ),
-                json!({
-                    "syncStatus": sync.status,
-                    "targetProvider": sync.target_provider,
-                    "changedSessionFiles": sync.changed_session_files,
-                    "skippedLockedRolloutFiles": sync.skipped_locked_rollout_files,
-                    "sqliteRowsUpdated": sync.sqlite_rows_updated,
-                    "sqliteProviderRowsUpdated": sync.sqlite_provider_rows_updated,
-                    "sqliteUserEventRowsUpdated": sync.sqlite_user_event_rows_updated,
-                    "sqliteCwdRowsUpdated": sync.sqlite_cwd_rows_updated,
-                    "sqliteCatalogRowsInserted": sync.sqlite_catalog_rows_inserted,
-                    "updatedWorkspaceRoots": sync.updated_workspace_roots,
-                    "encryptedContentWarning": sync.encrypted_content_warning,
-                    "backupDir": sync.backup_dir,
-                    "syncMessage": sync.message,
-                }),
-            )
+            let payload = json!({
+                "syncStatus": sync.status,
+                "targetProvider": sync.target_provider,
+                "changedSessionFiles": sync.changed_session_files,
+                "skippedLockedRolloutFiles": sync.skipped_locked_rollout_files,
+                "sqliteRowsUpdated": sync.sqlite_rows_updated,
+                "sqliteProviderRowsUpdated": sync.sqlite_provider_rows_updated,
+                "sqliteUserEventRowsUpdated": sync.sqlite_user_event_rows_updated,
+                "sqliteCwdRowsUpdated": sync.sqlite_cwd_rows_updated,
+                "sqliteCatalogRowsInserted": sync.sqlite_catalog_rows_inserted,
+                "updatedWorkspaceRoots": sync.updated_workspace_roots,
+                "encryptedContentWarning": sync.encrypted_content_warning,
+                "backupDir": sync.backup_dir,
+                "syncMessage": sync.message,
+            });
+            if succeeded {
+                ok(
+                    &format!(
+                        "供应商已同步一次：{} 个会话文件，{} 行索引，跳过 {} 个占用文件。",
+                        sync.changed_session_files,
+                        sync.sqlite_rows_updated,
+                        sync.skipped_locked_rollout_files.len()
+                    ),
+                    payload,
+                )
+            } else {
+                failed(&sync.message, payload)
+            }
         }
         Err(error) => failed(&format!("供应商同步失败：{error}"), json!({})),
     }
@@ -5523,6 +5529,15 @@ model_reasoning_effort = "high"
             .save_latest(&launch_status_with_helper_port(Some(0)))
             .unwrap();
         assert_eq!(effective_helper_port_with_store(&zero_store, 57321), 57321);
+    }
+
+    #[test]
+    fn provider_sync_success_status_only_accepts_synced() {
+        use codex_plus_data::ProviderSyncStatus;
+
+        assert!(is_success_sync_status(&ProviderSyncStatus::Synced));
+        assert!(!is_success_sync_status(&ProviderSyncStatus::Skipped));
+        assert!(!is_success_sync_status(&ProviderSyncStatus::Disabled));
     }
 
     #[cfg(target_os = "linux")]

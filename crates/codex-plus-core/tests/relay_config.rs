@@ -141,6 +141,105 @@ fn codex_session_db_path_prefers_threads_db_over_codex_dev_inbox_db() {
 }
 
 #[test]
+fn codex_session_db_path_prefers_most_recent_threads_db_over_directory_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    let sqlite_dir = home.join("sqlite");
+    std::fs::create_dir(&sqlite_dir).unwrap();
+
+    let stale_path = sqlite_dir.join("state_5.sqlite");
+    let stale = rusqlite::Connection::open(&stale_path).unwrap();
+    stale
+        .execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, updated_at INTEGER)",
+            [],
+        )
+        .unwrap();
+    stale
+        .execute("INSERT INTO threads VALUES ('stale', 100)", [])
+        .unwrap();
+    drop(stale);
+
+    let active_path = home.join("state_5.sqlite");
+    let active = rusqlite::Connection::open(&active_path).unwrap();
+    active
+        .execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, updated_at INTEGER)",
+            [],
+        )
+        .unwrap();
+    active
+        .execute("INSERT INTO threads VALUES ('active', 200)", [])
+        .unwrap();
+    drop(active);
+
+    assert_eq!(codex_session_db_path_from_home(home), active_path);
+}
+
+#[test]
+fn codex_session_db_path_uses_latest_value_across_mixed_time_columns() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    let sqlite_dir = home.join("sqlite");
+    std::fs::create_dir(&sqlite_dir).unwrap();
+
+    let stale_path = sqlite_dir.join("state_5.sqlite");
+    let stale = rusqlite::Connection::open(&stale_path).unwrap();
+    stale
+        .execute(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                updated_at_ms INTEGER,
+                updated_at INTEGER
+            )",
+            [],
+        )
+        .unwrap();
+    stale
+        .execute(
+            "INSERT INTO threads VALUES ('stale', 2000000000000, 2000000000)",
+            [],
+        )
+        .unwrap();
+    drop(stale);
+
+    let active_path = home.join("state_5.sqlite");
+    let active = rusqlite::Connection::open(&active_path).unwrap();
+    active
+        .execute(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                updated_at_ms INTEGER,
+                updated_at INTEGER
+            )",
+            [],
+        )
+        .unwrap();
+    active
+        .execute("INSERT INTO threads VALUES ('active', 0, 3000000000)", [])
+        .unwrap();
+    drop(active);
+
+    assert_eq!(codex_session_db_path_from_home(home), active_path);
+}
+
+#[test]
+fn relative_to_codex_home_maps_external_database_below_backup_root() {
+    let home = std::path::Path::new("/home/user/.codex");
+    let external = std::path::Path::new("/external/A B/state_5.sqlite");
+    let colliding_before_hash = std::path::Path::new("/external/A_B/state_5.sqlite");
+
+    let relative = codex_plus_core::codex_sqlite::relative_to_codex_home(home, external);
+    let distinct =
+        codex_plus_core::codex_sqlite::relative_to_codex_home(home, colliding_before_hash);
+
+    assert!(!relative.is_absolute());
+    assert!(relative.starts_with("external"));
+    assert_eq!(relative.file_name().unwrap(), "state_5.sqlite");
+    assert_ne!(relative, distinct);
+}
+
+#[test]
 fn codex_session_db_path_falls_back_to_legacy_state_db() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path();

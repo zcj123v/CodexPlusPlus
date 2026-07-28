@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 
 pub fn default_codex_home_dir() -> PathBuf {
     crate::codex_home::default_codex_home_dir()
@@ -14,10 +15,27 @@ pub fn codex_session_db_path() -> PathBuf {
 
 pub fn codex_session_db_path_from_home(home: &Path) -> PathBuf {
     let paths = codex_session_db_paths_from_home(home);
-    paths
-        .iter()
-        .find(|path| sqlite_has_table(path, "threads"))
-        .cloned()
+    let mut selected_threads_db: Option<(PathBuf, Option<f64>)> = None;
+    for path in &paths {
+        if !sqlite_has_table(path, "threads") {
+            continue;
+        }
+        let activity = sqlite_latest_thread_activity(path);
+        let replace = selected_threads_db
+            .as_ref()
+            .is_some_and(
+                |(_, selected_activity)| match (activity, *selected_activity) {
+                    (Some(candidate), Some(selected)) => candidate > selected,
+                    (Some(_), None) => true,
+                    _ => false,
+                },
+            );
+        if selected_threads_db.is_none() || replace {
+            selected_threads_db = Some((path.clone(), activity));
+        }
+    }
+    selected_threads_db
+        .map(|(path, _)| path)
         .or_else(|| paths.into_iter().next())
         .unwrap_or_else(|| legacy_state_db_path(home))
 }
@@ -61,7 +79,16 @@ pub fn codex_sqlite_sidecar_paths(db_path: &Path) -> [PathBuf; 3] {
 }
 
 pub fn relative_to_codex_home(home: &Path, path: &Path) -> PathBuf {
-    path.strip_prefix(home).unwrap_or(path).to_path_buf()
+    if let Ok(relative) = path.strip_prefix(home) {
+        return relative.to_path_buf();
+    }
+    let path_text = path.as_os_str().to_string_lossy();
+    let digest = format!("{:x}", Sha256::digest(path_text.as_bytes()));
+    let file_name = path
+        .file_name()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| OsStr::new("sqlite.db"));
+    PathBuf::from("external").join(digest).join(file_name)
 }
 
 fn resolve_sqlite_home_from_env() -> Option<PathBuf> {
@@ -149,6 +176,163 @@ fn sqlite_has_table(path: &Path, table: &str) -> bool {
         |_| Ok(()),
     )
     .is_ok()
+}
+
+fn sqlite_latest_thread_activity(path: &Path) -> Option<f64> {
+    let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let mut stmt = db.prepare("PRAGMA table_info(threads)").ok()?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .ok()?
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    drop(stmt);
+
+    let mut latest = None;
+    for column in ["updated_at_ms", "updated_at", "created_at_ms", "created_at"] {
+        if !columns.iter().any(|candidate| candidate == column) {
+            continue;
+        }
+        let sql = format!("SELECT MAX(CAST({column} AS REAL)) FROM threads");
+        let value = db
+            .query_row(&sql, [], |row| row.get::<_, Option<f64>>(0))
+            .ok()
+            .flatten()
+            .filter(|value| value.is_finite() && *value > 0.0);
+        if let Some(value) = value {
+            let normalized = if value.abs() > 9_999_999_999.0 {
+                value / 1_000.0
+            } else {
+                value
+            };
+            latest = Some(latest.map_or(normalized, |current: f64| current.max(normalized)));
+        }
+    }
+    latest
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SanitizeThreadCwdResult {
+    pub scanned: usize,
+    pub updated: usize,
+}
+
+/// 把可确认的 Windows 扩展盘符或 UNC 路径转换为普通路径。
+/// 其他扩展命名空间或残缺路径返回 `None`，由调用方保持原值。
+pub fn normalize_windows_extended_thread_cwd(cwd: &str) -> Option<String> {
+    let path = cwd.strip_prefix(r"\\?\")?;
+    if path
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"UNC\"))
+    {
+        let unc_path = path[4..].replace('/', r"\");
+        let mut parts = unc_path.split('\\');
+        let has_server = parts.next().is_some_and(|value| !value.is_empty());
+        let has_share = parts.next().is_some_and(|value| !value.is_empty());
+        return (has_server && has_share).then(|| format!(r"\\{unc_path}"));
+    }
+    let bytes = path.as_bytes();
+    (bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\')
+        .then(|| path.to_string())
+}
+
+/// 只读统计需要从 Windows 扩展长度路径恢复为普通路径的线程数。
+pub fn count_windows_extended_thread_cwds(home: &Path) -> anyhow::Result<usize> {
+    let mut count = 0;
+    for db_path in codex_session_db_paths_from_home(home) {
+        if !db_path.exists() {
+            continue;
+        }
+        let db = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let has_cwd = db
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'threads' LIMIT 1",
+                [],
+                |_| Ok(()),
+            )
+            .is_ok()
+            && db
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info('threads') WHERE name = 'cwd' LIMIT 1",
+                    [],
+                    |_| Ok(()),
+                )
+                .is_ok();
+        if !has_cwd {
+            continue;
+        }
+        let mut stmt = db.prepare("SELECT cwd FROM threads WHERE substr(cwd, 1, 4) = ?1")?;
+        let rows = stmt
+            .query_map([r"\\?\"], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        count += rows
+            .iter()
+            .filter(|cwd| normalize_windows_extended_thread_cwd(cwd).is_some())
+            .count();
+    }
+    Ok(count)
+}
+
+/// 把 Windows 扩展长度路径恢复为 Codex Desktop 可识别的普通路径。
+/// 盘符路径仅移除 `\\?\` 前缀，UNC 路径恢复为标准的 `\\server\share` 形式。
+pub fn sanitize_windows_extended_thread_cwds(
+    home: &Path,
+) -> anyhow::Result<SanitizeThreadCwdResult> {
+    let mut result = SanitizeThreadCwdResult::default();
+    for db_path in codex_session_db_paths_from_home(home) {
+        if !db_path.exists() {
+            continue;
+        }
+        let (scanned, updated) = sanitize_windows_extended_thread_cwds_in_db(&db_path)?;
+        result.scanned += scanned;
+        result.updated += updated;
+    }
+    Ok(result)
+}
+
+fn sanitize_windows_extended_thread_cwds_in_db(db_path: &Path) -> anyhow::Result<(usize, usize)> {
+    let mut conn = Connection::open(db_path)?;
+    let tx = conn.transaction()?;
+    let has_cwd = tx
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'threads' LIMIT 1",
+            [],
+            |_| Ok(()),
+        )
+        .is_ok()
+        && tx
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('threads') WHERE name = 'cwd' LIMIT 1",
+                [],
+                |_| Ok(()),
+            )
+            .is_ok();
+    if !has_cwd {
+        return Ok((0, 0));
+    }
+
+    let mut stmt = tx.prepare("SELECT id, cwd FROM threads WHERE substr(cwd, 1, 4) = ?1")?;
+    let rows = stmt
+        .query_map([r"\\?\"], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    let scanned = rows.len();
+    let mut updated = 0;
+    for (id, cwd) in rows {
+        let Some(normalized) = normalize_windows_extended_thread_cwd(&cwd) else {
+            continue;
+        };
+        tx.execute(
+            "UPDATE threads SET cwd = ?1 WHERE id = ?2",
+            [&normalized, &id],
+        )?;
+        updated += 1;
+    }
+    tx.commit()?;
+    Ok((scanned, updated))
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

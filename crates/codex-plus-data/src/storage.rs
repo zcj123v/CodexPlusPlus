@@ -138,6 +138,10 @@ fn sqlite_limit(limit: usize) -> i64 {
     i64::try_from(limit).unwrap_or(i64::MAX)
 }
 
+fn display_cwd(cwd: String) -> String {
+    codex_plus_core::codex_sqlite::normalize_windows_extended_thread_cwd(&cwd).unwrap_or(cwd)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalSession {
@@ -252,7 +256,7 @@ impl SQLiteStorageAdapter {
             Ok(LocalSession {
                 id: row.get(0)?,
                 title: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                cwd: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                cwd: display_cwd(row.get::<_, Option<String>>(2)?.unwrap_or_default()),
                 model_provider: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
                 archived: row.get::<_, Option<i64>>(4)?.unwrap_or_default() != 0,
                 updated_at_ms: row.get(5)?,
@@ -291,7 +295,7 @@ impl SQLiteStorageAdapter {
             Ok(LocalSession {
                 id: row.get(0)?,
                 title: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                cwd: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                cwd: display_cwd(row.get::<_, Option<String>>(2)?.unwrap_or_default()),
                 model_provider: String::new(),
                 archived: row
                     .get::<_, Option<String>>(3)?

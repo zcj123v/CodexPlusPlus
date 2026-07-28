@@ -658,6 +658,36 @@ fn list_local_sessions_reads_codex_threads_ordered_by_update_time() {
 }
 
 #[test]
+fn list_local_sessions_normalizes_valid_extended_windows_cwd_for_display_only() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("state_5.sqlite");
+    let adapter = SQLiteStorageAdapter::new(&db_path, BackupStore::new(tmp.path().join("backups")));
+    let db = Connection::open(&db_path).unwrap();
+    db.execute(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, title TEXT, cwd TEXT, model_provider TEXT, archived INTEGER, updated_at_ms INTEGER)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES ('t1', 'r1.jsonl', 'First', ?1, 'custom', 0, 100)",
+        [r"\\?\C:\Users\zcj12\Documents\Codex\hello"],
+    )
+    .unwrap();
+    drop(db);
+
+    let sessions = adapter.list_local_sessions().unwrap();
+
+    assert_eq!(sessions[0].cwd, r"C:\Users\zcj12\Documents\Codex\hello");
+    let db = Connection::open(&db_path).unwrap();
+    let stored_cwd: String = db
+        .query_row("SELECT cwd FROM threads WHERE id = 't1'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(stored_cwd, r"\\?\C:\Users\zcj12\Documents\Codex\hello");
+}
+
+#[test]
 fn list_local_sessions_reads_codex_automation_runs_schema() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("codex-dev.db");
