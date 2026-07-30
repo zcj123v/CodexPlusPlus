@@ -1,8 +1,4 @@
-<<<<<<< HEAD
-use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value as SqlValue};
-=======
-use rusqlite::{Connection, DatabaseName, params_from_iter, types::Value as SqlValue};
->>>>>>> 2f0a4b1 (fix: harden Windows historical session repair)
+use rusqlite::{Connection, DatabaseName, OptionalExtension, params_from_iter, types::Value as SqlValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -594,7 +590,6 @@ pub fn run_provider_sync_with_target(
                 );
             }
         };
-<<<<<<< HEAD
     if require_stopped_app {
         let running_processes =
             codex_plus_core::watcher::find_session_index_cleanup_blocking_processes();
@@ -609,14 +604,19 @@ pub fn run_provider_sync_with_target(
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
-=======
+                &target_provider,
+                None,
+                0,
+                0,
+            );
+        }
+    }
     let enforce_process_guard = codex_home.is_none() || home == dirs_home().join(".codex");
     if enforce_process_guard {
         if let Some(message) = provider_sync_blocking_process_message() {
             return result(
                 ProviderSyncStatus::Skipped,
                 message,
->>>>>>> 2f0a4b1 (fix: harden Windows historical session repair)
                 &target_provider,
                 None,
                 0,
@@ -637,7 +637,6 @@ pub fn run_provider_sync_with_target(
     }
     let mut failure_backup_dir = None;
     let sync_result = (|| -> anyhow::Result<ProviderSyncResult> {
-<<<<<<< HEAD
         let sqlite_paths = provider_sync_db_paths(&home);
         let thread_kinds = sqlite_provider_sync_thread_kinds(&sqlite_paths)?;
         let repair_audit = match audit_provider_sync_state(&home, &sqlite_paths) {
@@ -655,6 +654,8 @@ pub fn run_provider_sync_with_target(
                 ProviderSyncAudit::default()
             }
         };
+        let extended_cwd_count =
+            codex_plus_core::codex_sqlite::count_windows_extended_thread_cwds(&home)?;
         let collected = collect_session_changes(
             &home,
             &target_provider,
@@ -663,11 +664,6 @@ pub fn run_provider_sync_with_target(
         )?;
         let mut subagent_thread_ids = thread_kinds.subagent_thread_ids;
         subagent_thread_ids.extend(collected.subagent_thread_ids.iter().cloned());
-=======
-        let extended_cwd_count =
-            codex_plus_core::codex_sqlite::count_windows_extended_thread_cwds(&home)?;
-        let collected = collect_session_changes(&home, &target_provider)?;
->>>>>>> 2f0a4b1 (fix: harden Windows historical session repair)
         let encrypted_content_warning =
             build_encrypted_content_warning(&collected.encrypted_content_counts, &target_provider);
         let rewrite_changes = collected
@@ -761,12 +757,8 @@ pub fn run_provider_sync_with_target(
                 &subagent_thread_ids,
             )?;
             let mut sqlite_updates = sqlite_updates;
-<<<<<<< HEAD
-            let catalog_repairs =
-=======
             sqlite_updates.cwd_rows += sanitized_cwds.updated;
-            sqlite_updates.catalog_insert_rows =
->>>>>>> 2f0a4b1 (fix: harden Windows historical session repair)
+            let catalog_repairs =
                 repair_missing_local_thread_catalog_rows(&sqlite_paths, &target_provider)?;
             sqlite_updates.catalog_insert_rows = catalog_repairs.inserted_rows;
             sqlite_updates.catalog_remove_rows = catalog_repairs.removed_rows;
@@ -2512,9 +2504,7 @@ fn apply_session_changes(
 }
 
 fn restore_session_changes(changes: &[SessionChange]) -> anyhow::Result<()> {
-    let mut errors = Vec::new();
     for change in changes {
-<<<<<<< HEAD
         if replace_session_text_if_unchanged(
             &change.path,
             &change.next_text,
@@ -2522,19 +2512,8 @@ fn restore_session_changes(changes: &[SessionChange]) -> anyhow::Result<()> {
         )? {
             restore_file_mtime(&change.path, change.original_mtime);
         }
-=======
-        if let Err(error) = fs::write(&change.path, &change.original_text) {
-            errors.push(format!("{}: {error}", change.path.to_string_lossy()));
-            continue;
-        }
-        restore_file_mtime(&change.path, change.original_mtime);
->>>>>>> 2f0a4b1 (fix: harden Windows historical session repair)
     }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        anyhow::bail!("{}", errors.join("; "))
-    }
+    Ok(())
 }
 
 fn replace_session_text_if_unchanged(
