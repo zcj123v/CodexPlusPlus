@@ -58,3 +58,10 @@
 - feature 分支命名：`codex/per-model-context` 或类似
 - 定期 `git fetch upstream && git rebase upstream/main` 保持同步
 - 目标：全栈完成后向主仓提 PR 合并
+
+## Fork 版本规则
+
+- 逻辑版本必须使用 `<上游版本>-linux.<fork序号>`：例如上游为 `1.2.43`、fork 第 4 次发布时为 `1.2.43-linux.4`；Release tag 使用 `v1.2.43-linux.4`。
+- 上游版本以 `upstream/main` 的 workspace `Cargo.toml` 为准；同一上游版本内只递增 `linux.<fork序号>`，切换到新的上游版本后从 `linux.1` 开始。
+- Arch `pkgver` 不允许连字符，打包时会将逻辑版本显示为 `1.2.43.linux.4`；包末尾的 `-<pkgrel>` 仅表示 Arch 打包修订，不得作为 fork 版本序号。
+- 新建 Release 前必须核对 `Cargo.toml`、Git tag 和发行说明中的逻辑版本一致，禁止把上游版本号当作 fork 版本递增。
