@@ -11,6 +11,10 @@ const DEFAULT_PROVIDER: &str = "openai";
 const SESSION_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
 const BACKUP_KEEP_COUNT: usize = 5;
 
+fn default_codex_home_dir() -> PathBuf {
+    codex_plus_core::codex_home::default_codex_home_dir()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderSyncStatus {
@@ -182,7 +186,7 @@ pub fn run_provider_sync_with_target(
 ) -> ProviderSyncResult {
     let home = codex_home
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| dirs_home().join(".codex"));
+        .unwrap_or_else(default_codex_home_dir);
     if !home.exists() {
         return result(
             ProviderSyncStatus::Skipped,
@@ -207,7 +211,7 @@ pub fn run_provider_sync_with_target(
                 );
             }
         };
-    let enforce_process_guard = codex_home.is_none() || home == dirs_home().join(".codex");
+    let enforce_process_guard = codex_home.is_none() || home == default_codex_home_dir();
     if enforce_process_guard {
         if let Some(message) = provider_sync_blocking_process_message() {
             return result(
@@ -419,13 +423,6 @@ fn result(
     }
 }
 
-fn dirs_home() -> PathBuf {
-    std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
 fn provider_sync_db_paths(home: &Path) -> Vec<PathBuf> {
     let mut paths = codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(home);
     for path in codex_plus_core::codex_sqlite::codex_thread_reference_db_paths_from_home(home) {
@@ -439,7 +436,7 @@ fn provider_sync_db_paths(home: &Path) -> Vec<PathBuf> {
 pub fn load_provider_sync_targets(codex_home: Option<&Path>) -> ProviderSyncTargetList {
     let home = codex_home
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| dirs_home().join(".codex"));
+        .unwrap_or_else(default_codex_home_dir);
     let current_provider = read_current_provider(&home.join("config.toml"));
     let mut sources: HashMap<String, HashSet<ProviderSyncTargetSource>> = HashMap::new();
 
@@ -984,7 +981,7 @@ pub fn preview_session_index_cleanup(
 ) -> anyhow::Result<SessionIndexCleanupPreview> {
     let home = codex_home
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| dirs_home().join(".codex"));
+        .unwrap_or_else(default_codex_home_dir);
     let sqlite_paths =
         codex_plus_core::codex_sqlite::codex_thread_reference_db_paths_from_home(&home);
     let live_thread_ids = collect_live_thread_ids(&home, &sqlite_paths)?;
@@ -1012,7 +1009,7 @@ pub fn apply_session_index_cleanup(
     }
     let home = codex_home
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| dirs_home().join(".codex"));
+        .unwrap_or_else(default_codex_home_dir);
     let lock_dir = home.join("tmp/provider-sync.lock");
     acquire_lock(&lock_dir).map_err(|error| cleanup_apply_error(error, None))?;
     let result = (|| {
