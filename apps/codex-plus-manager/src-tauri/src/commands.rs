@@ -3091,7 +3091,6 @@ pub async fn sync_providers_now(target_provider: Option<String>) -> CommandResul
                     "manager.sync_providers_now.after",
                 );
             }
-<<<<<<< HEAD
             let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
                 "manager.provider_sync.completed",
                 json!({
@@ -3111,36 +3110,6 @@ pub async fn sync_providers_now(target_provider: Option<String>) -> CommandResul
                 json!({ "message": error.to_string() }),
             );
             failed(&format!("供应商同步失败：{error}"), json!({}))
-=======
-            let payload = json!({
-                "syncStatus": sync.status,
-                "targetProvider": sync.target_provider,
-                "changedSessionFiles": sync.changed_session_files,
-                "skippedLockedRolloutFiles": sync.skipped_locked_rollout_files,
-                "sqliteRowsUpdated": sync.sqlite_rows_updated,
-                "sqliteProviderRowsUpdated": sync.sqlite_provider_rows_updated,
-                "sqliteUserEventRowsUpdated": sync.sqlite_user_event_rows_updated,
-                "sqliteCwdRowsUpdated": sync.sqlite_cwd_rows_updated,
-                "sqliteCatalogRowsInserted": sync.sqlite_catalog_rows_inserted,
-                "updatedWorkspaceRoots": sync.updated_workspace_roots,
-                "encryptedContentWarning": sync.encrypted_content_warning,
-                "backupDir": sync.backup_dir,
-                "syncMessage": sync.message,
-            });
-            if succeeded {
-                ok(
-                    &format!(
-                        "供应商已同步一次：{} 个会话文件，{} 行索引，跳过 {} 个占用文件。",
-                        sync.changed_session_files,
-                        sync.sqlite_rows_updated,
-                        sync.skipped_locked_rollout_files.len()
-                    ),
-                    payload,
-                )
-            } else {
-                failed(&sync.message, payload)
-            }
->>>>>>> 2f0a4b1 (fix: harden Windows historical session repair)
         }
     }
 }
