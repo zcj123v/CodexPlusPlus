@@ -275,20 +275,11 @@ pub fn find_macos_codex_app_default() -> Option<PathBuf> {
     find_macos_codex_app(&roots)
 }
 
-/// Well-known install roots of community Linux builds of the Codex desktop app
-/// (AUR package, deb/rpm layouts, portable installs).
+/// Well-known install roots of the community Linux build of the Codex desktop
+/// app (ilysenko/codex-desktop-linux native packages).
 #[cfg(target_os = "linux")]
 fn linux_codex_app_roots() -> Vec<PathBuf> {
-    let mut roots = vec![
-        PathBuf::from("/usr/lib/openai-codex-desktop"),
-        PathBuf::from("/opt/codex-desktop"),
-        PathBuf::from("/opt/openai-codex-desktop"),
-    ];
-    if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
-        roots.push(home.join(".local/share/codex-desktop"));
-        roots.push(home.join(".local/share/openai-codex-desktop"));
-    }
-    roots
+    vec![PathBuf::from("/opt/codex-desktop")]
 }
 
 #[cfg(target_os = "linux")]
@@ -398,7 +389,9 @@ pub fn normalize_codex_app_path(path: &Path) -> Option<PathBuf> {
     }
 
     let file_name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
-    if is_supported_app_executable_name(file_name) {
+    // 仅对文件应用可执行名捷径：目录可能恰好叫 codex-desktop（如
+    // /opt/codex-desktop），误判成可执行文件会错误地返回其父目录。
+    if !path.is_dir() && is_supported_app_executable_name(file_name) {
         return path.parent().map(Path::to_path_buf);
     }
 
@@ -729,8 +722,9 @@ pub(crate) fn is_supported_app_executable_name(name: &str) -> bool {
     if name.eq_ignore_ascii_case("Codex.exe") || name.eq_ignore_ascii_case("ChatGPT.exe") {
         return true;
     }
-    // Community Linux builds ship the Electron binary as `codex` / `codex-desktop`.
-    cfg!(target_os = "linux") && (name == "codex" || name == "codex-desktop")
+    // The community Linux build (ilysenko/codex-desktop-linux) ships the stock
+    // Electron binary as `electron`; some repacks rename it to `codex-desktop`.
+    cfg!(target_os = "linux") && (name == "electron" || name == "codex-desktop")
 }
 
 fn package_spec_from_path(path: &Path) -> Option<AppPackageSpec> {
@@ -774,11 +768,11 @@ fn package_entry_dir(package_dir: &Path, spec: AppPackageSpec) -> Option<PathBuf
 }
 
 fn executable_in_dir(dir: &Path) -> Option<PathBuf> {
-    // Linux 优先匹配社区版的 codex / codex-desktop 二进制,同时保留经典的
-    // exe 名称以兼容 Windows 布局的目录(便携包、共享目录等)。
+    // Linux 匹配社区版（ilysenko/codex-desktop-linux）的 electron 二进制，
+    // 同时保留 codex-desktop 与经典 exe 名称以兼容改名打包和 Windows 布局目录。
     #[cfg(target_os = "linux")]
     const FALLBACK_EXECUTABLES: &[&str] = &[
-        "codex",
+        "electron",
         "codex-desktop",
         "ChatGPT.exe",
         "Codex.exe",
