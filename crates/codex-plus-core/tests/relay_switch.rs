@@ -344,9 +344,14 @@ fn switch_captures_safe_app_state_before_writing_provider_config() {
         .unwrap(),
     )
     .unwrap();
+    // 路径分隔符按平台归一化（见 normalize_desktop_path）：Windows 用反斜杠，其他平台用正斜杠。
+    #[cfg(windows)]
+    let expected_workspace_roots = serde_json::json!(["C:\\work\\app"]);
+    #[cfg(not(windows))]
+    let expected_workspace_roots = serde_json::json!(["C:/work/app"]);
     assert_eq!(
         snapshot["state"]["electron-saved-workspace-roots"],
-        serde_json::json!(["C:\\work\\app"])
+        expected_workspace_roots
     );
     assert_eq!(
         snapshot["state"]["electron-persisted-atom-state"]["default-service-tier"],

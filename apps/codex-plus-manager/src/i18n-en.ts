@@ -17,8 +17,8 @@ export const EN_PLAIN: Record<string, string> = {
   "Codex 意外停止": "Codex stopped unexpectedly",
   "Codex 版本": "Codex version",
   "Codex 目标": "Codex goals",
-  "Codex++ 官方中转站，主打稳定接入和划算价格，支持 GPT-5.6 全系列、Fable 5、Sonnet 5、GPT-5.5、GPT-5.4、Claude Opus 4.8、Claude Opus 4.7、gpt-image-2 等模型与图像能力。":
-    "The official Codex++ relay, built for stable access and good value, supporting the full GPT-5.6 family, Fable 5, Sonnet 5, GPT-5.5, GPT-5.4, Claude Opus 4.8, Claude Opus 4.7, gpt-image-2 and other models plus image capabilities.",
+  "JOJO Code 提供稳定、价格合理的 API 中转服务，支持 GPT-5.6 全系列、Fable 5、Sonnet 5、GPT-5.5、GPT-5.4、Claude Opus 4.8、Claude Opus 4.7、gpt-image-2 等模型与图像能力。":
+    "JOJO Code provides a stable, competitively priced API relay supporting the full GPT-5.6 family, Fable 5, Sonnet 5, GPT-5.5, GPT-5.4, Claude Opus 4.8, Claude Opus 4.7, gpt-image-2 and other models plus image capabilities.",
   "Codex++ 导入": "Codex++ import",
   "Codex++ 版本": "Codex++ version",
   "Codex-Dream-Skin 风格主题和换图": "Codex-Dream-Skin style themes and image replacement",
@@ -236,6 +236,12 @@ export const EN_PLAIN: Record<string, string> = {
   "从 Word 等富文本粘贴到 Codex composer 时只保留纯文本，避免被识别为图片/文件附件。需重启 Codex 才生效。":
     "Keeps only plain text when pasting rich text (e.g. from Word) into the Codex composer, avoiding it being treated as an image/file attachment. Requires restarting Codex.",
   "从上游获取": "Fetch from upstream",
+  "获取倍率": "Fetch multiplier",
+  "尝试从sub2api获取倍率显示": "Try fetching the multiplier display from sub2api",
+  "保存前可先尝试从 /v1/sub2api/billing 获取上游倍率。":
+    "Before saving, you can try fetching the upstream multiplier from /v1/sub2api/billing.",
+  "非 Sub2API 供应商不会请求或显示倍率。": "Non-Sub2API providers do not request or display a multiplier.",
+  "Sub2API 倍率未获取": "Sub2API multiplier not fetched",
   "从最新 upstream 分支创建 Git worktree。": "Create a Git worktree from the latest upstream branch.",
   "从环境变量和 config.toml 的 /v1/models 拉取模型并补进模型列表。":
     "Pull models from environment variables and config.toml's /v1/models and add them to the model list.",
@@ -403,7 +409,7 @@ export const EN_PLAIN: Record<string, string> = {
   "安装维护": "Install & maintenance",
   "完整增强": "Full enhancement",
   "官方": "Official",
-  "官方中转站": "Official relay",
+  "项目赞助商": "Project sponsor",
   "官方混入 API Key": "Official mixed-in API Key",
   "官方混合 API 不应在 auth.json 中保存 OPENAI_API_KEY。请清理此供应商的 auth.json 后再切换。":
     "Official mixed API should not store OPENAI_API_KEY in auth.json. Clear this provider's auth.json before switching.",
@@ -614,11 +620,12 @@ export const EN_PLAIN: Record<string, string> = {
   "模式。": " mode.",
   "正在下载安装包…": "Downloading installer…",
   "正在打开下载页面…": "Opening download page…",
+  "正在写入安装包…": "Writing installer…",
   "正在下载插件市场快照…": "Downloading plugin marketplace snapshot…",
   "正在修复…": "Repairing…",
   "正在修复历史会话": "Repairing historical sessions",
   "正在准备安装包下载…": "Preparing installer download…",
-  "正在启动安装包…": "Launching installer…",
+  "下载或启动耗时较长，请保持窗口打开；完成或失败后会自动更新状态。": "The download or launch is taking longer than usual. Keep this window open; the status will update when it finishes or fails.",
   "正在写入 Codex 配置…": "Writing Codex config…",
   "正在写入修复与备份…": "Writing repairs and backups…",
   "正在删除…": "Deleting…",
@@ -860,6 +867,8 @@ export const EN_TEMPLATE: Record<string, string> = {
   "删除选中的 {0} 个会话？此操作会删除本地数据库记录和 rollout 文件，并为每个会话创建备份。\n\n{1}{2}":
     "Delete the {0} selected session(s)? This deletes the local database records and rollout files, and creates a backup for each session.\n\n{1}{2}",
   "发现 {0} 个 Codex 供应商": "Found {0} Codex provider(s)",
+  "当前缓存倍率：{0}x": "Current cache multiplier: {0}x",
+  "Sub2API 倍率 {0}x": "Sub2API multiplier {0}x",
   "发现新版本 {0}": "New version {0} available",
   "在 GitHub 上支持作者：{0}": "Support the author on GitHub: {0}",
   "检测到 TUN 模式已开启，请在 Clash Verge Rev 中关闭。配置：{0}":
