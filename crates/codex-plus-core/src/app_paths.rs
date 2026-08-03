@@ -858,14 +858,14 @@ pub(crate) fn is_supported_app_executable_name(name: &str) -> bool {
     if name.eq_ignore_ascii_case("Codex.exe") || name.eq_ignore_ascii_case("ChatGPT.exe") {
         return true;
     }
-    // Linux（无扩展名）
-    #[cfg(target_os = "linux")]
-    {
-        if name.eq_ignore_ascii_case("Codex") || name.eq_ignore_ascii_case("ChatGPT") {
-            return true;
-        }
-    }
-    false
+    // Linux：官方包（openai-codex-desktop）的 Electron 二进制名为 `ChatGPT`；
+    // 社区包（ilysenko/codex-desktop-linux）直接用 `electron`，部分改名打包为
+    // `codex-desktop`；便携包/共享目录仍可能出现无扩展名的 `Codex`。
+    cfg!(target_os = "linux")
+        && (name == "ChatGPT"
+            || name == "Codex"
+            || name == "electron"
+            || name == "codex-desktop")
 }
 
 fn package_spec_from_path(path: &Path) -> Option<AppPackageSpec> {

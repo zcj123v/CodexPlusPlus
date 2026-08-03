@@ -68,3 +68,33 @@ fn codex_app_version_ignores_corrupt_asar() {
         None
     );
 }
+
+// 社区 Linux 版（ilysenko/codex-desktop-linux）把 Electron 二进制命名为
+// `electron`，旧 AUR/自建版的 `codex` 二进制不再受支持。
+#[cfg(target_os = "linux")]
+#[test]
+fn normalize_codex_app_path_accepts_dir_with_electron_binary() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("codex-desktop");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(app_dir.join("electron"), b"#!/bin/sh\n").unwrap();
+
+    assert_eq!(
+        codex_plus_core::app_paths::normalize_codex_app_path(&app_dir),
+        Some(app_dir.clone())
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn normalize_codex_app_path_rejects_dir_with_legacy_codex_binary() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("openai-codex-desktop");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(app_dir.join("codex"), b"#!/bin/sh\n").unwrap();
+
+    assert_eq!(
+        codex_plus_core::app_paths::normalize_codex_app_path(&app_dir),
+        None
+    );
+}
