@@ -1,2 +1,2 @@
-- 本分支面向社区 Linux 构建版 Codex Desktop；官方桌面版及其他版本可能可用，但不保证
+- 本分支面向社区 Linux 构建版 Codex Desktop（[ilysenko/codex-desktop-linux](https://github.com/ilysenko/codex-desktop-linux)，安装根 `/opt/codex-desktop`）；官方桌面版及其他社区构建（旧 AUR 包等）可能可用，但不保证
 - 提供 Linux x86_64 构建（Arch .pkg.tar.zst 与 Debian .deb）；其他系统或架构可能可用，但不保证
