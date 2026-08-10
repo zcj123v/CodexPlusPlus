@@ -731,13 +731,6 @@ impl LaunchHooks for DefaultLaunchHooks {
         settings: &BackendSettings,
         extra_args: &[String],
     ) -> anyhow::Result<CodexLaunch> {
-        if settings.enhancements_enabled {
-            let home = crate::relay_config::default_codex_home_dir();
-            crate::codex_app_state::prepare_projectless_main_window_nonfatal(
-                &home,
-                "launcher.prelaunch",
-            );
-        }
         #[cfg(target_os = "linux")]
         {
             // A Codex instance started without our debug port would swallow this
