@@ -290,11 +290,18 @@ fn linux_process_matches_codex_desktop(exe_target: &str, cmdline: &str) -> bool 
     if exe_target.contains("codex-desktop") || exe_target.contains("openai-codex") {
         return true;
     }
+    // 官方 Linux 桌面版（openai-codex-desktop）的 Electron 二进制名为 ChatGPT
+    // （如 /usr/lib/chatgpt/ChatGPT）。
+    if exe_target.ends_with("/ChatGPT") {
+        return true;
+    }
     // Distro packages symlink the app binary to a shared Electron runtime
     // (e.g. /usr/lib/electron42/electron), so the exe link alone cannot
     // identify the app — match the app.asar argument in the command line.
     cmdline.contains("app.asar")
-        && (cmdline.contains("codex-desktop") || cmdline.contains("openai-codex"))
+        && (cmdline.contains("codex-desktop")
+            || cmdline.contains("openai-codex")
+            || cmdline.contains("chatgpt"))
 }
 
 #[cfg(target_os = "linux")]
@@ -650,4 +657,33 @@ fn startup_shortcut_path() -> Option<PathBuf> {
             .join("Startup")
             .join(WATCHER_STARTUP_SHORTCUT_NAME)
     })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_process_match_tests {
+    use super::linux_process_matches_codex_desktop;
+
+    #[test]
+    fn matches_official_chatgpt_binary_path() {
+        assert!(linux_process_matches_codex_desktop(
+            "/usr/lib/chatgpt/ChatGPT",
+            "/usr/lib/chatgpt/ChatGPT\0--remote-debugging-port=9229\0",
+        ));
+    }
+
+    #[test]
+    fn matches_official_app_asar_cmdline() {
+        assert!(linux_process_matches_codex_desktop(
+            "/usr/lib/electron42/electron",
+            "/usr/lib/electron42/electron\0/usr/lib/chatgpt/resources/app.asar\0",
+        ));
+    }
+
+    #[test]
+    fn ignores_unrelated_chatgpt_named_cli_without_asar() {
+        assert!(!linux_process_matches_codex_desktop(
+            "/home/user/.local/bin/chatgpt",
+            "chatgpt\0--ask\0",
+        ));
+    }
 }
