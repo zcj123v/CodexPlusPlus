@@ -85,6 +85,22 @@ fn normalize_codex_app_path_accepts_dir_with_electron_binary() {
     );
 }
 
+// 官方 Linux 包（openai-codex-desktop）把 Electron 二进制命名为 `ChatGPT`，
+// 安装根为 /usr/lib/chatgpt。
+#[cfg(target_os = "linux")]
+#[test]
+fn normalize_codex_app_path_accepts_dir_with_chatgpt_binary() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("chatgpt");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(app_dir.join("ChatGPT"), b"#!/bin/sh\n").unwrap();
+
+    assert_eq!(
+        codex_plus_core::app_paths::normalize_codex_app_path(&app_dir),
+        Some(app_dir.clone())
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn normalize_codex_app_path_rejects_dir_with_legacy_codex_binary() {
