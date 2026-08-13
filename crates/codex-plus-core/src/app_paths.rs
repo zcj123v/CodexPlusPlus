@@ -271,11 +271,15 @@ pub fn find_macos_codex_app_default() -> Option<PathBuf> {
     find_macos_codex_app(&roots)
 }
 
-/// Well-known install roots of the community Linux build of the Codex desktop
-/// app (ilysenko/codex-desktop-linux native packages).
+/// Well-known install roots of Linux desktop app packages: the official
+/// openai-codex-desktop package (/usr/lib/chatgpt) first, then the community
+/// build (ilysenko/codex-desktop-linux native packages).
 #[cfg(target_os = "linux")]
 fn linux_codex_app_roots() -> Vec<PathBuf> {
-    vec![PathBuf::from("/opt/codex-desktop")]
+    vec![
+        PathBuf::from("/usr/lib/chatgpt"),
+        PathBuf::from("/opt/codex-desktop"),
+    ]
 }
 
 #[cfg(target_os = "linux")]
@@ -285,15 +289,19 @@ pub fn find_linux_codex_app_default() -> Option<PathBuf> {
         .find(|root| executable_in_dir(root).is_some())
 }
 
-/// Wrapper scripts shipped by Linux packages of the Codex desktop app. They
-/// start the local webview server and set ELECTRON_RENDERER_URL before
-/// exec'ing Electron, so launching them is required for the app to render.
+/// Wrapper scripts shipped by Linux packages of the desktop app. The official
+/// package's wrapper (/usr/bin/chatgpt, also linked as /usr/bin/codex-desktop)
+/// applies Wayland/ozone flags and forwards our arguments to the Electron
+/// binary; the community build's wrapper additionally starts the local webview
+/// server and sets ELECTRON_RENDERER_URL before exec'ing Electron.
 #[cfg(target_os = "linux")]
-fn linux_codex_wrapper_candidates() -> Vec<PathBuf> {
-    let mut candidates = vec![
-        PathBuf::from("/usr/bin/codex-desktop"),
-        PathBuf::from("/usr/local/bin/codex-desktop"),
-    ];
+fn linux_codex_wrapper_candidates(app_dir: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if app_dir == Path::new("/usr/lib/chatgpt") {
+        candidates.push(PathBuf::from("/usr/bin/chatgpt"));
+    }
+    candidates.push(PathBuf::from("/usr/bin/codex-desktop"));
+    candidates.push(PathBuf::from("/usr/local/bin/codex-desktop"));
     if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
         candidates.push(home.join(".local/bin/codex-desktop"));
     }
@@ -488,10 +496,11 @@ pub fn build_codex_executable(app_dir: &Path) -> PathBuf {
     #[cfg(target_os = "linux")]
     {
         // Distro packages install into well-known roots and ship a wrapper
-        // script that prepares the webview server; prefer it for those roots.
+        // script; prefer it for those roots (the community wrapper prepares
+        // the webview server, the official wrapper applies platform flags).
         // Other directories keep their own executable (portable bundles etc.).
         if linux_codex_app_roots().iter().any(|root| root == app_dir) {
-            if let Some(wrapper) = linux_codex_wrapper_candidates()
+            if let Some(wrapper) = linux_codex_wrapper_candidates(app_dir)
                 .into_iter()
                 .find(|wrapper| wrapper.is_file())
             {
@@ -752,9 +761,11 @@ pub(crate) fn is_supported_app_executable_name(name: &str) -> bool {
     if name.eq_ignore_ascii_case("Codex.exe") || name.eq_ignore_ascii_case("ChatGPT.exe") {
         return true;
     }
-    // The community Linux build (ilysenko/codex-desktop-linux) ships the stock
-    // Electron binary as `electron`; some repacks rename it to `codex-desktop`.
-    cfg!(target_os = "linux") && (name == "electron" || name == "codex-desktop")
+    // The official Linux package (openai-codex-desktop) ships the Electron
+    // binary as `ChatGPT`; the community build (ilysenko/codex-desktop-linux)
+    // ships the stock Electron binary as `electron`; some repacks rename it to
+    // `codex-desktop`.
+    cfg!(target_os = "linux") && (name == "ChatGPT" || name == "electron" || name == "codex-desktop")
 }
 
 fn package_spec_from_path(path: &Path) -> Option<AppPackageSpec> {
@@ -795,10 +806,12 @@ fn package_entry_dir(package_dir: &Path, spec: AppPackageSpec) -> Option<PathBuf
 }
 
 fn executable_in_dir(dir: &Path) -> Option<PathBuf> {
-    // Linux 匹配社区版（ilysenko/codex-desktop-linux）的 electron 二进制，
+    // Linux 匹配官方包（openai-codex-desktop）的 ChatGPT 二进制与社区版
+    // （ilysenko/codex-desktop-linux）的 electron 二进制，
     // 同时保留 codex-desktop 与经典 exe 名称以兼容改名打包和 Windows 布局目录。
     #[cfg(target_os = "linux")]
     const FALLBACK_EXECUTABLES: &[&str] = &[
+        "ChatGPT",
         "electron",
         "codex-desktop",
         "ChatGPT.exe",
