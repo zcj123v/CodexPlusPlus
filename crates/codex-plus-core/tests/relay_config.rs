@@ -816,6 +816,95 @@ experimental_bearer_token = "sk-test-redacted"
 }
 
 #[test]
+fn backfill_repairs_local_proxy_with_fallback_port() {
+    // 端口回退后 live config 指向非默认端口的本地代理，回填必须识别并恢复真实上游，
+    // 否则代理地址会被当成 upstreamBaseUrl 存库，helper 自我转发形成自环。
+    let temp = tempfile::tempdir().unwrap();
+    let profile = RelayProfile {
+        id: "custom".to_string(),
+        relay_mode: RelayMode::PureApi,
+        protocol: RelayProtocol::Responses,
+        base_url: "https://responses.example.test/v1".to_string(),
+        upstream_base_url: "https://responses.example.test/v1".to_string(),
+        config_contents: r#"model = "gpt-5.6-sol"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "https://responses.example.test/v1"
+"#
+        .to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"sk-test-redacted"}"#.to_string(),
+        ..RelayProfile::default()
+    };
+
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+    let config_path = temp.path().join("config.toml");
+    let updated = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(
+        &config_path,
+        updated.replace(
+            "https://responses.example.test/v1",
+            "http://127.0.0.1:57345/v1",
+        ),
+    )
+    .unwrap();
+
+    let mut backfilled = profile.clone();
+    let mut common = String::new();
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut backfilled, &mut common)
+        .unwrap();
+    assert!(
+        !backfilled.config_contents.contains("127.0.0.1"),
+        "回填后 config_contents 不应残留本地代理地址: {}",
+        backfilled.config_contents
+    );
+    assert_eq!(
+        codex_plus_core::relay_config::relay_profile_base_url(&backfilled),
+        "https://responses.example.test/v1"
+    );
+}
+
+#[test]
+fn normalize_drops_polluted_local_proxy_upstream_base_url() {
+    // 带单模型路由时 upstream_base_url 会被原样采信；若它已被污染成本地代理地址
+    // （任意端口），normalize 不得照单存库，应回退到 config_contents 里的真实上游。
+    let mut profile = RelayProfile {
+        id: "custom".to_string(),
+        relay_mode: RelayMode::PureApi,
+        protocol: RelayProtocol::Responses,
+        base_url: "http://127.0.0.1:57345/v1".to_string(),
+        upstream_base_url: "http://127.0.0.1:57345/v1".to_string(),
+        config_contents: r#"model = "gpt-5.6-sol"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "https://responses.example.test/v1"
+"#
+        .to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"sk-test-redacted"}"#.to_string(),
+        model_routes: vec![RelayModelRoute {
+            model: "gpt-5.6-luna".to_string(),
+            target_relay_id: "target".to_string(),
+            target_model: String::new(),
+        }],
+        ..RelayProfile::default()
+    };
+
+    normalize_relay_profile_for_storage(&mut profile).unwrap();
+    assert_eq!(
+        profile.upstream_base_url, "https://responses.example.test/v1",
+        "本地代理地址不得写入 upstream_base_url"
+    );
+    assert_eq!(profile.base_url, "https://responses.example.test/v1");
+}
+
+#[test]
 fn responses_profile_with_model_routes_uses_local_proxy_and_preserves_upstream() {
     let temp = tempfile::tempdir().unwrap();
     let mut profile = RelayProfile {

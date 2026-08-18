@@ -886,13 +886,9 @@ pub fn backfill_relay_profile_from_home_with_common(
     profile.config_contents =
         restore_profile_provider_id_for_backfill(&profile.config_contents, &template_config)?;
     if profile.protocol == RelayProtocol::Responses
-        && provider_string_from_config(&profile.config_contents, "base_url").as_deref()
-            == Some(
-                crate::protocol_proxy::local_responses_proxy_base_url(
-                    crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
-                )
-                .as_str(),
-            )
+        && provider_string_from_config(&profile.config_contents, "base_url")
+            .as_deref()
+            .is_some_and(is_local_proxy_base_url)
         && !template_base_url.trim().is_empty()
     {
         let mut doc = parse_toml_document(&profile.config_contents)?;
@@ -2532,20 +2528,21 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
         );
     }
     if profile.has_model_routes() {
-        if !profile.upstream_base_url.trim().is_empty() {
+        if !profile.upstream_base_url.trim().is_empty()
+            && !is_local_proxy_base_url(profile.upstream_base_url.trim())
+        {
             return profile.upstream_base_url.trim().to_string();
         }
         if !profile.base_url.trim().is_empty()
-            && profile.base_url.trim()
-                != crate::protocol_proxy::local_responses_proxy_base_url(
-                    crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
-                )
+            && !is_local_proxy_base_url(profile.base_url.trim())
         {
             return profile.base_url.trim().to_string();
         }
     }
     if relay_protocol_uses_local_responses_proxy(profile.protocol) {
-        if !profile.upstream_base_url.trim().is_empty() {
+        if !profile.upstream_base_url.trim().is_empty()
+            && !is_local_proxy_base_url(profile.upstream_base_url.trim())
+        {
             return profile.upstream_base_url.trim().to_string();
         }
         if let Some(value) = root_key_string(&profile.config_contents, CHAT_UPSTREAM_BASE_URL_KEY)
@@ -2553,7 +2550,9 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
         {
             return value;
         }
-        if !profile.base_url.trim().is_empty() {
+        if !profile.base_url.trim().is_empty()
+            && !is_local_proxy_base_url(profile.base_url.trim())
+        {
             return profile.base_url.trim().to_string();
         }
     }
@@ -2561,10 +2560,7 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_default();
     if relay_protocol_uses_local_responses_proxy(profile.protocol)
-        && provider_base_url
-            == crate::protocol_proxy::local_responses_proxy_base_url(
-                crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
-            )
+        && is_local_proxy_base_url(&provider_base_url)
     {
         String::new()
     } else if !provider_base_url.is_empty() {
