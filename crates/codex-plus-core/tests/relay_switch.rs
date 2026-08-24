@@ -348,7 +348,12 @@ fn switch_captures_safe_app_state_before_writing_provider_config() {
     .unwrap();
     assert_eq!(
         snapshot["state"]["electron-saved-workspace-roots"],
-        serde_json::json!(["C:\\work\\app"])
+        if cfg!(windows) {
+            serde_json::json!(["C:\\work\\app"])
+        } else {
+            // 非 Windows 平台不做正斜杠→反斜杠转换（见 fix: stop writing Windows path formats）
+            serde_json::json!(["C:/work/app"])
+        }
     );
     assert_eq!(
         snapshot["state"]["electron-persisted-atom-state"]["default-service-tier"],

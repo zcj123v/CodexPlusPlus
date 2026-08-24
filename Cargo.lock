@@ -418,23 +418,7 @@ dependencies = [
 
 [[package]]
 name = "codex-plus-core"
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
-version = "1.2.52"
-=======
-version = "1.2.42-linux.1"
->>>>>>> 9efb02f (chore(release): align package version with v1.2.42-linux.1)
-=======
-version = "1.2.42-linux.2"
->>>>>>> d97f8f9 (chore(release): bump fork version to v1.2.42-linux.2)
-=======
-version = "1.2.44-linux.1"
->>>>>>> 2f0a4b1 (fix: harden Windows historical session repair)
-=======
-version = "1.2.43-linux.4"
->>>>>>> 8823088 (fix: sanitize custom message ids for official sessions)
+version = "1.2.52-linux.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -464,23 +448,7 @@ dependencies = [
 
 [[package]]
 name = "codex-plus-data"
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
-version = "1.2.52"
-=======
-version = "1.2.42-linux.1"
->>>>>>> 9efb02f (chore(release): align package version with v1.2.42-linux.1)
-=======
-version = "1.2.42-linux.2"
->>>>>>> d97f8f9 (chore(release): bump fork version to v1.2.42-linux.2)
-=======
-version = "1.2.44-linux.1"
->>>>>>> 2f0a4b1 (fix: harden Windows historical session repair)
-=======
-version = "1.2.43-linux.4"
->>>>>>> 8823088 (fix: sanitize custom message ids for official sessions)
+version = "1.2.52-linux.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -497,23 +465,7 @@ dependencies = [
 
 [[package]]
 name = "codex-plus-launcher"
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
-version = "1.2.52"
-=======
-version = "1.2.42-linux.1"
->>>>>>> 9efb02f (chore(release): align package version with v1.2.42-linux.1)
-=======
-version = "1.2.42-linux.2"
->>>>>>> d97f8f9 (chore(release): bump fork version to v1.2.42-linux.2)
-=======
-version = "1.2.44-linux.1"
->>>>>>> 2f0a4b1 (fix: harden Windows historical session repair)
-=======
-version = "1.2.43-linux.4"
->>>>>>> 8823088 (fix: sanitize custom message ids for official sessions)
+version = "1.2.52-linux.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -527,23 +479,7 @@ dependencies = [
 
 [[package]]
 name = "codex-plus-manager"
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
-version = "1.2.52"
-=======
-version = "1.2.42-linux.1"
->>>>>>> 9efb02f (chore(release): align package version with v1.2.42-linux.1)
-=======
-version = "1.2.42-linux.2"
->>>>>>> d97f8f9 (chore(release): bump fork version to v1.2.42-linux.2)
-=======
-version = "1.2.44-linux.1"
->>>>>>> 2f0a4b1 (fix: harden Windows historical session repair)
-=======
-version = "1.2.43-linux.4"
->>>>>>> 8823088 (fix: sanitize custom message ids for official sessions)
+version = "1.2.52-linux.1"
 dependencies = [
  "anyhow",
  "async-trait",

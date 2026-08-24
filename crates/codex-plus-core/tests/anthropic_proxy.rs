@@ -1096,6 +1096,7 @@ async fn aggregate_failover_to_anthropic_member() {
         aggregate_relay_profiles: vec![AggregateRelayProfile {
             id: aggregate_id,
             name: "Task 8 Aggregate Profile".to_string(),
+            session_provider: Default::default(),
             strategy: AggregateRelayStrategy::Failover,
             members: vec![
                 AggregateRelayMember {

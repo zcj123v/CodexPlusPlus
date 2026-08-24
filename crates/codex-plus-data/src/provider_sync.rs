@@ -462,14 +462,20 @@ pub fn run_remote_control_session_finalization_for_thread_with_target(
             .filter(|change| change.rewrite_needed)
             .cloned()
             .collect::<Vec<_>>();
-        let backup_dir = create_backup(&home, target_provider, &rewrite_changes)?;
-        let applied = apply_session_changes(&rewrite_changes)?;
+        let backup = create_backup(&home, target_provider, &rewrite_changes)?;
+        let applied = match apply_session_changes(&rewrite_changes) {
+            Ok(applied) => applied,
+            Err(ApplySessionChangesError { error, applied }) => {
+                let _ = restore_session_changes(&applied.changes);
+                return Err(error);
+            }
+        };
         if !rollout_file_matches_provider(&rollout_path, thread_id, target_provider)? {
             let mut deferred = result(
                 ProviderSyncStatus::Skipped,
                 "Remote Control session finalization deferred for a changed or locked rollout",
                 target_provider,
-                Some(backup_dir),
+                Some(backup.directory),
                 applied.changes.len(),
                 0,
             );
@@ -494,7 +500,7 @@ pub fn run_remote_control_session_finalization_for_thread_with_target(
             ProviderSyncStatus::Synced,
             "Remote Control session finalization complete",
             target_provider,
-            Some(backup_dir),
+            Some(backup.directory),
             applied.changes.len(),
             sqlite_updates.total(),
         );
@@ -611,7 +617,8 @@ pub fn run_provider_sync_with_target(
             );
         }
     }
-    let enforce_process_guard = codex_home.is_none() || home == dirs_home().join(".codex");
+    let enforce_process_guard =
+        codex_home.is_none() || home == default_codex_home_dir();
     if enforce_process_guard {
         if let Some(message) = provider_sync_blocking_process_message() {
             return result(

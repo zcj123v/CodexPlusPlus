@@ -1163,18 +1163,17 @@ async fn apply_image_handling(relay: &crate::settings::RelayProfile, body: &mut 
                     base_url: relay.vlm_base_url.clone(),
                 };
 
-                    for key in &["messages", "input"] {
-                        if let Some(arr) = body.get_mut(key).and_then(Value::as_array_mut) {
-                            crate::vision::strip_image_blocks(
-                                arr,
-                                &vlm_config,
-                                &relay.model_windows,
-                                &relay.context_window,
-                                &model,
-                                relay.protocol == crate::settings::RelayProtocol::Responses,
-                            )
-                            .await;
-                        }
+                for key in &["messages", "input"] {
+                    if let Some(arr) = body.get_mut(key).and_then(Value::as_array_mut) {
+                        crate::vision::strip_image_blocks(
+                            arr,
+                            &vlm_config,
+                            &relay.model_windows,
+                            &relay.context_window,
+                            &model,
+                            relay.protocol == crate::settings::RelayProtocol::Responses,
+                        )
+                        .await;
                     }
                 }
             }

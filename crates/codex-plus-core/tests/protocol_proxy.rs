@@ -7,7 +7,7 @@ use codex_plus_core::protocol_proxy::{
     is_responses_compact_proxy_path, is_responses_proxy_path, models_url,
     open_audio_transcriptions_proxy_request, open_chat_completions_proxy_request,
     open_models_proxy_request, open_models_proxy_request_with_identity,
-    open_models_proxy_request_with_originator, open_responses_proxy_request,
+    open_responses_proxy_request,
     open_responses_proxy_request_with_settings,
     open_responses_proxy_request_with_settings_for_path, responses_compact_url,
     responses_error_from_upstream, responses_to_chat_completions, responses_url,
@@ -1825,7 +1825,7 @@ async fn model_route_uses_target_responses_provider_without_mutating_request() {
     });
     let settings = model_route_settings("gpt-5.6-luna", "", format!("http://{target_addr}/v1"));
 
-    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings, None)
         .await
         .unwrap();
     assert_eq!(result.status_code, 200);
@@ -1860,7 +1860,7 @@ async fn model_route_can_rewrite_only_the_target_model_name() {
         format!("http://{target_addr}/v1"),
     );
 
-    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings, None)
         .await
         .unwrap();
     assert_eq!(result.status_code, 200);
@@ -1916,7 +1916,7 @@ async fn model_route_uses_exact_match_and_keeps_other_models_on_source_provider(
         model_route_settings("gpt-5.6-luna", "", "http://127.0.0.1:9/v1".to_string());
     settings.relay_profiles[0].base_url = format!("http://{source_addr}/v1");
 
-    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings, None)
         .await
         .unwrap();
     assert_eq!(result.status_code, 200);
@@ -1937,6 +1937,7 @@ async fn model_route_rejects_missing_or_non_responses_targets() {
     let error = open_responses_proxy_request_with_settings(
         r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
         missing,
+        None,
     )
     .await
     .err()
@@ -1948,6 +1949,7 @@ async fn model_route_rejects_missing_or_non_responses_targets() {
     let error = open_responses_proxy_request_with_settings(
         r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
         chat,
+        None,
     )
     .await
     .err()

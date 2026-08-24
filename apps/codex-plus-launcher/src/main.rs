@@ -1365,6 +1365,10 @@ mod tests {
             Ok(())
         }
 
+        async fn run_remote_control_session_recovery(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
         async fn start_helper(&self, helper_port: u16) -> anyhow::Result<u16> {
             self.event(format!("start-helper:{helper_port}"));
             Ok(helper_port + self.helper_port_fallback_offset)
@@ -1413,7 +1417,11 @@ mod tests {
             self.event(format!("status:{status}"));
         }
 
-        async fn wait_for_codex_exit(&self, _launch: &CodexLaunch) -> anyhow::Result<()> {
+        async fn wait_for_codex_exit(
+            &self,
+            _launch: &CodexLaunch,
+            _debug_port: u16,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
 
