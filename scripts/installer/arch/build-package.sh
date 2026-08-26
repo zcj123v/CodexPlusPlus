@@ -26,8 +26,11 @@ if [[ ! "$arch_version" =~ ^[0-9][A-Za-z0-9._+]*$ ]]; then
 fi
 
 # 1. Build the frontend (the Tauri manager embeds it at compile time).
-if [[ ! -d "$repo_root/apps/codex-plus-manager/dist" ]]; then
-  (cd "$repo_root/apps/codex-plus-manager" && npm install --package-lock=false && npm run vite:build)
+# dist 存在不代表新鲜:src 有更新时必须重建,否则会把旧前端打进包里。
+frontend_dir="$repo_root/apps/codex-plus-manager"
+dist_index="$frontend_dir/dist/index.html"
+if [[ ! -f "$dist_index" ]] || [[ -n "$(find "$frontend_dir/src" -newer "$dist_index" -print -quit 2>/dev/null)" ]]; then
+  (cd "$frontend_dir" && npm install --package-lock=false && npm run vite:build)
 fi
 
 # 2. Build release binaries.
