@@ -1085,6 +1085,10 @@ fn should_handle_backend_exit(wait_succeeded: bool, cancelled: bool) -> bool {
     wait_succeeded && !cancelled
 }
 
+fn backend_codex_gone_message() -> &'static str {
+    "Codex 已退出，跳过后端重启"
+}
+
 #[cfg(target_os = "linux")]
 fn backend_is_alive(debug_port: u16) -> bool {
     !codex_plus_core::watcher::find_codex_processes().is_empty()
@@ -1100,17 +1104,47 @@ fn monitor_is_current(current: &Option<BackendMonitorState>, cancel: &Arc<Atomic
 }
 
 #[cfg(target_os = "linux")]
+fn wait_error_cleanup_message(
+    wait_error: &std::io::Error,
+    cleanup_error: Option<&std::io::Error>,
+) -> String {
+    match cleanup_error {
+        Some(cleanup_error) => {
+            format!("wait failed: {wait_error}; cleanup failed: {cleanup_error}")
+        }
+        None => format!("wait failed: {wait_error}; cleanup succeeded"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_after_wait_error(
+    child: &mut std::process::Child,
+    wait_error: std::io::Error,
+) -> std::io::Error {
+    let kill_error = child.kill().err();
+    let reap_error = child.wait().err();
+    let cleanup_error = reap_error.or(kill_error);
+    std::io::Error::new(
+        wait_error.kind(),
+        wait_error_cleanup_message(&wait_error, cleanup_error.as_ref()),
+    )
+}
+
+#[cfg(target_os = "linux")]
 fn stop_child(child: &mut std::process::Child) -> std::io::Result<std::process::ExitStatus> {
     match child.try_wait() {
         Ok(Some(status)) => Ok(status),
         Ok(None) => {
-            let _ = child.kill();
-            child.wait()
+            let kill_result = child.kill();
+            let wait_result = child.wait();
+            match (kill_result, wait_result) {
+                (Ok(()), Ok(status)) => Ok(status),
+                (kill_result, wait_result) => Err(std::io::Error::other(format!(
+                    "kill result: {kill_result:?}; wait result: {wait_result:?}"
+                ))),
+            }
         }
-        Err(error) => {
-            let _ = child.kill();
-            child.wait().or(Err(error))
-        }
+        Err(error) => Err(cleanup_after_wait_error(child, error)),
     }
 }
 
@@ -1123,9 +1157,10 @@ fn wait_for_backend_child(
         if cancel.load(Ordering::SeqCst) {
             return stop_child(child);
         }
-        match child.try_wait()? {
-            Some(status) => return Ok(status),
-            None => std::thread::sleep(Duration::from_millis(100)),
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(error) => return Err(cleanup_after_wait_error(child, error)),
         }
     }
 }
@@ -1215,6 +1250,12 @@ fn monitor_backend(
                 return;
             }
             if !backend_is_alive(request.debug_port) {
+                let _ = save_requested_launch_status(
+                    &request,
+                    "failed",
+                    backend_codex_gone_message(),
+                    current_timestamp_ms(),
+                );
                 return;
             }
             match codex_plus_core::install::spawn_companion_child(
@@ -6541,6 +6582,21 @@ mod tests {
         assert!(!should_handle_backend_exit(false, true));
         assert!(!should_handle_backend_exit(true, true));
         assert!(should_handle_backend_exit(true, false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn backend_wait_error_cleanup_message_keeps_both_errors() {
+        let wait_error = std::io::Error::other("try wait failed");
+        let cleanup_error = std::io::Error::other("cleanup wait failed");
+        let message = wait_error_cleanup_message(&wait_error, Some(&cleanup_error));
+        assert!(message.contains("try wait failed"));
+        assert!(message.contains("cleanup wait failed"));
+    }
+
+    #[test]
+    fn backend_codex_gone_message_describes_skipped_restart() {
+        assert_eq!(backend_codex_gone_message(), "Codex 已退出，跳过后端重启");
     }
 
     #[cfg(target_os = "linux")]
