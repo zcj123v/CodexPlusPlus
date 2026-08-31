@@ -13,6 +13,16 @@ test("launch status ignores a terminal result from an older request", () => {
   );
 });
 
+test("launch status keeps automatic restart pending", () => {
+  assert.equal(
+    resolveLaunchStatus(
+      { status: "starting", message: "Codex++ 后端正在重启", started_at_ms: 101 },
+      100,
+    ),
+    "pending",
+  );
+});
+
 test("launch status waits while the current request is starting", () => {
   assert.equal(
     resolveLaunchStatus(
