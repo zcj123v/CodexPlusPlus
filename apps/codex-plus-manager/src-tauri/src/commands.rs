@@ -950,21 +950,7 @@ fn spawn_codex_plus_launch(
             "app_path": request.app_path.trim()
         }),
     );
-    if let Err(error) = save_requested_launch_status(
-        &request,
-        "starting",
-        "Codex++ launcher is starting",
-        launch_started_at_ms,
-    ) {
-        return failed(
-            &format!("记录启动状态失败，未执行启动：{error}"),
-            json!({
-                "debugPort": debug_port,
-                "helperPort": helper_port
-            }),
-        );
-    }
-    match spawn_silent_launcher(&request) {
+    match spawn_silent_launcher_with_status(&request, Some(launch_started_at_ms)) {
         Ok(()) => CommandResult {
             status: "accepted".to_string(),
             message: accepted_message.to_string(),
@@ -1178,6 +1164,44 @@ where
     BackendRetryOutcome::Exhausted
 }
 
+fn monitor_retry_cycle<T, Before, Sleep, Attempt>(
+    exit_success: bool,
+    cancelled: bool,
+    codex_alive: bool,
+    retry_count: &mut u32,
+    window_started: Instant,
+    cancel: &AtomicBool,
+    delays: &[Duration],
+    before_retry: Before,
+    sleep: Sleep,
+    attempt: Attempt,
+) -> Option<BackendRetryOutcome<T>>
+where
+    Before: FnMut(u32),
+    Sleep: FnMut(Duration) -> bool,
+    Attempt: FnMut(u32) -> BackendRetryAttempt<T>,
+{
+    if should_restart_after_exit(
+        exit_success,
+        cancelled,
+        codex_alive,
+        *retry_count,
+        window_started.elapsed().as_secs(),
+    ) {
+        Some(retry_backend_spawn(
+            retry_count,
+            window_started,
+            cancel,
+            delays,
+            before_retry,
+            sleep,
+            attempt,
+        ))
+    } else {
+        None
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn backend_is_alive(debug_port: u16) -> bool {
     !codex_plus_core::watcher::find_codex_processes().is_empty()
@@ -1204,8 +1228,22 @@ fn save_monitor_status_if_current(
     status: &str,
     message: &str,
 ) {
-    let Ok(current) = backend_monitor_cancel().lock() else {
-        return;
+    let current = match backend_monitor_cancel().lock() {
+        Ok(current) => current,
+        Err(error) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.backend_status_write_failed",
+                json!({
+                    "message": "backend monitor state lock is poisoned",
+                    "error": error.to_string(),
+                    "status": status,
+                    "status_message": message,
+                    "debug_port": request.debug_port,
+                    "helper_port": request.helper_port,
+                }),
+            );
+            return;
+        }
     };
     if can_write_monitor_status(
         monitor_is_current(&current, cancel),
@@ -1329,25 +1367,10 @@ fn monitor_backend(
             json!({ "exit": format!("{exit_status:?}"), "codex_alive": codex_alive }),
         );
         let cancelled = cancel.load(Ordering::SeqCst);
-        if !should_restart_after_exit(
+        let outcome = monitor_retry_cycle(
             exit_status.success(),
             cancelled,
             codex_alive,
-            retry_count,
-            window_started.elapsed().as_secs(),
-        ) {
-            if !exit_status.success() && !cancelled {
-                save_monitor_status_if_current(
-                    &request,
-                    &cancel,
-                    "failed",
-                    backend_exit_status_message(codex_alive),
-                );
-            }
-            return;
-        }
-
-        let outcome = retry_backend_spawn(
             &mut retry_count,
             window_started,
             &cancel,
@@ -1400,6 +1423,17 @@ fn monitor_backend(
                 }
             },
         );
+        let Some(outcome) = outcome else {
+            if !exit_status.success() && !cancelled {
+                save_monitor_status_if_current(
+                    &request,
+                    &cancel,
+                    "failed",
+                    backend_exit_status_message(codex_alive),
+                );
+            }
+            return;
+        };
         match outcome {
             BackendRetryOutcome::Spawned(next_child) => {
                 child = next_child;
@@ -1482,12 +1516,27 @@ fn spawn_silent_launcher_locked(request: &LaunchRequest) -> anyhow::Result<()> {
     }
 }
 
-fn spawn_silent_launcher(request: &LaunchRequest) -> anyhow::Result<()> {
+fn spawn_silent_launcher_with_status(
+    request: &LaunchRequest,
+    starting_at_ms: Option<u64>,
+) -> anyhow::Result<()> {
     let Ok(_operation) = backend_monitor_operation().lock() else {
         return Err(anyhow::anyhow!("后台 launcher 生命周期锁已损坏"));
     };
     stop_backend_monitor_locked();
+    if let Some(starting_at_ms) = starting_at_ms {
+        save_requested_launch_status(
+            request,
+            "starting",
+            "Codex++ launcher is starting",
+            starting_at_ms,
+        )?;
+    }
     spawn_silent_launcher_locked(request)
+}
+
+fn spawn_silent_launcher(request: &LaunchRequest) -> anyhow::Result<()> {
+    spawn_silent_launcher_with_status(request, None)
 }
 
 pub fn start_weixin_connect_from_saved_settings() {
@@ -6758,22 +6807,27 @@ mod tests {
     fn backend_monitor_retry_chain_retries_failures_then_continues_new_child() {
         let cancel = AtomicBool::new(false);
         let mut retry_count = 0;
+        let mut retry_statuses = Vec::new();
         let mut outcomes = vec![
             BackendRetryAttempt::SpawnFailed,
             BackendRetryAttempt::SpawnFailed,
             BackendRetryAttempt::Spawned("new-child"),
         ];
-        let outcome = retry_backend_spawn(
+        let outcome = monitor_retry_cycle(
+            false,
+            false,
+            true,
             &mut retry_count,
             Instant::now(),
             &cancel,
             &[Duration::ZERO; 3],
-            |_| {},
+            |retry| retry_statuses.push(retry),
             |_| true,
             |_| outcomes.remove(0),
         );
-        assert_eq!(outcome, BackendRetryOutcome::Spawned("new-child"));
+        assert_eq!(outcome, Some(BackendRetryOutcome::Spawned("new-child")));
         assert_eq!(retry_count, 3);
+        assert_eq!(retry_statuses, vec![1, 2, 3]);
 
         let mut retry_count = 0;
         let mut outcomes = vec![
@@ -6781,7 +6835,10 @@ mod tests {
             BackendRetryAttempt::SpawnFailed,
             BackendRetryAttempt::SpawnFailed,
         ];
-        let outcome = retry_backend_spawn(
+        let outcome = monitor_retry_cycle(
+            false,
+            false,
+            true,
             &mut retry_count,
             Instant::now(),
             &cancel,
@@ -6790,7 +6847,7 @@ mod tests {
             |_| true,
             |_| outcomes.remove(0),
         );
-        assert_eq!(outcome, BackendRetryOutcome::Exhausted);
+        assert_eq!(outcome, Some(BackendRetryOutcome::Exhausted));
         assert_eq!(retry_count, 3);
     }
 
