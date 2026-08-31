@@ -2,7 +2,7 @@ use codex_plus_core::install::{
     InstallOptions, MANAGER_BUNDLE_ID, SILENT_BINARY, SILENT_BUNDLE_ID, app_bundle_names,
     build_linux_desktop_entries, build_macos_app_bundle, build_windows_entrypoint_plan,
     companion_binary_path_from_exe, default_install_root_strategy,
-    macos_companion_bundle_identifier_from_exe, shortcut_names,
+    macos_companion_bundle_identifier_from_exe, shortcut_names, spawn_companion_child,
 };
 
 #[test]
@@ -299,4 +299,16 @@ fn default_install_root_strategy_matches_platform() {
     } else {
         assert_eq!(strategy, "user-dirs-desktop");
     }
+}
+
+// macOS 上的 bundle 启动分支与普通二进制路径不同，这里只在 Linux 上验证
+// spawn_companion_child 的错误路径（不会启动真实 Codex）。
+#[cfg(target_os = "linux")]
+#[test]
+fn tracked_companion_api_returns_spawn_error_for_missing_binary() {
+    let result: anyhow::Result<std::process::Child> = spawn_companion_child(
+        "codex-plus-plus-test-binary-that-does-not-exist",
+        std::iter::empty::<&str>(),
+    );
+    assert!(result.is_err());
 }

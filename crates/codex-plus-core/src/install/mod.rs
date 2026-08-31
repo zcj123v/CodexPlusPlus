@@ -311,9 +311,22 @@ where
         }
     }
 
+    // 普通二进制路径：启动后丢弃 Child，仅返回路径字符串（detached 调用方兼容）。
+    spawn_companion_child(binary, args)?;
+    let path = companion_binary_path(binary);
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// 启动 companion 并返回可等待的 [`std::process::Child`]，供 manager 等调用方直接
+/// 监督进程生命周期；macOS 的 bundle 启动分支仍由 [`spawn_companion`] 处理。
+pub fn spawn_companion_child<I, S>(binary: &str, args: I) -> anyhow::Result<std::process::Child>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let path = companion_binary_path(binary);
     let mut command = Command::new(&path);
-    command.args(&args);
+    command.args(args);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -321,8 +334,7 @@ where
     }
     command
         .spawn()
-        .map_err(|error| anyhow::anyhow!("无法启动 {}：{error}", path.to_string_lossy()))?;
-    Ok(path.to_string_lossy().to_string())
+        .map_err(|error| anyhow::anyhow!("无法启动 {}：{error}", path.to_string_lossy()))
 }
 
 pub fn macos_companion_bundle_identifier_from_exe(
