@@ -27,11 +27,15 @@ fn backend_monitor_cancel() -> &'static Mutex<Option<Arc<AtomicBool>>> {
     BACKEND_MONITOR_CANCEL.get_or_init(|| Mutex::new(None))
 }
 
+fn cancel_backend_monitor_locked(current: &mut Option<Arc<AtomicBool>>) {
+    if let Some(cancel) = current.take() {
+        cancel.store(true, Ordering::SeqCst);
+    }
+}
+
 pub(crate) fn stop_backend_monitor() {
     if let Ok(mut current) = backend_monitor_cancel().lock() {
-        if let Some(cancel) = current.take() {
-            cancel.store(true, Ordering::SeqCst);
-        }
+        cancel_backend_monitor_locked(&mut current);
     }
 }
 
@@ -673,7 +677,13 @@ pub fn restart_codex_plus(request: LaunchRequest) -> CommandResult<Value> {
             }),
         );
     }
-    stop_backend_monitor();
+    let Ok(mut backend_lifecycle) = backend_monitor_cancel().lock() else {
+        return failed(
+            "后台 launcher 生命周期锁已损坏，请重启管理器后再试。",
+            json!({}),
+        );
+    };
+    cancel_backend_monitor_locked(&mut backend_lifecycle);
     codex_plus_core::watcher::stop_launcher_processes_and_wait();
     codex_plus_core::watcher::stop_codex_processes_for_debug_port_and_wait(request.debug_port);
     let home = codex_plus_core::relay_config::default_codex_home_dir();
@@ -702,7 +712,9 @@ pub fn restart_codex_plus(request: LaunchRequest) -> CommandResult<Value> {
             }),
         );
     }
-    match restart_codex_plus_after_stop(&request, &home, settings.as_ref(), spawn_silent_launcher) {
+    match restart_codex_plus_after_stop(&request, &home, settings.as_ref(), |request| {
+        spawn_silent_launcher_locked(request, &mut backend_lifecycle)
+    }) {
         Ok(()) => CommandResult {
             status: "accepted".to_string(),
             message: "Codex 已请求重启，启动任务正在后台运行。".to_string(),
@@ -958,12 +970,25 @@ fn save_requested_launch_status(
     message: &str,
     started_at_ms: u64,
 ) -> anyhow::Result<()> {
-    StatusStore::default().save_latest(&requested_launch_status(
+    let result = StatusStore::default().save_latest(&requested_launch_status(
         request,
         status,
         message,
         started_at_ms,
-    ))
+    ));
+    if let Err(error) = &result {
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "manager.backend_status_write_failed",
+            json!({
+                "message": error.to_string(),
+                "status": status,
+                "status_message": message,
+                "debug_port": request.debug_port,
+                "helper_port": request.helper_port,
+            }),
+        );
+    }
+    result
 }
 
 fn requested_launch_status(
@@ -1016,6 +1041,38 @@ fn should_restart_backend(
     !cancelled && codex_alive && retry_count < 3 && window_age_seconds < 5 * 60
 }
 
+const BACKEND_RETRY_WINDOW: Duration = Duration::from_secs(5 * 60);
+const BACKEND_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+    Duration::from_secs(8),
+];
+
+fn retry_window_allows(window_started: Instant, delay: Duration) -> bool {
+    window_started
+        .elapsed()
+        .checked_add(delay)
+        .is_some_and(|elapsed| elapsed < BACKEND_RETRY_WINDOW)
+}
+
+fn should_handle_backend_exit(wait_succeeded: bool, cancelled: bool) -> bool {
+    wait_succeeded && !cancelled
+}
+
+#[cfg(target_os = "linux")]
+fn backend_is_alive(debug_port: u16) -> bool {
+    !codex_plus_core::watcher::find_codex_processes().is_empty()
+        || codex_plus_core::watcher::cdp_listening(debug_port)
+}
+
+#[cfg(target_os = "linux")]
+fn monitor_is_current(current: &Option<Arc<AtomicBool>>, cancel: &Arc<AtomicBool>) -> bool {
+    current
+        .as_ref()
+        .is_some_and(|active| Arc::ptr_eq(active, cancel))
+        && !cancel.load(Ordering::SeqCst)
+}
+
 #[cfg(target_os = "linux")]
 fn monitor_backend(
     request: LaunchRequest,
@@ -1025,18 +1082,34 @@ fn monitor_backend(
     let mut retry_count = 0;
     let window_started = Instant::now();
     loop {
-        let exit_status = child.wait();
-        if cancel.load(Ordering::SeqCst) {
+        let wait_result = child.wait();
+        if !should_handle_backend_exit(wait_result.is_ok(), cancel.load(Ordering::SeqCst)) {
+            if let Err(error) = wait_result {
+                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                    "manager.backend_wait_failed",
+                    json!({
+                        "message": error.to_string(),
+                        "debug_port": request.debug_port,
+                        "helper_port": request.helper_port,
+                    }),
+                );
+                let _ = save_requested_launch_status(
+                    &request,
+                    "failed",
+                    "Codex++ 后端进程等待失败",
+                    current_timestamp_ms(),
+                );
+            }
             return;
         }
-        let codex_alive = !codex_plus_core::watcher::find_codex_processes().is_empty()
-            || codex_plus_core::watcher::cdp_listening(request.debug_port);
+        let exit_status = wait_result.expect("successful wait result checked above");
+        let codex_alive = backend_is_alive(request.debug_port);
         let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
             "manager.backend_exit",
             json!({ "exit": format!("{exit_status:?}"), "codex_alive": codex_alive }),
         );
         if !should_restart_backend(
-            false,
+            cancel.load(Ordering::SeqCst),
             codex_alive,
             retry_count,
             window_started.elapsed().as_secs(),
@@ -1052,7 +1125,11 @@ fn monitor_backend(
             return;
         }
         let mut next_child = None;
-        while retry_count < 3 && window_started.elapsed().as_secs() < 5 * 60 {
+        while retry_count < 3 {
+            let delay = BACKEND_RETRY_DELAYS[retry_count as usize];
+            if !retry_window_allows(window_started, delay) {
+                break;
+            }
             retry_count += 1;
             let _ = save_requested_launch_status(
                 &request,
@@ -1060,12 +1137,28 @@ fn monitor_backend(
                 "Codex++ 后端正在重启",
                 current_timestamp_ms(),
             );
-            let delay_ms = [1_000, 3_000, 8_000][(retry_count - 1) as usize];
-            for _ in 0..delay_ms / 100 {
+            for _ in 0..delay.as_millis() / 100 {
                 if cancel.load(Ordering::SeqCst) {
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(100));
+            }
+            let Ok(lifecycle) = backend_monitor_cancel().lock() else {
+                let _ = save_requested_launch_status(
+                    &request,
+                    "failed",
+                    "Codex++ 后端生命周期锁已损坏",
+                    current_timestamp_ms(),
+                );
+                return;
+            };
+            if !monitor_is_current(&lifecycle, &cancel)
+                || !retry_window_allows(window_started, Duration::ZERO)
+            {
+                return;
+            }
+            if !backend_is_alive(request.debug_port) {
+                return;
             }
             match codex_plus_core::install::spawn_companion_child(
                 SILENT_BINARY,
@@ -1096,25 +1189,54 @@ fn monitor_backend(
     }
 }
 
-fn spawn_silent_launcher(request: &LaunchRequest) -> anyhow::Result<()> {
+fn spawn_silent_launcher_locked(
+    request: &LaunchRequest,
+    current: &mut Option<Arc<AtomicBool>>,
+) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        stop_backend_monitor();
         let child =
             codex_plus_core::install::spawn_companion_child(SILENT_BINARY, launch_args(request))?;
         let cancel = Arc::new(AtomicBool::new(false));
-        if let Ok(mut current) = backend_monitor_cancel().lock() {
-            *current = Some(cancel.clone());
+        *current = Some(cancel.clone());
+        let monitor_request = request.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("codex-plus-backend-monitor".to_string())
+            .spawn(move || monitor_backend(monitor_request, child, cancel))
+        {
+            current.take();
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.backend_monitor_spawn_failed",
+                json!({
+                    "message": error.to_string(),
+                    "debug_port": request.debug_port,
+                    "helper_port": request.helper_port,
+                }),
+            );
+            let _ = save_requested_launch_status(
+                request,
+                "failed",
+                "Codex++ 后端监控线程启动失败",
+                current_timestamp_ms(),
+            );
+            return Err(anyhow::anyhow!("无法启动 Codex++ 后端监控线程：{error}"));
         }
-        let request = request.clone();
-        std::thread::spawn(move || monitor_backend(request, child, cancel));
         return Ok(());
     }
 
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = current;
         codex_plus_core::install::spawn_companion(SILENT_BINARY, launch_args(request)).map(|_| ())
     }
+}
+
+fn spawn_silent_launcher(request: &LaunchRequest) -> anyhow::Result<()> {
+    let Ok(mut lifecycle) = backend_monitor_cancel().lock() else {
+        return Err(anyhow::anyhow!("后台 launcher 生命周期锁已损坏"));
+    };
+    cancel_backend_monitor_locked(&mut lifecycle);
+    spawn_silent_launcher_locked(request, &mut lifecycle)
 }
 
 pub fn start_weixin_connect_from_saved_settings() {
@@ -6338,6 +6460,58 @@ mod tests {
         assert!(!should_restart_backend(false, false, 0, 0));
         assert!(!should_restart_backend(false, true, 3, 0));
         assert!(!should_restart_backend(false, true, 0, 5 * 60));
+    }
+
+    #[test]
+    fn backend_wait_failure_is_not_handled_as_an_exit() {
+        assert!(!should_handle_backend_exit(false, false));
+        assert!(!should_handle_backend_exit(false, true));
+        assert!(!should_handle_backend_exit(true, true));
+        assert!(should_handle_backend_exit(true, false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn backend_monitor_uses_only_the_current_uncancelled_token() {
+        let current = Arc::new(AtomicBool::new(false));
+        let replacement = Arc::new(AtomicBool::new(false));
+        assert!(monitor_is_current(&Some(current.clone()), &current));
+        assert!(!monitor_is_current(&Some(replacement), &current));
+        current.store(true, Ordering::SeqCst);
+        assert!(!monitor_is_current(&Some(current.clone()), &current));
+    }
+
+    #[test]
+    fn backend_retry_window_includes_backoff_before_spawn() {
+        assert!(retry_window_allows(Instant::now(), Duration::from_secs(1)));
+        let near_window_end = Instant::now()
+            .checked_sub(Duration::from_secs(299))
+            .expect("test instant subtraction should succeed");
+        assert!(!retry_window_allows(
+            near_window_end,
+            Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn launch_args_are_reused_for_the_complete_launcher_invocation() {
+        let request = LaunchRequest {
+            app_path: "  /opt/codex  ".to_string(),
+            debug_port: 9333,
+            helper_port: 57322,
+            sync_active_relay: false,
+        };
+        assert_eq!(
+            launch_args(&request),
+            vec![
+                "--app-path",
+                "/opt/codex",
+                "--debug-port",
+                "9333",
+                "--helper-port",
+                "57322",
+            ]
+        );
     }
 
     #[cfg(windows)]

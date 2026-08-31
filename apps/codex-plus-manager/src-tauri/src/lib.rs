@@ -328,6 +328,7 @@ fn register_main_window_events<R: tauri::Runtime>(
 
             if transient {
                 APP_EXITING.store(true, Ordering::SeqCst);
+                commands::stop_backend_monitor();
                 close_event_app.exit(0);
                 return;
             }
