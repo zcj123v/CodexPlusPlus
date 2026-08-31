@@ -1089,6 +1089,14 @@ fn backend_codex_gone_message() -> &'static str {
     "Codex 已退出，跳过后端重启"
 }
 
+fn backend_exit_status_message(codex_alive: bool) -> &'static str {
+    if codex_alive {
+        "Codex++ 后端意外退出"
+    } else {
+        backend_codex_gone_message()
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn backend_is_alive(debug_port: u16) -> bool {
     !codex_plus_core::watcher::find_codex_processes().is_empty()
@@ -1200,20 +1208,21 @@ fn monitor_backend(
             "manager.backend_exit",
             json!({ "exit": format!("{exit_status:?}"), "codex_alive": codex_alive }),
         );
+        if cancel.load(Ordering::SeqCst) {
+            return;
+        }
         if !should_restart_backend(
-            cancel.load(Ordering::SeqCst),
+            false,
             codex_alive,
             retry_count,
             window_started.elapsed().as_secs(),
         ) {
-            if codex_alive {
-                let _ = save_requested_launch_status(
-                    &request,
-                    "failed",
-                    "Codex++ 后端意外退出",
-                    current_timestamp_ms(),
-                );
-            }
+            let _ = save_requested_launch_status(
+                &request,
+                "failed",
+                backend_exit_status_message(codex_alive),
+                current_timestamp_ms(),
+            );
             return;
         }
         let mut next_child = None;
@@ -6597,6 +6606,15 @@ mod tests {
     #[test]
     fn backend_codex_gone_message_describes_skipped_restart() {
         assert_eq!(backend_codex_gone_message(), "Codex 已退出，跳过后端重启");
+    }
+
+    #[test]
+    fn backend_exit_status_messages_cover_both_codex_states() {
+        assert_eq!(backend_exit_status_message(true), "Codex++ 后端意外退出");
+        assert_eq!(
+            backend_exit_status_message(false),
+            "Codex 已退出，跳过后端重启"
+        );
     }
 
     #[cfg(target_os = "linux")]
