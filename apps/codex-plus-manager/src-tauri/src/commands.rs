@@ -1097,6 +1097,77 @@ fn backend_exit_status_message(codex_alive: bool) -> &'static str {
     }
 }
 
+fn reset_retry_epoch_if_stable(
+    child_started: Instant,
+    exited_at: Instant,
+    retry_count: &mut u32,
+    window_started: &mut Instant,
+) {
+    if exited_at.duration_since(child_started) >= BACKEND_RETRY_WINDOW {
+        *retry_count = 0;
+        *window_started = exited_at;
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BackendRetryAttempt<T> {
+    Spawned(T),
+    SpawnFailed,
+    CodexGone,
+    Cancelled,
+    WindowExpired,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BackendRetryOutcome<T> {
+    Spawned(T),
+    Exhausted,
+    CodexGone,
+    Cancelled,
+    WindowExpired,
+}
+
+fn retry_backend_spawn<T, Before, Sleep, Attempt>(
+    retry_count: &mut u32,
+    window_started: Instant,
+    cancel: &AtomicBool,
+    delays: &[Duration],
+    mut before_retry: Before,
+    mut sleep: Sleep,
+    mut attempt: Attempt,
+) -> BackendRetryOutcome<T>
+where
+    Before: FnMut(u32),
+    Sleep: FnMut(Duration) -> bool,
+    Attempt: FnMut(u32) -> BackendRetryAttempt<T>,
+{
+    while (*retry_count as usize) < delays.len() {
+        if cancel.load(Ordering::SeqCst) {
+            return BackendRetryOutcome::Cancelled;
+        }
+        let delay = delays[*retry_count as usize];
+        if !retry_window_allows(window_started, delay) {
+            return BackendRetryOutcome::WindowExpired;
+        }
+        *retry_count += 1;
+        before_retry(*retry_count);
+        if !sleep(delay) || cancel.load(Ordering::SeqCst) {
+            return BackendRetryOutcome::Cancelled;
+        }
+        if !retry_window_allows(window_started, Duration::ZERO) {
+            return BackendRetryOutcome::WindowExpired;
+        }
+        match attempt(*retry_count) {
+            BackendRetryAttempt::Spawned(child) => return BackendRetryOutcome::Spawned(child),
+            BackendRetryAttempt::SpawnFailed => {}
+            BackendRetryAttempt::CodexGone => return BackendRetryOutcome::CodexGone,
+            BackendRetryAttempt::Cancelled => return BackendRetryOutcome::Cancelled,
+            BackendRetryAttempt::WindowExpired => return BackendRetryOutcome::WindowExpired,
+        }
+    }
+    BackendRetryOutcome::Exhausted
+}
+
 #[cfg(target_os = "linux")]
 fn backend_is_alive(debug_port: u16) -> bool {
     !codex_plus_core::watcher::find_codex_processes().is_empty()
@@ -1178,9 +1249,11 @@ fn monitor_backend(
     request: LaunchRequest,
     mut child: std::process::Child,
     cancel: Arc<AtomicBool>,
+    child_started: Instant,
 ) {
     let mut retry_count = 0;
-    let window_started = Instant::now();
+    let mut child_started = child_started;
+    let mut window_started = child_started;
     loop {
         let wait_result = wait_for_backend_child(&mut child, &cancel);
         if !should_handle_backend_exit(wait_result.is_ok(), cancel.load(Ordering::SeqCst)) {
@@ -1203,6 +1276,13 @@ fn monitor_backend(
             return;
         }
         let exit_status = wait_result.expect("successful wait result checked above");
+        let exited_at = Instant::now();
+        reset_retry_epoch_if_stable(
+            child_started,
+            exited_at,
+            &mut retry_count,
+            &mut window_started,
+        );
         let codex_alive = backend_is_alive(request.debug_port);
         let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
             "manager.backend_exit",
@@ -1225,40 +1305,67 @@ fn monitor_backend(
             );
             return;
         }
-        let mut next_child = None;
-        while retry_count < 3 {
-            let delay = BACKEND_RETRY_DELAYS[retry_count as usize];
-            if !retry_window_allows(window_started, delay) {
-                break;
-            }
-            retry_count += 1;
-            let _ = save_requested_launch_status(
-                &request,
-                "starting",
-                "Codex++ 后端正在重启",
-                current_timestamp_ms(),
-            );
-            for _ in 0..delay.as_millis() / 100 {
-                if cancel.load(Ordering::SeqCst) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            let Ok(lifecycle) = backend_monitor_cancel().lock() else {
+
+        let outcome = retry_backend_spawn(
+            &mut retry_count,
+            window_started,
+            &cancel,
+            &BACKEND_RETRY_DELAYS,
+            |retry_count| {
                 let _ = save_requested_launch_status(
                     &request,
-                    "failed",
-                    "Codex++ 后端生命周期锁已损坏",
+                    "starting",
+                    "Codex++ 后端正在重启",
                     current_timestamp_ms(),
                 );
-                return;
-            };
-            if !monitor_is_current(&lifecycle, &cancel)
-                || !retry_window_allows(window_started, Duration::ZERO)
-            {
-                return;
+                let _ = retry_count;
+            },
+            |delay| {
+                for _ in 0..delay.as_millis() / 100 {
+                    if cancel.load(Ordering::SeqCst) {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                true
+            },
+            |retry_count| {
+                let Ok(lifecycle) = backend_monitor_cancel().lock() else {
+                    return BackendRetryAttempt::WindowExpired;
+                };
+                if !monitor_is_current(&lifecycle, &cancel)
+                    || !retry_window_allows(window_started, Duration::ZERO)
+                {
+                    return if cancel.load(Ordering::SeqCst) {
+                        BackendRetryAttempt::Cancelled
+                    } else {
+                        BackendRetryAttempt::WindowExpired
+                    };
+                }
+                if !backend_is_alive(request.debug_port) {
+                    return BackendRetryAttempt::CodexGone;
+                }
+                match codex_plus_core::install::spawn_companion_child(
+                    SILENT_BINARY,
+                    launch_args(&request),
+                ) {
+                    Ok(child) => BackendRetryAttempt::Spawned(child),
+                    Err(error) => {
+                        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                            "manager.backend_restart_failed",
+                            json!({ "message": error.to_string(), "retry_count": retry_count }),
+                        );
+                        BackendRetryAttempt::SpawnFailed
+                    }
+                }
+            },
+        );
+        match outcome {
+            BackendRetryOutcome::Spawned(next_child) => {
+                child = next_child;
+                child_started = Instant::now();
             }
-            if !backend_is_alive(request.debug_port) {
+            BackendRetryOutcome::CodexGone => {
                 let _ = save_requested_launch_status(
                     &request,
                     "failed",
@@ -1267,32 +1374,17 @@ fn monitor_backend(
                 );
                 return;
             }
-            match codex_plus_core::install::spawn_companion_child(
-                SILENT_BINARY,
-                launch_args(&request),
-            ) {
-                Ok(child) => {
-                    next_child = Some(child);
-                    break;
-                }
-                Err(error) => {
-                    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-                        "manager.backend_restart_failed",
-                        json!({ "message": error.to_string(), "retry_count": retry_count }),
-                    );
-                }
+            BackendRetryOutcome::Cancelled => return,
+            BackendRetryOutcome::WindowExpired | BackendRetryOutcome::Exhausted => {
+                let _ = save_requested_launch_status(
+                    &request,
+                    "failed",
+                    "Codex++ 后端重启失败",
+                    current_timestamp_ms(),
+                );
+                return;
             }
         }
-        let Some(next_child) = next_child else {
-            let _ = save_requested_launch_status(
-                &request,
-                "failed",
-                "Codex++ 后端重启失败",
-                current_timestamp_ms(),
-            );
-            return;
-        };
-        child = next_child;
     }
 }
 
@@ -1305,6 +1397,7 @@ fn spawn_silent_launcher_locked(request: &LaunchRequest) -> anyhow::Result<()> {
     {
         let child =
             codex_plus_core::install::spawn_companion_child(SILENT_BINARY, launch_args(request))?;
+        let child_started = Instant::now();
         let cancel = Arc::new(AtomicBool::new(false));
         let child_slot = Arc::new(Mutex::new(Some(child)));
         let monitor_child_slot = Arc::clone(&child_slot);
@@ -1320,7 +1413,7 @@ fn spawn_silent_launcher_locked(request: &LaunchRequest) -> anyhow::Result<()> {
                 else {
                     return;
                 };
-                monitor_backend(monitor_request, child, monitor_cancel);
+                monitor_backend(monitor_request, child, monitor_cancel, child_started);
             }) {
             Ok(join) => join,
             Err(error) => {
@@ -6583,6 +6676,65 @@ mod tests {
         assert!(!should_restart_backend(false, false, 0, 0));
         assert!(!should_restart_backend(false, true, 3, 0));
         assert!(!should_restart_backend(false, true, 0, 5 * 60));
+    }
+
+    #[test]
+    fn backend_monitor_stable_exit_starts_a_new_retry_epoch() {
+        let child_started = Instant::now()
+            .checked_sub(BACKEND_RETRY_WINDOW + Duration::from_secs(1))
+            .expect("test instant subtraction should succeed");
+        let mut window_started = Instant::now()
+            .checked_sub(Duration::from_secs(400))
+            .expect("test instant subtraction should succeed");
+        let mut retry_count = 2;
+        reset_retry_epoch_if_stable(
+            child_started,
+            Instant::now(),
+            &mut retry_count,
+            &mut window_started,
+        );
+        assert_eq!(retry_count, 0);
+        assert!(window_started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn backend_monitor_retry_chain_retries_failures_then_continues_new_child() {
+        let cancel = AtomicBool::new(false);
+        let mut retry_count = 0;
+        let mut outcomes = vec![
+            BackendRetryAttempt::SpawnFailed,
+            BackendRetryAttempt::SpawnFailed,
+            BackendRetryAttempt::Spawned("new-child"),
+        ];
+        let outcome = retry_backend_spawn(
+            &mut retry_count,
+            Instant::now(),
+            &cancel,
+            &[Duration::ZERO; 3],
+            |_| {},
+            |_| true,
+            |_| outcomes.remove(0),
+        );
+        assert_eq!(outcome, BackendRetryOutcome::Spawned("new-child"));
+        assert_eq!(retry_count, 3);
+
+        let mut retry_count = 0;
+        let mut outcomes = vec![
+            BackendRetryAttempt::<&str>::SpawnFailed,
+            BackendRetryAttempt::SpawnFailed,
+            BackendRetryAttempt::SpawnFailed,
+        ];
+        let outcome = retry_backend_spawn(
+            &mut retry_count,
+            Instant::now(),
+            &cancel,
+            &[Duration::ZERO; 3],
+            |_| {},
+            |_| true,
+            |_| outcomes.remove(0),
+        );
+        assert_eq!(outcome, BackendRetryOutcome::Exhausted);
+        assert_eq!(retry_count, 3);
     }
 
     #[test]
