@@ -1085,6 +1085,16 @@ fn should_handle_backend_exit(wait_succeeded: bool, cancelled: bool) -> bool {
     wait_succeeded && !cancelled
 }
 
+fn should_restart_after_exit(
+    exit_success: bool,
+    cancelled: bool,
+    codex_alive: bool,
+    retry_count: u32,
+    window_age_seconds: u64,
+) -> bool {
+    !exit_success && should_restart_backend(cancelled, codex_alive, retry_count, window_age_seconds)
+}
+
 fn backend_codex_gone_message() -> &'static str {
     "Codex 已退出，跳过后端重启"
 }
@@ -1183,6 +1193,29 @@ fn monitor_is_current(current: &Option<BackendMonitorState>, cancel: &Arc<Atomic
 }
 
 #[cfg(target_os = "linux")]
+fn can_write_monitor_status(token_current: bool, cancelled: bool) -> bool {
+    token_current && !cancelled
+}
+
+#[cfg(target_os = "linux")]
+fn save_monitor_status_if_current(
+    request: &LaunchRequest,
+    cancel: &Arc<AtomicBool>,
+    status: &str,
+    message: &str,
+) {
+    let Ok(current) = backend_monitor_cancel().lock() else {
+        return;
+    };
+    if can_write_monitor_status(
+        monitor_is_current(&current, cancel),
+        cancel.load(Ordering::SeqCst),
+    ) {
+        let _ = save_requested_launch_status(request, status, message, current_timestamp_ms());
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn wait_error_cleanup_message(
     wait_error: &std::io::Error,
     cleanup_error: Option<&std::io::Error>,
@@ -1210,6 +1243,11 @@ fn cleanup_after_wait_error(
 }
 
 #[cfg(target_os = "linux")]
+fn child_cleanup_succeeded(_kill_succeeded: bool, wait_succeeded: bool) -> bool {
+    wait_succeeded
+}
+
+#[cfg(target_os = "linux")]
 fn stop_child(child: &mut std::process::Child) -> std::io::Result<std::process::ExitStatus> {
     match child.try_wait() {
         Ok(Some(status)) => Ok(status),
@@ -1217,7 +1255,9 @@ fn stop_child(child: &mut std::process::Child) -> std::io::Result<std::process::
             let kill_result = child.kill();
             let wait_result = child.wait();
             match (kill_result, wait_result) {
-                (Ok(()), Ok(status)) => Ok(status),
+                (kill_result, Ok(status)) if child_cleanup_succeeded(kill_result.is_ok(), true) => {
+                    Ok(status)
+                }
                 (kill_result, wait_result) => Err(std::io::Error::other(format!(
                     "kill result: {kill_result:?}; wait result: {wait_result:?}"
                 ))),
@@ -1266,11 +1306,11 @@ fn monitor_backend(
                         "helper_port": request.helper_port,
                     }),
                 );
-                let _ = save_requested_launch_status(
+                save_monitor_status_if_current(
                     &request,
+                    &cancel,
                     "failed",
                     "Codex++ 后端进程等待失败",
-                    current_timestamp_ms(),
                 );
             }
             return;
@@ -1288,21 +1328,22 @@ fn monitor_backend(
             "manager.backend_exit",
             json!({ "exit": format!("{exit_status:?}"), "codex_alive": codex_alive }),
         );
-        if cancel.load(Ordering::SeqCst) {
-            return;
-        }
-        if !should_restart_backend(
-            false,
+        let cancelled = cancel.load(Ordering::SeqCst);
+        if !should_restart_after_exit(
+            exit_status.success(),
+            cancelled,
             codex_alive,
             retry_count,
             window_started.elapsed().as_secs(),
         ) {
-            let _ = save_requested_launch_status(
-                &request,
-                "failed",
-                backend_exit_status_message(codex_alive),
-                current_timestamp_ms(),
-            );
+            if !exit_status.success() && !cancelled {
+                save_monitor_status_if_current(
+                    &request,
+                    &cancel,
+                    "failed",
+                    backend_exit_status_message(codex_alive),
+                );
+            }
             return;
         }
 
@@ -1311,14 +1352,13 @@ fn monitor_backend(
             window_started,
             &cancel,
             &BACKEND_RETRY_DELAYS,
-            |retry_count| {
-                let _ = save_requested_launch_status(
+            |_retry_count| {
+                save_monitor_status_if_current(
                     &request,
+                    &cancel,
                     "starting",
                     "Codex++ 后端正在重启",
-                    current_timestamp_ms(),
                 );
-                let _ = retry_count;
             },
             |delay| {
                 for _ in 0..delay.as_millis() / 100 {
@@ -1366,22 +1406,17 @@ fn monitor_backend(
                 child_started = Instant::now();
             }
             BackendRetryOutcome::CodexGone => {
-                let _ = save_requested_launch_status(
+                save_monitor_status_if_current(
                     &request,
+                    &cancel,
                     "failed",
                     backend_codex_gone_message(),
-                    current_timestamp_ms(),
                 );
                 return;
             }
             BackendRetryOutcome::Cancelled => return,
             BackendRetryOutcome::WindowExpired | BackendRetryOutcome::Exhausted => {
-                let _ = save_requested_launch_status(
-                    &request,
-                    "failed",
-                    "Codex++ 后端重启失败",
-                    current_timestamp_ms(),
-                );
+                save_monitor_status_if_current(&request, &cancel, "failed", "Codex++ 后端重启失败");
                 return;
             }
         }
@@ -6676,6 +6711,28 @@ mod tests {
         assert!(!should_restart_backend(false, false, 0, 0));
         assert!(!should_restart_backend(false, true, 3, 0));
         assert!(!should_restart_backend(false, true, 0, 5 * 60));
+    }
+
+    #[test]
+    fn successful_backend_exit_never_restarts_even_when_codex_is_alive() {
+        assert!(!should_restart_after_exit(true, false, true, 0, 0));
+        assert!(should_restart_after_exit(false, false, true, 0, 0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn backend_monitor_status_requires_the_current_uncancelled_token() {
+        assert!(!can_write_monitor_status(false, false));
+        assert!(!can_write_monitor_status(true, true));
+        assert!(can_write_monitor_status(true, false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn backend_child_cleanup_treats_reaped_child_as_success() {
+        assert!(child_cleanup_succeeded(false, true));
+        assert!(child_cleanup_succeeded(true, true));
+        assert!(!child_cleanup_succeeded(true, false));
     }
 
     #[test]
