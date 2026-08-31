@@ -4,7 +4,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use codex_plus_core::install::SILENT_BINARY;
 use codex_plus_core::models::{DeleteResult, SessionRef};
@@ -20,6 +20,20 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::install::{self, InstallActionResult, InstallOptions};
+
+static BACKEND_MONITOR_CANCEL: OnceLock<Mutex<Option<Arc<AtomicBool>>>> = OnceLock::new();
+
+fn backend_monitor_cancel() -> &'static Mutex<Option<Arc<AtomicBool>>> {
+    BACKEND_MONITOR_CANCEL.get_or_init(|| Mutex::new(None))
+}
+
+pub(crate) fn stop_backend_monitor() {
+    if let Ok(mut current) = backend_monitor_cancel().lock() {
+        if let Some(cancel) = current.take() {
+            cancel.store(true, Ordering::SeqCst);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CommandResult<T>
@@ -659,6 +673,7 @@ pub fn restart_codex_plus(request: LaunchRequest) -> CommandResult<Value> {
             }),
         );
     }
+    stop_backend_monitor();
     codex_plus_core::watcher::stop_launcher_processes_and_wait();
     codex_plus_core::watcher::stop_codex_processes_for_debug_port_and_wait(request.debug_port);
     let home = codex_plus_core::relay_config::default_codex_home_dir();
@@ -975,17 +990,131 @@ fn current_timestamp_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn spawn_silent_launcher(request: &LaunchRequest) -> anyhow::Result<()> {
+fn launch_args(request: &LaunchRequest) -> Vec<String> {
     let mut args = Vec::new();
     if !request.app_path.trim().is_empty() {
-        args.push("--app-path".to_string());
-        args.push(request.app_path.trim().to_string());
+        args.extend([
+            "--app-path".to_string(),
+            request.app_path.trim().to_string(),
+        ]);
     }
-    args.push("--debug-port".to_string());
-    args.push(request.debug_port.to_string());
-    args.push("--helper-port".to_string());
-    args.push(request.helper_port.to_string());
-    codex_plus_core::install::spawn_companion(SILENT_BINARY, &args).map(|_| ())
+    args.extend([
+        "--debug-port".to_string(),
+        request.debug_port.to_string(),
+        "--helper-port".to_string(),
+        request.helper_port.to_string(),
+    ]);
+    args
+}
+
+fn should_restart_backend(
+    cancelled: bool,
+    codex_alive: bool,
+    retry_count: u32,
+    window_age_seconds: u64,
+) -> bool {
+    !cancelled && codex_alive && retry_count < 3 && window_age_seconds < 5 * 60
+}
+
+#[cfg(target_os = "linux")]
+fn monitor_backend(
+    request: LaunchRequest,
+    mut child: std::process::Child,
+    cancel: Arc<AtomicBool>,
+) {
+    let mut retry_count = 0;
+    let window_started = Instant::now();
+    loop {
+        let exit_status = child.wait();
+        if cancel.load(Ordering::SeqCst) {
+            return;
+        }
+        let codex_alive = !codex_plus_core::watcher::find_codex_processes().is_empty()
+            || codex_plus_core::watcher::cdp_listening(request.debug_port);
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "manager.backend_exit",
+            json!({ "exit": format!("{exit_status:?}"), "codex_alive": codex_alive }),
+        );
+        if !should_restart_backend(
+            false,
+            codex_alive,
+            retry_count,
+            window_started.elapsed().as_secs(),
+        ) {
+            if codex_alive {
+                let _ = save_requested_launch_status(
+                    &request,
+                    "failed",
+                    "Codex++ 后端意外退出",
+                    current_timestamp_ms(),
+                );
+            }
+            return;
+        }
+        let mut next_child = None;
+        while retry_count < 3 && window_started.elapsed().as_secs() < 5 * 60 {
+            retry_count += 1;
+            let _ = save_requested_launch_status(
+                &request,
+                "starting",
+                "Codex++ 后端正在重启",
+                current_timestamp_ms(),
+            );
+            let delay_ms = [1_000, 3_000, 8_000][(retry_count - 1) as usize];
+            for _ in 0..delay_ms / 100 {
+                if cancel.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            match codex_plus_core::install::spawn_companion_child(
+                SILENT_BINARY,
+                launch_args(&request),
+            ) {
+                Ok(child) => {
+                    next_child = Some(child);
+                    break;
+                }
+                Err(error) => {
+                    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                        "manager.backend_restart_failed",
+                        json!({ "message": error.to_string(), "retry_count": retry_count }),
+                    );
+                }
+            }
+        }
+        let Some(next_child) = next_child else {
+            let _ = save_requested_launch_status(
+                &request,
+                "failed",
+                "Codex++ 后端重启失败",
+                current_timestamp_ms(),
+            );
+            return;
+        };
+        child = next_child;
+    }
+}
+
+fn spawn_silent_launcher(request: &LaunchRequest) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        stop_backend_monitor();
+        let child =
+            codex_plus_core::install::spawn_companion_child(SILENT_BINARY, launch_args(request))?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Ok(mut current) = backend_monitor_cancel().lock() {
+            *current = Some(cancel.clone());
+        }
+        let request = request.clone();
+        std::thread::spawn(move || monitor_backend(request, child, cancel));
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        codex_plus_core::install::spawn_companion(SILENT_BINARY, launch_args(request)).map(|_| ())
+    }
 }
 
 pub fn start_weixin_connect_from_saved_settings() {
@@ -6200,6 +6329,15 @@ mod tests {
         CODEX_HOME_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn backend_monitor_restarts_only_for_live_codex_and_uncancelled_child() {
+        assert!(should_restart_backend(false, true, 0, 0));
+        assert!(!should_restart_backend(true, true, 0, 0));
+        assert!(!should_restart_backend(false, false, 0, 0));
+        assert!(!should_restart_backend(false, true, 3, 0));
+        assert!(!should_restart_backend(false, true, 0, 5 * 60));
     }
 
     #[cfg(windows)]

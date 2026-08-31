@@ -278,6 +278,7 @@ fn install_tray<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Result<()> {
             }
             TRAY_MENU_QUIT => {
                 APP_EXITING.store(true, Ordering::SeqCst);
+                commands::stop_backend_monitor();
                 app.exit(0);
             }
             _ => {}
@@ -345,6 +346,7 @@ fn startup_is_transient() -> bool {
 #[tauri::command]
 fn manager_exit_app<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
     APP_EXITING.store(true, Ordering::SeqCst);
+    commands::stop_backend_monitor();
     app.exit(0);
 }
 
