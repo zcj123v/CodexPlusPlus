@@ -21,22 +21,48 @@ use serde_json::{Value, json};
 
 use crate::install::{self, InstallActionResult, InstallOptions};
 
-static BACKEND_MONITOR_CANCEL: OnceLock<Mutex<Option<Arc<AtomicBool>>>> = OnceLock::new();
+struct BackendMonitorState {
+    cancel: Arc<AtomicBool>,
+    join: std::thread::JoinHandle<()>,
+}
 
-fn backend_monitor_cancel() -> &'static Mutex<Option<Arc<AtomicBool>>> {
+static BACKEND_MONITOR_CANCEL: OnceLock<Mutex<Option<BackendMonitorState>>> = OnceLock::new();
+static BACKEND_MONITOR_OPERATION: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn backend_monitor_cancel() -> &'static Mutex<Option<BackendMonitorState>> {
     BACKEND_MONITOR_CANCEL.get_or_init(|| Mutex::new(None))
 }
 
-fn cancel_backend_monitor_locked(current: &mut Option<Arc<AtomicBool>>) {
-    if let Some(cancel) = current.take() {
-        cancel.store(true, Ordering::SeqCst);
+fn backend_monitor_operation() -> &'static Mutex<()> {
+    BACKEND_MONITOR_OPERATION.get_or_init(|| Mutex::new(()))
+}
+
+fn stop_backend_monitor_locked() {
+    let state = backend_monitor_cancel()
+        .lock()
+        .ok()
+        .and_then(|mut current| current.take());
+    let Some(state) = state else {
+        return;
+    };
+    state.cancel.store(true, Ordering::SeqCst);
+    if state.join.join().is_err() {
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "manager.backend_monitor_join_failed",
+            json!({ "message": "backend monitor thread panicked while stopping" }),
+        );
     }
 }
 
 pub(crate) fn stop_backend_monitor() {
-    if let Ok(mut current) = backend_monitor_cancel().lock() {
-        cancel_backend_monitor_locked(&mut current);
-    }
+    let Ok(_operation) = backend_monitor_operation().lock() else {
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "manager.backend_monitor_stop_failed",
+            json!({ "message": "backend monitor lifecycle lock is poisoned" }),
+        );
+        return;
+    };
+    stop_backend_monitor_locked();
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -677,13 +703,13 @@ pub fn restart_codex_plus(request: LaunchRequest) -> CommandResult<Value> {
             }),
         );
     }
-    let Ok(mut backend_lifecycle) = backend_monitor_cancel().lock() else {
+    let Ok(_backend_operation) = backend_monitor_operation().lock() else {
         return failed(
             "后台 launcher 生命周期锁已损坏，请重启管理器后再试。",
             json!({}),
         );
     };
-    cancel_backend_monitor_locked(&mut backend_lifecycle);
+    stop_backend_monitor_locked();
     codex_plus_core::watcher::stop_launcher_processes_and_wait();
     codex_plus_core::watcher::stop_codex_processes_for_debug_port_and_wait(request.debug_port);
     let home = codex_plus_core::relay_config::default_codex_home_dir();
@@ -713,7 +739,7 @@ pub fn restart_codex_plus(request: LaunchRequest) -> CommandResult<Value> {
         );
     }
     match restart_codex_plus_after_stop(&request, &home, settings.as_ref(), |request| {
-        spawn_silent_launcher_locked(request, &mut backend_lifecycle)
+        spawn_silent_launcher_locked(request)
     }) {
         Ok(()) => CommandResult {
             status: "accepted".to_string(),
@@ -1066,11 +1092,42 @@ fn backend_is_alive(debug_port: u16) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn monitor_is_current(current: &Option<Arc<AtomicBool>>, cancel: &Arc<AtomicBool>) -> bool {
+fn monitor_is_current(current: &Option<BackendMonitorState>, cancel: &Arc<AtomicBool>) -> bool {
     current
         .as_ref()
-        .is_some_and(|active| Arc::ptr_eq(active, cancel))
+        .is_some_and(|active| Arc::ptr_eq(&active.cancel, cancel))
         && !cancel.load(Ordering::SeqCst)
+}
+
+#[cfg(target_os = "linux")]
+fn stop_child(child: &mut std::process::Child) -> std::io::Result<std::process::ExitStatus> {
+    match child.try_wait() {
+        Ok(Some(status)) => Ok(status),
+        Ok(None) => {
+            let _ = child.kill();
+            child.wait()
+        }
+        Err(error) => {
+            let _ = child.kill();
+            child.wait().or(Err(error))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_backend_child(
+    child: &mut std::process::Child,
+    cancel: &AtomicBool,
+) -> std::io::Result<std::process::ExitStatus> {
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return stop_child(child);
+        }
+        match child.try_wait()? {
+            Some(status) => return Ok(status),
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1082,7 +1139,7 @@ fn monitor_backend(
     let mut retry_count = 0;
     let window_started = Instant::now();
     loop {
-        let wait_result = child.wait();
+        let wait_result = wait_for_backend_child(&mut child, &cancel);
         if !should_handle_backend_exit(wait_result.is_ok(), cancel.load(Ordering::SeqCst)) {
             if let Err(error) = wait_result {
                 let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
@@ -1189,54 +1246,70 @@ fn monitor_backend(
     }
 }
 
-fn spawn_silent_launcher_locked(
-    request: &LaunchRequest,
-    current: &mut Option<Arc<AtomicBool>>,
-) -> anyhow::Result<()> {
+fn spawn_silent_launcher_locked(request: &LaunchRequest) -> anyhow::Result<()> {
+    let Ok(mut current) = backend_monitor_cancel().lock() else {
+        return Err(anyhow::anyhow!("后台 launcher 生命周期锁已损坏"));
+    };
+
     #[cfg(target_os = "linux")]
     {
         let child =
             codex_plus_core::install::spawn_companion_child(SILENT_BINARY, launch_args(request))?;
         let cancel = Arc::new(AtomicBool::new(false));
-        *current = Some(cancel.clone());
+        let child_slot = Arc::new(Mutex::new(Some(child)));
+        let monitor_child_slot = Arc::clone(&child_slot);
+        let monitor_cancel = Arc::clone(&cancel);
         let monitor_request = request.clone();
-        if let Err(error) = std::thread::Builder::new()
+        let join = match std::thread::Builder::new()
             .name("codex-plus-backend-monitor".to_string())
-            .spawn(move || monitor_backend(monitor_request, child, cancel))
-        {
-            current.take();
-            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-                "manager.backend_monitor_spawn_failed",
-                json!({
-                    "message": error.to_string(),
-                    "debug_port": request.debug_port,
-                    "helper_port": request.helper_port,
-                }),
-            );
-            let _ = save_requested_launch_status(
-                request,
-                "failed",
-                "Codex++ 后端监控线程启动失败",
-                current_timestamp_ms(),
-            );
-            return Err(anyhow::anyhow!("无法启动 Codex++ 后端监控线程：{error}"));
-        }
+            .spawn(move || {
+                let Some(child) = monitor_child_slot
+                    .lock()
+                    .ok()
+                    .and_then(|mut slot| slot.take())
+                else {
+                    return;
+                };
+                monitor_backend(monitor_request, child, monitor_cancel);
+            }) {
+            Ok(join) => join,
+            Err(error) => {
+                if let Some(mut child) = child_slot.lock().ok().and_then(|mut slot| slot.take()) {
+                    let _ = stop_child(&mut child);
+                }
+                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                    "manager.backend_monitor_spawn_failed",
+                    json!({
+                        "message": error.to_string(),
+                        "debug_port": request.debug_port,
+                        "helper_port": request.helper_port,
+                    }),
+                );
+                let _ = save_requested_launch_status(
+                    request,
+                    "failed",
+                    "Codex++ 后端监控线程启动失败",
+                    current_timestamp_ms(),
+                );
+                return Err(anyhow::anyhow!("无法启动 Codex++ 后端监控线程：{error}"));
+            }
+        };
+        *current = Some(BackendMonitorState { cancel, join });
         return Ok(());
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = current;
         codex_plus_core::install::spawn_companion(SILENT_BINARY, launch_args(request)).map(|_| ())
     }
 }
 
 fn spawn_silent_launcher(request: &LaunchRequest) -> anyhow::Result<()> {
-    let Ok(mut lifecycle) = backend_monitor_cancel().lock() else {
+    let Ok(_operation) = backend_monitor_operation().lock() else {
         return Err(anyhow::anyhow!("后台 launcher 生命周期锁已损坏"));
     };
-    cancel_backend_monitor_locked(&mut lifecycle);
-    spawn_silent_launcher_locked(request, &mut lifecycle)
+    stop_backend_monitor_locked();
+    spawn_silent_launcher_locked(request)
 }
 
 pub fn start_weixin_connect_from_saved_settings() {
@@ -6475,10 +6548,34 @@ mod tests {
     fn backend_monitor_uses_only_the_current_uncancelled_token() {
         let current = Arc::new(AtomicBool::new(false));
         let replacement = Arc::new(AtomicBool::new(false));
-        assert!(monitor_is_current(&Some(current.clone()), &current));
-        assert!(!monitor_is_current(&Some(replacement), &current));
+        let state = BackendMonitorState {
+            cancel: current.clone(),
+            join: std::thread::spawn(|| {}),
+        };
+        assert!(monitor_is_current(&Some(state), &current));
+        let replacement_state = BackendMonitorState {
+            cancel: replacement,
+            join: std::thread::spawn(|| {}),
+        };
+        assert!(!monitor_is_current(&Some(replacement_state), &current));
         current.store(true, Ordering::SeqCst);
-        assert!(!monitor_is_current(&Some(current.clone()), &current));
+        let cancelled_state = BackendMonitorState {
+            cancel: current.clone(),
+            join: std::thread::spawn(|| {}),
+        };
+        assert!(!monitor_is_current(&Some(cancelled_state), &current));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_stop_child_kills_and_reaps_a_running_process() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep should be available in the Linux test environment");
+        let status = stop_child(&mut child).expect("stopping child should reap it");
+        assert!(!status.success());
+        assert!(child.try_wait().unwrap().is_some());
     }
 
     #[test]
