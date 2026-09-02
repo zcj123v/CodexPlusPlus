@@ -2,7 +2,7 @@
 # Packages prebuilt release binaries staged next to this PKGBUILD by
 # scripts/installer/arch/build-package.sh (or the arch-package CI workflow).
 pkgname=codexplusplus
-pkgver=1.2.54.linux.1
+pkgver=1.2.56.linux.1
 pkgrel=1
 pkgdesc='External enhancement launcher and manager for the Codex desktop app (Linux port)'
 arch=('x86_64')

@@ -754,19 +754,13 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             crate::anthropic_proxy::anthropic_request_builder(
                 http_client,
                 &endpoint,
-                &relay,
+                relay.api_key.trim(),
                 is_stream,
                 &upstream_body,
                 originator,
             )
         } else {
-            upstream_request_builder(
-                http_client,
-                &endpoint,
-                relay.api_key.trim(),
-                is_stream,
-                &upstream_body,
-            )
+            upstream_request_builder(http_client, &endpoint, &relay, is_stream, &upstream_body)
         };
         let upstream = match send_upstream_request_for_responses(request_builder, is_stream).await {
             Ok(upstream) => upstream,

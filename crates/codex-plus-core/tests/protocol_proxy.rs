@@ -7,8 +7,7 @@ use codex_plus_core::protocol_proxy::{
     is_responses_compact_proxy_path, is_responses_proxy_path, models_url,
     open_audio_transcriptions_proxy_request, open_chat_completions_proxy_request,
     open_models_proxy_request, open_models_proxy_request_with_identity,
-    open_models_proxy_request_with_originator, open_responses_proxy_request,
-    open_responses_proxy_request_with_settings,
+    open_responses_proxy_request, open_responses_proxy_request_with_settings,
     open_responses_proxy_request_with_settings_for_path, responses_compact_url,
     responses_error_from_upstream, responses_to_chat_completions, responses_url,
     send_upstream_request_with_header_timeout, upstream_header_timeout, upstream_http_client,
@@ -2082,7 +2081,7 @@ async fn model_route_supports_no_auth_target_without_authorization_header() {
     settings.relay_profiles[1].no_auth = true;
     settings.relay_profiles[1].api_key.clear();
 
-    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings, None)
         .await
         .unwrap();
     let (headers, upstream_body) = target_server.await.unwrap();

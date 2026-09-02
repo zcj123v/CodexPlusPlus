@@ -32,6 +32,7 @@ describe("provider presets", () => {
       modelList: ["MiniMax-M3", "MiniMax-M2.7"],
     });
   });
+});
 
 test("DeepSeek preset uses the official Responses integration", () => {
   const preset = PRESETS.find((candidate) => candidate.id === "deepseek");
