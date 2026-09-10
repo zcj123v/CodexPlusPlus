@@ -691,28 +691,6 @@ fn openai_session_provider_rejects_chat_completions() {
 }
 
 #[test]
-fn anthropic_profile_config_points_to_local_proxy() {
-    let temp = tempfile::tempdir().unwrap();
-
-    let result = codex_plus_core::relay_config::apply_relay_config_to_home_with_protocol(
-        temp.path(),
-        "https://anthropic.example.test/v1",
-        "sk-test-redacted",
-        RelayProtocol::Anthropic,
-        57321,
-    )
-    .unwrap();
-    let updated = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-
-    // Anthropic profile 与 chatCompletions 一样指向本地协议代理
-    assert!(result.configured);
-    assert!(updated.contains(r#"wire_api = "responses""#));
-    assert!(updated.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
-    assert!(updated.contains(r#"experimental_bearer_token = "sk-test-redacted""#));
-    assert!(!updated.contains("https://anthropic.example.test/v1"));
-}
-
-#[test]
 fn responses_profile_stays_direct_and_backfill_repairs_legacy_local_proxy() {
     let temp = tempfile::tempdir().unwrap();
     let profile = RelayProfile {
@@ -1112,79 +1090,6 @@ fn sync_local_proxy_port_leaves_remote_base_url_untouched() {
     assert_eq!(outcome.reason, "not_local_proxy_url");
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
     assert_eq!(config, original);
-}
-
-#[test]
-fn anthropic_profile_preserves_upstream_across_storage_apply_and_backfill() {
-    let temp = tempfile::tempdir().unwrap();
-    let upstream = "https://api.kimi.com/coding";
-    let local_proxy = "http://127.0.0.1:57321/v1";
-    let mut profile = RelayProfile {
-        id: "relay-anthropic".to_string(),
-        model: "k3".to_string(),
-        upstream_base_url: upstream.to_string(),
-        api_key: "sk-test-redacted".to_string(),
-        protocol: RelayProtocol::Anthropic,
-        relay_mode: RelayMode::PureApi,
-        config_contents: format!(
-            r#"model = "k3"
-model_provider = "custom"
-
-[model_providers.custom]
-name = "custom"
-wire_api = "chat"
-requires_openai_auth = true
-base_url = "{local_proxy}"
-"#
-        ),
-        ..RelayProfile::default()
-    };
-
-    normalize_relay_profile_for_storage(&mut profile).unwrap();
-    assert_eq!(profile.upstream_base_url, upstream);
-    assert_eq!(profile.base_url, upstream);
-    assert_eq!(
-        codex_plus_core::relay_config::relay_profile_base_url(&profile),
-        upstream
-    );
-    assert!(
-        profile
-            .config_contents
-            .contains(r#"wire_api = "responses""#)
-    );
-    assert!(!profile.config_contents.contains(r#"wire_api = "chat""#));
-    assert!(profile.config_contents.contains(local_proxy));
-    assert!(!profile.config_contents.contains(upstream));
-
-    let serialized = serde_json::to_string(&profile).unwrap();
-    let mut reloaded: RelayProfile = serde_json::from_str(&serialized).unwrap();
-    normalize_relay_profile_for_storage(&mut reloaded).unwrap();
-    assert_eq!(reloaded.upstream_base_url, upstream);
-    assert_eq!(reloaded.base_url, upstream);
-
-    apply_relay_profile_to_home_with_switch_rules(temp.path(), &reloaded, "").unwrap();
-    let live = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-    assert!(live.contains(r#"wire_api = "responses""#));
-    assert!(!live.contains(r#"wire_api = "chat""#));
-    assert!(live.contains(local_proxy));
-    assert!(!live.contains(upstream));
-
-    let mut common = String::new();
-    backfill_relay_profile_from_home_with_common(temp.path(), &mut reloaded, &mut common).unwrap();
-    normalize_relay_profile_for_storage(&mut reloaded).unwrap();
-    assert_eq!(reloaded.upstream_base_url, upstream);
-    assert_eq!(reloaded.base_url, upstream);
-    assert_eq!(
-        codex_plus_core::relay_config::relay_profile_base_url(&reloaded),
-        upstream
-    );
-    assert!(
-        reloaded
-            .config_contents
-            .contains(r#"wire_api = "responses""#)
-    );
-    assert!(reloaded.config_contents.contains(local_proxy));
-    assert!(!reloaded.config_contents.contains(upstream));
 }
 
 #[test]

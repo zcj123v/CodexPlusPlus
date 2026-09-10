@@ -308,9 +308,6 @@ pub fn finalize_non_streaming_responses_response(
 
     let upstream_json: Value = serde_json::from_slice(upstream_body)?;
     let response_json = match wire_api {
-        UpstreamWireApi::AnthropicMessages => {
-            crate::anthropic_proxy::anthropic_message_to_response(&upstream_json, original_request)?
-        }
         UpstreamWireApi::ChatCompletions => {
             if let Some(original_request) = original_request {
                 chat_completion_to_response_with_request(upstream_json, original_request)?
@@ -343,7 +340,6 @@ pub struct UpstreamProxyResponse {
 pub enum UpstreamWireApi {
     Responses,
     ChatCompletions,
-    AnthropicMessages,
     AudioTranscriptions,
 }
 
@@ -501,47 +497,28 @@ impl ChatSseToResponsesConverter {
     }
 }
 
-/// 按上游 wire API 分发的 SSE 转换器。
-pub enum ResponsesSseConverter {
-    Chat(ChatSseToResponsesConverter),
-    Anthropic(crate::anthropic_proxy::AnthropicSseToResponsesConverter),
-}
+/// Chat Completions SSE 转 Responses SSE 的转换器。
+pub struct ResponsesSseConverter(ChatSseToResponsesConverter);
 
 impl ResponsesSseConverter {
-    pub fn for_wire_api(wire_api: UpstreamWireApi, request_json: Option<&Value>) -> Self {
-        match wire_api {
-            UpstreamWireApi::AnthropicMessages => Self::Anthropic(
-                crate::anthropic_proxy::AnthropicSseToResponsesConverter::with_request(
-                    &request_json.cloned().unwrap_or_else(|| json!({})),
-                ),
-            ),
-            _ => Self::Chat(
-                request_json
-                    .map(ChatSseToResponsesConverter::with_request)
-                    .unwrap_or_default(),
-            ),
-        }
+    pub fn for_wire_api(_wire_api: UpstreamWireApi, request_json: Option<&Value>) -> Self {
+        Self(
+            request_json
+                .map(ChatSseToResponsesConverter::with_request)
+                .unwrap_or_default(),
+        )
     }
 
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
-        match self {
-            Self::Chat(converter) => converter.push_bytes(bytes),
-            Self::Anthropic(converter) => converter.push_bytes(bytes),
-        }
+        self.0.push_bytes(bytes)
     }
 
     pub fn finish(&mut self) -> Vec<u8> {
-        match self {
-            Self::Chat(converter) => converter.finish(),
-            Self::Anthropic(converter) => converter.finish(),
-        }
+        self.0.finish()
     }
 
     pub fn fail(&mut self, message: String, error_type: Option<String>) -> Vec<u8> {
-        match self {
-            Self::Chat(converter) => converter.fail(message, error_type),
-            Self::Anthropic(converter) => converter.fail(message, error_type),
-        }
+        self.0.fail(message, error_type)
     }
 }
 
@@ -684,7 +661,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     body: &str,
     settings: crate::settings::BackendSettings,
     original_user_agent: Option<&str>,
-    originator: Option<&str>,
+    _originator: Option<&str>,
     request_path: &str,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let mut request_json: Value = serde_json::from_str(body)?;
@@ -750,18 +727,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         let http_client = crate::http_client::proxied_client(
             &protocol_proxy_original_first_user_agent(&relay.user_agent, original_user_agent),
         )?;
-        let request_builder = if wire_api == UpstreamWireApi::AnthropicMessages {
-            crate::anthropic_proxy::anthropic_request_builder(
-                http_client,
-                &endpoint,
-                relay.api_key.trim(),
-                is_stream,
-                &upstream_body,
-                originator,
-            )
-        } else {
-            upstream_request_builder(http_client, &endpoint, &relay, is_stream, &upstream_body)
-        };
+        let request_builder =
+            upstream_request_builder(http_client, &endpoint, &relay, is_stream, &upstream_body);
         let upstream = match send_upstream_request_for_responses(request_builder, is_stream).await {
             Ok(upstream) => upstream,
             Err(error) => {
@@ -915,18 +882,8 @@ pub async fn open_models_proxy_request_with_identity(
 ) -> anyhow::Result<UpstreamProxyResponse> {
     validate_upstream(profile)?;
 
-    let is_anthropic = profile.protocol == RelayProtocol::Anthropic;
-    // Anthropic 协议下带路径的 base 也需补 /v1，故走 anthropic_models_url
-    let endpoint = if is_anthropic {
-        anthropic_models_url(&profile.base_url)
-    } else {
-        models_url(&profile.base_url)
-    };
-    let wire_api = if is_anthropic {
-        UpstreamWireApi::AnthropicMessages
-    } else {
-        UpstreamWireApi::Responses
-    };
+    let endpoint = models_url(&profile.base_url);
+    let wire_api = UpstreamWireApi::Responses;
     let _ = crate::diagnostic_log::append_diagnostic_log(
         "protocol_proxy.models_request",
         json!({
@@ -940,21 +897,7 @@ pub async fn open_models_proxy_request_with_identity(
         &profile.user_agent,
         original_user_agent,
     ))?;
-    let mut request = if is_anthropic {
-        // Anthropic 三头认证，与 messages 请求保持一致；no-auth 模式下只保留版本头
-        let mut request = client.get(&endpoint).header(
-            "anthropic-version",
-            crate::anthropic_proxy::ANTHROPIC_VERSION,
-        );
-        if !profile.uses_no_auth() {
-            request = request
-                .header("x-api-key", profile.api_key.trim())
-                .bearer_auth(profile.api_key.trim());
-        }
-        request
-    } else {
-        with_relay_auth(client.get(&endpoint), profile)
-    };
+    let mut request = with_relay_auth(client.get(&endpoint), profile);
     if let Some(originator) = originator.map(str::trim).filter(|value| !value.is_empty()) {
         request = request.header("originator", originator);
     }
@@ -1115,17 +1058,6 @@ async fn upstream_request_parts(
                 UpstreamWireApi::ChatCompletions,
             )
         }
-        RelayProtocol::Anthropic => {
-            // 图片处理在转换前的 Responses 格式 body 上做（vision 支持 input key）
-            let mut responses_body = request_json;
-            apply_image_handling(relay, &mut responses_body).await;
-            let body = crate::anthropic_proxy::responses_to_anthropic_messages(&responses_body)?;
-            (
-                anthropic_messages_url(&relay.base_url),
-                body,
-                UpstreamWireApi::AnthropicMessages,
-            )
-        }
     };
     // base64 图片泄漏兜底（上游 #1996）：出站前扫一遍最终 body
     if guard_inline_image_data_urls(&mut body) {
@@ -1279,11 +1211,8 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
     let upstream_body = upstream.response.bytes().await?;
 
     if !(200..300).contains(&status_code) {
-        let error = if wire_api == UpstreamWireApi::AnthropicMessages {
-            crate::anthropic_proxy::anthropic_error_to_responses_error(status_code, &upstream_body)
-        } else {
-            responses_error_from_upstream(status_code, &upstream_content_type, &upstream_body)
-        };
+        let error =
+            responses_error_from_upstream(status_code, &upstream_content_type, &upstream_body);
         return Ok(ProxyHttpResponse {
             status: http_status_line(status_code),
             content_type: "application/json; charset=utf-8".to_string(),
@@ -1428,66 +1357,6 @@ pub fn models_url(base_url: &str) -> String {
         .split_once("://")
         .map_or(!base.contains('/'), |(_, rest)| !rest.contains('/'));
     let mut url = if skip_version_prefix || has_version_suffix(&base) || !origin_only {
-        format!("{base}/models")
-    } else {
-        format!("{base}/v1/models")
-    };
-    while url.contains("/v1/v1") {
-        url = url.replace("/v1/v1", "/v1");
-    }
-    url
-}
-
-/// Anthropic Messages 端点拼接：除 `#` 后缀或已带版本号外，带路径的 base 也补 `/v1`。
-pub fn anthropic_messages_url(base_url: &str) -> String {
-    let skip_version_prefix = base_url.trim().ends_with('#');
-    let mut base = base_url
-        .trim()
-        .trim_end_matches('#')
-        .trim_end_matches('/')
-        .to_string();
-    for suffix in ["/chat/completions", "/responses", "/models"] {
-        if base.to_ascii_lowercase().ends_with(suffix) {
-            base.truncate(base.len() - suffix.len());
-            break;
-        }
-    }
-    if base.to_ascii_lowercase().ends_with("/messages") {
-        return base;
-    }
-    // 与 responses_url 不同：带路径的 base 同样补 /v1 前缀，
-    // 仅 `#` 后缀或已带版本号（如 /v1）时跳过。
-    let mut url = if skip_version_prefix || has_version_suffix(&base) {
-        format!("{base}/messages")
-    } else {
-        format!("{base}/v1/messages")
-    };
-    while url.contains("/v1/v1") {
-        url = url.replace("/v1/v1", "/v1");
-    }
-    url
-}
-
-/// Anthropic Models 端点拼接，规则与 `anthropic_messages_url` 一致（端点名 models）。
-/// 与 `models_url` 不同：带路径的 base（如 `https://api.kimi.com/coding`）同样补 `/v1`；
-/// 已是完整端点或以 /models 结尾则原样返回。
-pub fn anthropic_models_url(base_url: &str) -> String {
-    let skip_version_prefix = base_url.trim().ends_with('#');
-    let mut base = base_url
-        .trim()
-        .trim_end_matches('#')
-        .trim_end_matches('/')
-        .to_string();
-    for suffix in ["/chat/completions", "/responses", "/messages"] {
-        if base.to_ascii_lowercase().ends_with(suffix) {
-            base.truncate(base.len() - suffix.len());
-            break;
-        }
-    }
-    if base.to_ascii_lowercase().ends_with("/models") {
-        return base;
-    }
-    let mut url = if skip_version_prefix || has_version_suffix(&base) {
         format!("{base}/models")
     } else {
         format!("{base}/v1/models")

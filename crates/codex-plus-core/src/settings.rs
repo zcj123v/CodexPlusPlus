@@ -214,13 +214,26 @@ pub enum RelayModelInsertMode {
     Patch,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum RelayProtocol {
     #[default]
     Responses,
     ChatCompletions,
-    Anthropic,
+}
+
+impl<'de> Deserialize<'de> for RelayProtocol {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "responses" => Self::Responses,
+            "chatCompletions" => Self::ChatCompletions,
+            _ => Self::default(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -764,7 +777,7 @@ impl BackendSettings {
         self.active_aggregate_relay_profile().is_some()
             || matches!(
                 self.active_relay_profile().protocol,
-                RelayProtocol::ChatCompletions | RelayProtocol::Anthropic
+                RelayProtocol::ChatCompletions
             )
             || self.active_relay_profile().has_model_routes()
             || self.active_relay_profile().uses_no_auth()
@@ -1848,6 +1861,17 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(invalid.codex_app_stepwise_protocol, "chat_completions");
+    }
+
+    #[test]
+    fn legacy_relay_protocol_falls_back_to_responses() {
+        let profile: RelayProfile = serde_json::from_value(json!({
+            "id": "legacy",
+            "name": "Legacy",
+            "protocol": "anthropic"
+        }))
+        .unwrap();
+        assert_eq!(profile.protocol, RelayProtocol::Responses);
     }
 
     #[test]

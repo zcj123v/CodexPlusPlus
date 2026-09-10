@@ -1,5 +1,4 @@
 pub mod ads;
-pub mod anthropic_proxy;
 pub mod app_paths;
 pub mod assets;
 pub mod bridge;
@@ -40,9 +39,9 @@ pub mod relay_switch;
 pub mod remote_control_recovery;
 pub mod routes;
 pub mod script_market;
-pub mod share;
 pub mod session_share;
 pub mod settings;
+pub mod share;
 pub mod skills;
 pub mod status;
 pub mod stepwise;

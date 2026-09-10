@@ -1,13 +1,12 @@
 use codex_plus_core::protocol_proxy::{
-    ChatSseToResponsesConverter, UpstreamWireApi, anthropic_messages_url, anthropic_models_url,
-    audio_transcriptions_url, chat_completion_to_response,
-    chat_completion_to_response_with_request, chat_completions_url, chat_sse_to_responses_sse,
-    chat_sse_to_responses_sse_with_request, finalize_non_streaming_responses_response,
-    is_audio_transcriptions_proxy_path, is_chat_completions_proxy_path, is_models_proxy_path,
-    is_responses_compact_proxy_path, is_responses_proxy_path, models_url,
-    open_audio_transcriptions_proxy_request, open_chat_completions_proxy_request,
-    open_models_proxy_request, open_models_proxy_request_with_identity,
-    open_responses_proxy_request, open_responses_proxy_request_with_settings,
+    ChatSseToResponsesConverter, UpstreamWireApi, audio_transcriptions_url,
+    chat_completion_to_response, chat_completion_to_response_with_request, chat_completions_url,
+    chat_sse_to_responses_sse, chat_sse_to_responses_sse_with_request,
+    finalize_non_streaming_responses_response, is_audio_transcriptions_proxy_path,
+    is_chat_completions_proxy_path, is_models_proxy_path, is_responses_compact_proxy_path,
+    is_responses_proxy_path, models_url, open_audio_transcriptions_proxy_request,
+    open_chat_completions_proxy_request, open_models_proxy_request, open_responses_proxy_request,
+    open_responses_proxy_request_with_settings,
     open_responses_proxy_request_with_settings_for_path, responses_compact_url,
     responses_error_from_upstream, responses_to_chat_completions, responses_url,
     send_upstream_request_with_header_timeout, upstream_header_timeout, upstream_http_client,
@@ -1857,30 +1856,6 @@ fn response_and_chat_urls_replace_complete_sibling_endpoints() {
         chat_completions_url("https://api.example.test/v1/messages"),
         "https://api.example.test/v1/chat/completions"
     );
-    assert_eq!(
-        anthropic_messages_url("https://api.example.test/v1/models"),
-        "https://api.example.test/v1/messages"
-    );
-    assert_eq!(
-        anthropic_messages_url("https://api.example.test/v1/responses"),
-        "https://api.example.test/v1/messages"
-    );
-    assert_eq!(
-        anthropic_messages_url("https://api.example.test/v1/chat/completions"),
-        "https://api.example.test/v1/messages"
-    );
-    assert_eq!(
-        anthropic_models_url("https://api.example.test/v1/messages"),
-        "https://api.example.test/v1/models"
-    );
-    assert_eq!(
-        anthropic_models_url("https://api.example.test/v1/responses"),
-        "https://api.example.test/v1/models"
-    );
-    assert_eq!(
-        anthropic_models_url("https://api.example.test/v1/chat/completions"),
-        "https://api.example.test/v1/models"
-    );
 }
 
 #[test]
@@ -2764,75 +2739,6 @@ async fn no_auth_profile_test_omits_authorization_header() {
 
     assert_eq!(result.http_status, 200);
     assert_eq!(server.finish().authorization, None);
-}
-
-#[tokio::test]
-async fn anthropic_models_proxy_prefers_original_user_agent_and_forwards_originator() {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut buffer = [0_u8; 4096];
-        let bytes = stream.read(&mut buffer).await.unwrap();
-        let request = String::from_utf8_lossy(&buffer[..bytes]).to_string();
-        let body = r#"{"data":[],"has_more":false}"#;
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(response.as_bytes()).await.unwrap();
-        request
-    });
-    let profile = RelayProfile {
-        id: "anthropic-models".to_string(),
-        name: "Anthropic Models".to_string(),
-        base_url: format!("http://{addr}/v1"),
-        upstream_base_url: format!("http://{addr}/v1"),
-        api_key: "sk-models-test".to_string(),
-        protocol: codex_plus_core::settings::RelayProtocol::Anthropic,
-        relay_mode: RelayMode::MixedApi,
-        user_agent: "Models-UA/1.0".to_string(),
-        ..RelayProfile::default()
-    };
-
-    let upstream = open_models_proxy_request_with_identity(
-        &profile,
-        Some("Original-Models-UA/2.0"),
-        Some("codex_cli_rs"),
-    )
-    .await
-    .unwrap();
-    assert_eq!(upstream.status_code, 200);
-    let request = server.await.unwrap();
-    let head = request.split_once("\r\n\r\n").unwrap().0;
-    assert!(head.starts_with("GET /v1/models HTTP/1.1"), "{head}");
-    assert!(
-        head.lines()
-            .any(|line| line.eq_ignore_ascii_case("user-agent: Original-Models-UA/2.0")),
-        "{head}"
-    );
-    assert!(
-        head.lines()
-            .any(|line| line.eq_ignore_ascii_case("x-api-key: sk-models-test")),
-        "{head}"
-    );
-    assert!(
-        head.lines()
-            .any(|line| line.eq_ignore_ascii_case("authorization: Bearer sk-models-test")),
-        "{head}"
-    );
-    assert!(
-        head.lines()
-            .any(|line| line.eq_ignore_ascii_case("anthropic-version: 2023-06-01")),
-        "{head}"
-    );
-    assert!(
-        head.lines()
-            .any(|line| line.eq_ignore_ascii_case("originator: codex_cli_rs")),
-        "{head}"
-    );
 }
 
 fn write_chat_relay_settings(settings_dir: &Path, base_url: &str, user_agent: &str) {

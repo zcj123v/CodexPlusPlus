@@ -1737,16 +1737,16 @@ async fn launch_protocol_proxy_port_fallback_syncs_config_and_uses_effective_por
     std::fs::create_dir_all(&app_dir).unwrap();
     let status_store = StatusStore::new(temp.path().join("latest-status.json"));
     let events = Arc::new(Mutex::new(Vec::<String>::new()));
-    // anthropic/pureApi profile 使 active_relay_uses_protocol_proxy 为 true。
+    // chatCompletions/pureApi profile 使 active_relay_uses_protocol_proxy 为 true。
     let mut profile = RelayProfile {
         relay_mode: codex_plus_core::settings::RelayMode::PureApi,
         ..RelayProfile::default()
     };
-    profile.id = "relay-anthropic".to_string();
-    profile.protocol = RelayProtocol::Anthropic;
+    profile.id = "relay-chat".to_string();
+    profile.protocol = RelayProtocol::ChatCompletions;
     let settings = BackendSettings {
         relay_profiles: vec![profile],
-        active_relay_id: "relay-anthropic".to_string(),
+        active_relay_id: "relay-chat".to_string(),
         ..BackendSettings::default()
     };
     // 模拟 helper 回退：requested 57321，effective 57328。
@@ -1806,12 +1806,12 @@ async fn launch_protocol_proxy_port_fallback_syncs_config_without_enhancements()
         relay_mode: codex_plus_core::settings::RelayMode::PureApi,
         ..RelayProfile::default()
     };
-    profile.id = "relay-anthropic".to_string();
-    profile.protocol = RelayProtocol::Anthropic;
+    profile.id = "relay-chat".to_string();
+    profile.protocol = RelayProtocol::ChatCompletions;
     let settings = BackendSettings {
         enhancements_enabled: false,
         relay_profiles: vec![profile],
-        active_relay_id: "relay-anthropic".to_string(),
+        active_relay_id: "relay-chat".to_string(),
         ..BackendSettings::default()
     };
     let hooks = FakeHooks::new(events.clone())
@@ -1853,11 +1853,11 @@ async fn launch_protocol_proxy_without_fallback_still_syncs_to_restore_default()
         relay_mode: codex_plus_core::settings::RelayMode::PureApi,
         ..RelayProfile::default()
     };
-    profile.id = "relay-anthropic".to_string();
-    profile.protocol = RelayProtocol::Anthropic;
+    profile.id = "relay-chat".to_string();
+    profile.protocol = RelayProtocol::ChatCompletions;
     let settings = BackendSettings {
         relay_profiles: vec![profile],
-        active_relay_id: "relay-anthropic".to_string(),
+        active_relay_id: "relay-chat".to_string(),
         ..BackendSettings::default()
     };
     // 正常路径：57321 可绑定、无回退。上一次启动可能已把 config.toml 改写为
@@ -2242,7 +2242,7 @@ impl LaunchHooks for FakeHooks {
         Ok(())
     }
 
-async fn start_helper(&self, helper_port: u16) -> anyhow::Result<u16> {
+    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<u16> {
         {
             let mut remaining = self.remaining_helper_bind_conflicts.lock().unwrap();
             if *remaining > 0 {

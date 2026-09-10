@@ -392,7 +392,7 @@ type McpImportPreviewResult = CommandResult<{
   warnings: string[];
 }>;
 
-type RelayProtocol = "responses" | "chatCompletions" | "anthropic";
+type RelayProtocol = "responses" | "chatCompletions";
 type RelayMode = "official" | "mixedApi" | "pureApi" | "aggregate";
 type RelaySessionProvider = "custom" | "openai";
 const CHAT_UPSTREAM_BASE_URL_KEY = "codex_plus_chat_base_url";
@@ -8427,13 +8427,6 @@ function RelayProfileEditor({
                 >
                   Chat Completions
                 </button>
-                <button
-                  className={`protocol-option ${profile.protocol === "anthropic" ? "active" : ""}`}
-                  onClick={() => updateDraft({ protocol: "anthropic" })}
-                  type="button"
-                >
-                  Anthropic
-                </button>
               </div>
             </Field>
             <Field className="relay-field-session-provider" label={t("Codex 会话身份")}>
@@ -8553,7 +8546,7 @@ function RelayProfileEditor({
                     { value: "strip", label: t("移除图片"), title: t("删掉图片只发文字,避免纯文本模型报错(模型看不到图)") },
                     { value: "vlm", label: t("视觉辅助分析"), title: t("图片先由视觉辅助模型(Qwen)转成文字描述,纯文本模型也能\"看图\"") },
                   ]}
-                  title={vlmUnsupportedProtocol ? t("VLM 仅支持 Chat Completions、Anthropic 协议和聚合模式") : t("多模态模型（支持图片输入的模型）请保持 send-as-is。")}
+                  title={vlmUnsupportedProtocol ? t("VLM 仅支持 Chat Completions 和聚合模式") : t("多模态模型（支持图片输入的模型）请保持 send-as-is。")}
                 />
                 <Button
                   aria-label={t("删除模型")}
@@ -8725,7 +8718,7 @@ function RelayProfileEditor({
             <p className="field-hint">
               {t("若开启 VLM analysis，请确认 VLM 配置项完整且服务可用。")}
               <br />
-              {t("仅在 Chat Completions、Anthropic 协议和聚合模式生效。")}
+              {t("仅在 Chat Completions 和聚合模式生效。")}
             </p>
             {modelWindowRows.some((row) => row.imageHandling === "vlm") && (!profile.vlmApiKey || !profile.vlmModel || !profile.vlmBaseUrl) ? (
               <p className="field-hint warn">{t("VLM 配置不完整：API Key、Model 和 Base URL 为必填项，否则 VLM 不会生效。")}</p>
@@ -8818,7 +8811,7 @@ function RelayProfileEditor({
           <ToggleVisual />
         </label>
       </div>
-      {showApiFields && (profile.protocol === "chatCompletions" || profile.protocol === "anthropic") ? (
+      {showApiFields && profile.protocol === "chatCompletions" ? (
         <div className="hint-line relay-protocol-hint">
           <MessageCircle className="h-4 w-4" />
           <span>{t("此上游会通过本地 127.0.0.1:57321 转成 Responses API，需要从 Codex++ 启动 Codex。")}</span>
@@ -11255,7 +11248,7 @@ function normalizeRelayProfile(profile: RelayProfile): RelayProfile {
     baseUrl: profile.baseUrl || defaultSettings.relayBaseUrl,
     upstreamBaseUrl: profile.upstreamBaseUrl || profile.baseUrl || "",
     apiKey: noAuth ? "" : profile.apiKey || "",
-    protocol: profile.protocol === "chatCompletions" || profile.protocol === "anthropic" ? profile.protocol : "responses",
+    protocol: profile.protocol === "chatCompletions" ? profile.protocol : "responses",
     relayMode,
     sessionProvider: relaySessionProvider(profile),
     officialMixApiKey,
@@ -11304,7 +11297,6 @@ function activeRelayProfile(settings: BackendSettings): RelayProfile {
 }
 
 function relayProtocolLabel(protocol: RelayProtocol): string {
-  if (protocol === "anthropic") return t("Anthropic 转 Responses");
   return protocol === "chatCompletions" ? t("Chat Completions 转 Responses") : "Responses API";
 }
 
@@ -11461,7 +11453,7 @@ function buildRelayConfigToml(
   profile: Pick<RelayProfile, "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol" | "sessionProvider" | "noAuth">,
   options: { includeBearerToken: boolean; requiresOpenAiAuth?: boolean },
 ): string {
-  const baseUrl = profile.protocol === "chatCompletions" || profile.protocol === "anthropic" || profile.noAuth
+  const baseUrl = profile.protocol === "chatCompletions" || profile.noAuth
     ? PROTOCOL_PROXY_BASE_URL
     : profile.baseUrl.trim();
   const apiKey = profile.apiKey.trim();
@@ -11627,7 +11619,7 @@ function applyRelayProfilePatchToFiles(
     next.baseUrl = patch.upstreamBaseUrl || "";
   }
   if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch || "modelRoutes" in patch) {
-    const baseUrlForConfig = next.protocol === "chatCompletions" || next.protocol === "anthropic" || next.noAuth || normalizeRelayModelRoutes(next.modelRoutes).length > 0
+    const baseUrlForConfig = next.protocol === "chatCompletions" || next.noAuth || normalizeRelayModelRoutes(next.modelRoutes).length > 0
       ? PROTOCOL_PROXY_BASE_URL
       : next.upstreamBaseUrl || next.baseUrl;
     next.configContents = setCodexProviderStringKey(next.configContents, "base_url", baseUrlForConfig, {

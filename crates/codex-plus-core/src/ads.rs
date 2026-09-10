@@ -151,7 +151,7 @@ fn append_builtin_sponsors(ads: &mut Vec<Value>) {
         builtin_sponsor(
             "fenno-ai",
             "FennoAI",
-            "稳定高效的 Codex API 中转服务，兼容 OpenAI 与 Anthropic 协议，支持企业级调用、公对公结算和开票。",
+            "稳定高效的 Codex API 中转服务，兼容 OpenAI 协议，支持企业级调用、公对公结算和开票。",
             "https://api.fenno.ai/s/ZZM7",
             FENNO_AI_IMAGE,
             "image/png",

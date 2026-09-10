@@ -323,8 +323,6 @@ fn build_config_toml(base_url: &str, api_key: &str, protocol: RelayProtocol) -> 
     let wire_api = match protocol {
         RelayProtocol::Responses => "responses",
         RelayProtocol::ChatCompletions => "chat",
-        // Anthropic 经由本地代理接入，codex 侧始终以 responses 协议对话
-        RelayProtocol::Anthropic => "responses",
     };
     [
         "model_provider = \"CodexPlusPlus\"".to_string(),

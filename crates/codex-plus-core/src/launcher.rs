@@ -1559,21 +1559,6 @@ async fn handle_models_proxy_connection(
         upstream.content_type.clone()
     };
     let body = upstream.response.bytes().await?.to_vec();
-    // Anthropic 上游成功时把 models 列表转成 OpenAI 格式再回给客户端
-    let body = if is_success
-        && upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages
-    {
-        serde_json::from_slice::<serde_json::Value>(&body)
-            .map(|json| {
-                serde_json::to_vec(&crate::anthropic_proxy::anthropic_models_to_openai_models(
-                    &json,
-                ))
-                .unwrap_or_default()
-            })
-            .unwrap_or(body)
-    } else {
-        body
-    };
     write_http_response(stream, &status, &content_type, &body).await?;
     log_helper_response(
         if is_success {
@@ -1635,19 +1620,11 @@ async fn handle_protocol_proxy_connection(
         let status = upstream.status();
         let upstream_content_type = upstream.content_type.clone();
         let upstream_body = upstream.response.bytes().await?.to_vec();
-        let error =
-            if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages {
-                crate::anthropic_proxy::anthropic_error_to_responses_error(
-                    upstream.status_code,
-                    &upstream_body,
-                )
-            } else {
-                crate::protocol_proxy::responses_error_from_upstream(
-                    upstream.status_code,
-                    &upstream_content_type,
-                    &upstream_body,
-                )
-            };
+        let error = crate::protocol_proxy::responses_error_from_upstream(
+            upstream.status_code,
+            &upstream_content_type,
+            &upstream_body,
+        );
         let body = serde_json::to_vec(&error)?;
         write_http_response(stream, &status, "application/json; charset=utf-8", &body).await?;
         log_helper_response(

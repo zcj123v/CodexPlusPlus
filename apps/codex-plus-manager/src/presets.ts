@@ -9,7 +9,7 @@
 
 export type PresetCategory = "official" | "aggregator" | "third_party" | "cn_official";
 
-export type RelayProtocol = "responses" | "chatCompletions" | "anthropic";
+export type RelayProtocol = "responses" | "chatCompletions";
 
 export interface ProviderPreset {
   id: string;
@@ -56,7 +56,7 @@ export function createPresetPatch(preset: ProviderPreset): PresetPatch {
  * 预设列表。选择任一预设会自动填充：
  * - name     → 供应商名称
  * - baseUrl  → API 端点
- * - protocol → responses / chatCompletions / anthropic（根据上游实际协议）
+ * - protocol → responses / chatCompletions（根据上游实际协议）
  * - model    → 默认模型名
  * - modelList → 可选模型清单（换行分隔）
  */
@@ -105,18 +105,6 @@ export const PRESETS: ProviderPreset[] = [
     protocol: "chatCompletions",
     model: "kimi-k2.6",
     modelList: ["kimi-k2.6"],
-  },
-  {
-    id: "kimi-for-coding-anthropic",
-    name: "Kimi For Coding (Anthropic)",
-    websiteUrl: "https://www.kimi.com/code",
-    apiKeyUrl: "https://www.kimi.com/code/console",
-    category: "cn_official",
-    baseUrl: "https://api.kimi.com/coding",
-    protocol: "anthropic",
-    model: "k3",
-    modelList: ["k3", "kimi-for-coding", "kimi-for-coding-highspeed"],
-    modelWindows: { k3: "1M" },
   },
   {
     id: "bailian",

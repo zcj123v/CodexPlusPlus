@@ -614,7 +614,6 @@ pub async fn test_relay_profile(
     let endpoint = match profile.protocol {
         RelayProtocol::Responses => format!("{base_url}/responses"),
         RelayProtocol::ChatCompletions => format!("{base_url}/chat/completions"),
-        RelayProtocol::Anthropic => crate::protocol_proxy::anthropic_messages_url(base_url),
     };
     let test_model = model.trim();
     if test_model.is_empty() {
@@ -622,27 +621,10 @@ pub async fn test_relay_profile(
     }
 
     let payload = relay_profile_test_payload(profile.protocol, test_model);
-    // Anthropic 上游要求 anthropic-version 头，缺失会直接 400；
-    // 原生 Anthropic 端点靠 x-api-key 认证，缺失会 401，
-    // 与主代理路径（anthropic_request_builder）保持一致，三头同发。
-    let anthropic_headers = |request: reqwest::RequestBuilder| {
-        if profile.protocol == RelayProtocol::Anthropic {
-            request
-                .header(
-                    "anthropic-version",
-                    crate::anthropic_proxy::ANTHROPIC_VERSION,
-                )
-                .header("x-api-key", api_key)
-        } else {
-            request
-        }
-    };
-    let mut request = anthropic_headers(
-        client
-            .post(&endpoint)
-            .header(reqwest::header::CONTENT_TYPE, "application/json"),
-    )
-    .json(&payload);
+    let mut request = client
+        .post(&endpoint)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .json(&payload);
     if !profile.uses_no_auth() {
         request = request.bearer_auth(api_key);
     }
@@ -657,14 +639,11 @@ pub async fn test_relay_profile(
         let v1_endpoint = match profile.protocol {
             RelayProtocol::Responses => format!("{v1_url}/responses"),
             RelayProtocol::ChatCompletions => format!("{v1_url}/chat/completions"),
-            RelayProtocol::Anthropic => crate::protocol_proxy::anthropic_messages_url(&v1_url),
         };
-        let mut request = anthropic_headers(
-            client
-                .post(&v1_endpoint)
-                .header(reqwest::header::CONTENT_TYPE, "application/json"),
-        )
-        .json(&payload);
+        let mut request = client
+            .post(&v1_endpoint)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&payload);
         if !profile.uses_no_auth() {
             request = request.bearer_auth(api_key);
         }
@@ -698,8 +677,7 @@ fn relay_profile_test_payload(protocol: RelayProtocol, model: &str) -> Value {
             "input": "hi",
             "max_output_tokens": 16
         }),
-        // Chat Completions 与 Anthropic Messages 的探测负载同构（均要求 messages + max_tokens）
-        RelayProtocol::ChatCompletions | RelayProtocol::Anthropic => serde_json::json!({
+        RelayProtocol::ChatCompletions => serde_json::json!({
             "model": model,
             "messages": [
                 { "role": "user", "content": "hi" }
@@ -710,10 +688,7 @@ fn relay_profile_test_payload(protocol: RelayProtocol, model: &str) -> Value {
 }
 
 fn relay_protocol_uses_local_responses_proxy(protocol: RelayProtocol) -> bool {
-    matches!(
-        protocol,
-        RelayProtocol::ChatCompletions | RelayProtocol::Anthropic
-    )
+    protocol == RelayProtocol::ChatCompletions
 }
 
 fn codex_base_url_for_protocol(base_url: &str, protocol: RelayProtocol, proxy_port: u16) -> String {
@@ -2533,8 +2508,7 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
         {
             return profile.upstream_base_url.trim().to_string();
         }
-        if !profile.base_url.trim().is_empty()
-            && !is_local_proxy_base_url(profile.base_url.trim())
+        if !profile.base_url.trim().is_empty() && !is_local_proxy_base_url(profile.base_url.trim())
         {
             return profile.base_url.trim().to_string();
         }
@@ -2550,8 +2524,7 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
         {
             return value;
         }
-        if !profile.base_url.trim().is_empty()
-            && !is_local_proxy_base_url(profile.base_url.trim())
+        if !profile.base_url.trim().is_empty() && !is_local_proxy_base_url(profile.base_url.trim())
         {
             return profile.base_url.trim().to_string();
         }

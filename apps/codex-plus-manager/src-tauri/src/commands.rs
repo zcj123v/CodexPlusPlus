@@ -5536,7 +5536,6 @@ pub async fn diagnose_relay_profile(profile: RelayProfile) -> CommandResult<Prov
             match profile.protocol {
                 codex_plus_core::settings::RelayProtocol::Responses => "Responses API",
                 codex_plus_core::settings::RelayProtocol::ChatCompletions => "Chat Completions",
-                codex_plus_core::settings::RelayProtocol::Anthropic => "Anthropic Messages",
             }
         ),
     });
