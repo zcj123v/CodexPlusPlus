@@ -358,7 +358,15 @@ impl LaunchHooks for LauncherHooks {
         let result = tokio::task::spawn_blocking(|| codex_plus_data::run_provider_sync(None))
             .await
             .map_err(|error| anyhow::anyhow!("provider sync task failed: {error}"))?;
-        require_completed_provider_sync(&result.status, &result.message)
+        // fork(linux):本机 Codex App 常自启常驻,provider sync 会因此被跳过,
+        // 上游把跳过视为致命会导致后端永远起不来;仅「跳过且 App 确在运行」降级为告警
+        let app_running =
+            !codex_plus_core::watcher::find_session_index_cleanup_blocking_processes().is_empty();
+        tolerate_provider_sync_skipped_while_app_running(
+            &result.status,
+            &result.message,
+            app_running,
+        )
     }
 
     fn has_pending_remote_control_session_recoveries(&self) -> bool {
@@ -615,6 +623,23 @@ fn require_completed_provider_sync(
         return Ok(());
     }
     anyhow::bail!("provider sync did not complete ({status:?}): {message}")
+}
+
+/// fork(linux):仅当 provider sync 因「App 仍在运行」被跳过(且当前 App 确实在运行)
+/// 时放行启动并记录诊断日志;其余未完成状态维持上游的致命处理。
+fn tolerate_provider_sync_skipped_while_app_running(
+    status: &codex_plus_data::ProviderSyncStatus,
+    message: &str,
+    app_running: bool,
+) -> anyhow::Result<()> {
+    if *status == codex_plus_data::ProviderSyncStatus::Skipped && app_running {
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "launcher.provider_sync_skipped_app_running",
+            json!({ "message": message }),
+        );
+        return Ok(());
+    }
+    require_completed_provider_sync(status, message)
 }
 
 #[derive(Debug, Clone)]
@@ -1164,6 +1189,46 @@ mod tests {
                 .expect_err("an incomplete provider sync must stop launch");
             assert!(error.to_string().contains("target is unresolved"));
         }
+    }
+
+    #[test]
+    fn launcher_tolerates_provider_sync_skipped_only_while_app_running() {
+        // App 在运行时被跳过:放行
+        assert!(
+            tolerate_provider_sync_skipped_while_app_running(
+                &codex_plus_data::ProviderSyncStatus::Skipped,
+                "Codex App 仍在运行",
+                true,
+            )
+            .is_ok()
+        );
+        // 跳过但 App 并未运行(如锁占用):维持致命
+        assert!(
+            tolerate_provider_sync_skipped_while_app_running(
+                &codex_plus_data::ProviderSyncStatus::Skipped,
+                "Provider sync lock exists",
+                false,
+            )
+            .is_err()
+        );
+        // Disabled 无论 App 是否在运行都维持上游行为
+        assert!(
+            tolerate_provider_sync_skipped_while_app_running(
+                &codex_plus_data::ProviderSyncStatus::Disabled,
+                "disabled",
+                true,
+            )
+            .is_err()
+        );
+        // Synced 不受影响
+        assert!(
+            tolerate_provider_sync_skipped_while_app_running(
+                &codex_plus_data::ProviderSyncStatus::Synced,
+                "Provider sync complete",
+                true,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
