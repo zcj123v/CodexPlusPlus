@@ -4,9 +4,7 @@
 
 ## 项目概述
 
-本仓库是 [BigPizzaV3/CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus) 的 fork，目标是实现「按模型粒度配置上下文窗口与自动压缩阈值」feature（对应 issue #1171 / #931）。
-
-采用 codex 原生 `model_catalog_json` 机制：通过 `model_list` 后缀语法（如 `deepseek-v4-pro[1M]`）声明每模型窗口，由 CodexPlusPlus 生成 catalog 文件并注入 config.toml 指针，codex 客户端运行时按模型识别各自窗口。
+本仓库是 [BigPizzaV3/CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus) 的 fork，定位为「仅保留 Linux 适配」的下游分支：支持 Linux 上的社区/官方 codex desktop 布局、Arch/Debian 打包与发布、fork 自有更新通道。功能特性与上游保持一致；新增功能需求先评估能否直接提给上游，只在确属平台适配时才在 fork 落地。
 
 ## 仓库结构
 
@@ -17,11 +15,10 @@
 
 ## 关键代码位置
 
-- 数据模型：`crates/codex-plus-core/src/settings.rs` 的 `RelayProfile` 结构体
-- 配置生成：`crates/codex-plus-core/src/relay_config.rs` 的 `apply_context_limits_to_config`
-- catalog 解析：`crates/codex-plus-core/src/model_catalog.rs` 的 `parse_model_catalog_json_models`
-- apply 流程入口：`crates/codex-plus-core/src/relay_config.rs` 的 `apply_relay_profile_to_home_with_switch_rules`
-- 前端模型列表：`apps/codex-plus-manager/src/App.tsx` 的 `modelList` textarea
+- Linux 安装适配:`crates/codex-plus-core/src/install/linux.rs`
+- 桌面布局/进程检测:`crates/codex-plus-core/src/app_paths.rs`、`crates/codex-plus-core/src/watcher.rs`
+- fork 更新通道:`crates/codex-plus-core/src/update.rs`、`apps/codex-plus-manager/src-tauri/src/commands.rs`
+- 打包与发布:`scripts/installer/arch/`、`scripts/installer/debian/`、`.github/workflows/arch-package.yml`、`.github/workflows/release-assets.yml`
 
 ## 安全规则
 
@@ -54,10 +51,10 @@
 ## 与上游同步
 
 - `upstream` = https://github.com/BigPizzaV3/CodexPlusPlus.git
-- `origin` = 用户自己的 GitHub fork（待创建）
-- feature 分支命名：`codex/per-model-context` 或类似
+- `origin` = 用户自己的 GitHub fork(待创建)
+- 分支约定:`linux-support` 为主线,只承载 Linux 适配;临时工作分支用 `linux/<topic>`
 - 定期 `git fetch upstream && git rebase upstream/main` 保持同步
-- 目标：全栈完成后向主仓提 PR 合并
+- 非 Linux 适配的改动一律先提给上游,不在 fork 长期携带
 
 ## Fork 版本规则
 
