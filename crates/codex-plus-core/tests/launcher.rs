@@ -568,6 +568,9 @@ fn app_paths_linux_finds_codex_app_from_search_roots_avoiding_empty_opt() {
     );
 }
 
+/// 官方 Linux 包装了一个 wrapper 脚本（/usr/bin/chatgpt → /usr/lib/chatgpt/codex-launcher），
+/// 它先应用 chatgpt-flags.conf 里的启动参数再 exec 真正的 Electron 二进制；fork 刻意
+/// 优先返回 wrapper，因此这里放行 wrapper 与原始二进制两种结果，只校验指向官方根目录。
 #[test]
 #[cfg(target_os = "linux")]
 fn live_system_resolves_chatgpt_on_linux_when_installed() {
@@ -575,7 +578,12 @@ fn live_system_resolves_chatgpt_on_linux_when_installed() {
     if Path::new("/usr/lib/chatgpt").is_dir() {
         assert_eq!(resolved.as_deref(), Some(Path::new("/usr/lib/chatgpt")));
         let exe = codex_plus_core::app_paths::build_codex_executable(&resolved.unwrap());
-        assert_eq!(exe, PathBuf::from("/usr/lib/chatgpt/ChatGPT"));
+        assert!(
+            exe == PathBuf::from("/usr/lib/chatgpt/ChatGPT")
+                || exe == PathBuf::from("/usr/bin/chatgpt"),
+            "unexpected executable for the official Linux package: {}",
+            exe.display()
+        );
     }
 }
 

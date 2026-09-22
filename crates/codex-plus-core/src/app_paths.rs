@@ -16,14 +16,13 @@ const CODEX_PACKAGE_EXECUTABLES: &[&str] = &["ChatGPT.exe", "Codex.exe", "codex.
 #[cfg(not(target_os = "linux"))]
 const STANDALONE_CODEX_EXECUTABLES: &[&str] = &["ChatGPT.exe", "Codex.exe", "codex.exe"];
 
-/// Linux 可执行文件名（原生优先，兼容便携包）。`electron` / `codex-desktop`
-/// 来自社区版 ilysenko/codex-desktop-linux 及其改名打包。
+/// Linux 可执行文件名。不收录 `codex` / `chatgpt`：这两个名字与 Codex CLI
+/// 可执行文件同名（其中一种发行版布局还恰好叫 /usr/lib/openai-codex-desktop），
+/// 放进来会把 CLI 目录误判成桌面应用根。`electron` / `codex-desktop` 来自社区版
+/// ilysenko/codex-desktop-linux 及其改名打包。
 #[cfg(target_os = "linux")]
 const LINUX_CODEX_EXECUTABLES: &[&str] = &[
     "ChatGPT",
-    "chatgpt",
-    "Codex",
-    "codex",
     "electron",
     "codex-desktop",
     "ChatGPT.exe",
@@ -860,12 +859,11 @@ pub(crate) fn is_supported_app_executable_name(name: &str) -> bool {
     }
     // Linux：官方包（openai-codex-desktop）的 Electron 二进制名为 `ChatGPT`；
     // 社区包（ilysenko/codex-desktop-linux）直接用 `electron`，部分改名打包为
-    // `codex-desktop`；便携包/共享目录仍可能出现无扩展名的 `Codex`。
+    // `codex-desktop`。刻意不收 `codex` / `chatgpt`：它们与 Codex CLI 同名，
+    // 收录会把 CLI 目录误判成桌面应用根（见 tests/app_paths.rs 的拒绝用例）。
+    // Linux 进程匹配走 watcher 的 linux_process_matches_codex_desktop，不依赖本函数。
     cfg!(target_os = "linux")
-        && (name == "ChatGPT"
-            || name == "Codex"
-            || name == "electron"
-            || name == "codex-desktop")
+        && (name == "ChatGPT" || name == "electron" || name == "codex-desktop")
 }
 
 fn package_spec_from_path(path: &Path) -> Option<AppPackageSpec> {
