@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // 一条命令发版：改版本号 → 提交 → 打 tag → 推送。推送 tag 后由 CI（Release assets）
-// 从 CHANGELOG.md 截取说明建草稿 Release、构建各平台附件，附件齐了再自动发布。
+// 从 CHANGELOG.md 截取说明建草稿 Release、构建 Linux 附件，附件齐了再自动发布。
 //
 // 用法：
 //   node scripts/release.mjs 2.2.2            # 正式发版
@@ -51,9 +51,9 @@ if (!VERSION_PATTERN.test(version)) {
   fail("用法：node scripts/release.mjs <版本号，如 2.2.2> [--dry-run]");
 }
 
-// 1. 工作区：必须在 main 上，除 CHANGELOG.md 外不能有未提交的改动（未跟踪文件不管）。
+// 1. 工作区：必须在 linux-support 上，除 CHANGELOG.md 外不能有未提交的改动（未跟踪文件不管）。
 const branch = run("git", ["rev-parse", "--abbrev-ref", "HEAD"]);
-if (branch !== "main") fail(`当前在 ${branch} 分支，发版只从 main 发`);
+if (branch !== "linux-support") fail(`当前在 ${branch} 分支，发版只从 linux-support 发`);
 // -z 输出不能 trim：行首的状态列是空格，trim 掉会把文件名切掉一个字符。
 const dirty = execFileSync("git", ["status", "--porcelain", "-z", "--untracked-files=no"], { cwd: root, encoding: "utf8" })
   .split("\0")
@@ -63,12 +63,12 @@ const dirty = execFileSync("git", ["status", "--porcelain", "-z", "--untracked-f
 if (dirty.length) fail(`有未提交的改动，先提交或还原：\n  ${dirty.join("\n  ")}`);
 step("工作区干净（CHANGELOG.md 除外）");
 
-// 2. 与远端同步：本地不能落后 origin/main，否则推送会被拒或发出旧代码。
-run("git", ["fetch", "origin", "main", "--tags", "--quiet"]);
-if (!tryRun("git", ["merge-base", "--is-ancestor", "origin/main", "HEAD"]).ok) {
-  fail("本地 main 落后于 origin/main，先 git pull --rebase");
+// 2. 与远端同步：本地不能落后 origin/linux-support，否则推送会被拒或发出旧代码。
+run("git", ["fetch", "origin", "linux-support", "--tags", "--quiet"]);
+if (!tryRun("git", ["merge-base", "--is-ancestor", "origin/linux-support", "HEAD"]).ok) {
+  fail("本地 linux-support 落后于 origin/linux-support，先 git pull --rebase");
 }
-step("本地 main 不落后 origin/main");
+step("本地 linux-support 不落后 origin/linux-support");
 
 // 3. tag 不能已存在。
 if (tryRun("git", ["rev-parse", "-q", "--verify", `refs/tags/${tag}`]).ok) fail(`本地已有 tag ${tag}`);
@@ -129,7 +129,7 @@ if (dryRun) {
   process.exit(0);
 }
 
-// 7. 提交、打 tag、原子推送（main 和 tag 要么都上去，要么都不上去）。
+// 7. 提交、打 tag、原子推送（linux-support 和 tag 要么都上去，要么都不上去）。
 if (toCommit.length) {
   run("git", ["add", "--", ...toCommit]);
   run("git", ["commit", "-m", `release: ${tag}`], { stdio: ["ignore", "pipe", "inherit"] });
@@ -137,7 +137,7 @@ if (toCommit.length) {
 }
 run("git", ["tag", "-a", tag, "-m", `Codex++ ${tag}`]);
 step(`已打 tag ${tag} → ${run("git", ["rev-parse", "--short", "HEAD"])}`);
-execFileSync("git", ["push", "--atomic", "origin", "HEAD:refs/heads/main", `refs/tags/${tag}`], { cwd: root, stdio: "inherit" });
+execFileSync("git", ["push", "--atomic", "origin", "HEAD:refs/heads/linux-support", `refs/tags/${tag}`], { cwd: root, stdio: "inherit" });
 
 const repo = tryRun("gh", ["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"]);
 const slug = repo.ok ? repo.out : "BigPizzaV3/CodexPlusPlus";

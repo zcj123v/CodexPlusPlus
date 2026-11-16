@@ -1,5 +1,12 @@
 # 更新日志
 
+## 2.6.10-linux.1 - 2026-11-16
+
+- 同步上游 [v2.6.10](https://github.com/BigPizzaV3/CodexPlusPlus/releases/tag/v2.6.10)，应用功能与上游一致，移除旧 fork 独立功能差异。
+- 本仓库仅构建和发布 Linux x86_64：Ubuntu 24.04 DEB，以及使用同一二进制生成的 tar.gz。其他发行版使用 tar.gz 时需要 GTK 3 / WebKitGTK 4.1 等动态依赖。
+- 应用内更新行为保持上游配置；本 fork 的 Linux 安装包从本仓库 Releases 获取。
+- 上游本版修复及历史更新见下方日志；本次升级保留原有用户数据。
+
 ## 2.6.10 - 2026-11-15
 
 本次修复切换渠道后技能启停被重置、Claude Desktop 偶发显示连接断开、切换供应商时反复提示「旧会话尚未卸载」等问题。

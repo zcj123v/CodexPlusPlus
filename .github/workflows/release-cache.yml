@@ -1,13 +1,13 @@
 name: Release dependency cache
 
 # 给 release-assets.yml 预热 release profile 的第三方依赖缓存。
-# PR build 推送 main 时只跑测试 / check，不再编 release，发版那边就没有现成的 release 依赖可读；
+# Linux-only release 依赖缓存。
 # 依赖只在 Cargo.lock 变化时才变，所以只在这时（以及每周一次防止 7 天未访问被逐出、手动触发）编一遍。
-# rust-cache 只缓存第三方依赖（会剔除本仓库 crate），shared-key 必须与 release-assets.yml 一致。
+# rust-cache 只缓存第三方依赖（会剔除本仓库 crate），key 必须与 release-assets.yml 一致。
 
 on:
   push:
-    branches: [main]
+    branches: [linux-support]
     paths:
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -24,12 +24,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  windows:
-    name: Windows release deps
-    runs-on: windows-latest
+  linux:
+    name: Linux release dependencies
+    runs-on: ubuntu-24.04
     steps:
-      - name: Checkout
+      - name: Checkout release tag
         uses: actions/checkout@v4
+        with:
+          ref: linux-support
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -42,49 +44,40 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: windows-release
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: linux
+          save-if: ${{ github.ref == 'refs/heads/linux-support' }}
 
-      # 统一应用会把前端 dist 嵌进二进制，和发版一样先构建前端再编。
-      - name: Install frontend dependencies
-        working-directory: apps/codex-plus-manager
-        run: npm ci
-
-      - name: Build frontend
-        working-directory: apps/codex-plus-manager
-        run: npm run vite:build
-
-      - name: Build release
-        run: cargo build --release
-
-  macos:
-    name: macOS release deps (${{ matrix.target }})
-    runs-on: macos-15
-    strategy:
-      matrix:
-        target: [x86_64-apple-darwin, aarch64-apple-darwin]
-    env:
-      # 与 release-assets.yml 保持一致：rust-cache 的环境哈希和 C 依赖的编译参数都要对得上。
-      MACOSX_DEPLOYMENT_TARGET: "12.0"
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: macos-release-${{ matrix.target }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # 与 pr-build.yml 相同：默认 Azure 镜像不通时限时失败并换官方源重试。
+      - name: Install Linux build dependencies
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          pkgs="build-essential curl git pkg-config libssl-dev libsqlite3-dev \
+            libdbus-1-dev libglib2.0-dev libgtk-3-dev \
+            libayatana-appindicator3-dev libjavascriptcoregtk-4.1-dev \
+            libwebkit2gtk-4.1-dev libsoup-3.0-dev libz3-dev libasound2-dev"
+          apt="sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15"
+          try_install() {
+            timeout 480 bash -c "$apt update -qq && $apt install -y --no-install-recommends $pkgs"
+          }
+          # 新版 runner 的源写成 mirror+file:/etc/apt/apt-mirrors.txt（里面是 azure 镜像），旧版直接写 azure 地址，两种都换。
+          use_official_mirror() {
+            echo "::warning::默认 Ubuntu 镜像不可用，改用 archive.ubuntu.com"
+            for f in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
+              if [ -f "$f" ]; then
+                sudo sed -i -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu#g' \
+                  -e 's#http://azure.archive.ubuntu.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
+              fi
+            done
+          }
+          # 域名都解析不了时 apt 要白等好几分钟才放弃（2026-11-11 实测），先探一下，不通直接换。
+          if ! getent hosts azure.archive.ubuntu.com >/dev/null; then
+            use_official_mirror
+          fi
+          if ! try_install; then
+            use_official_mirror
+            try_install
+          fi
 
       - name: Install frontend dependencies
         working-directory: apps/codex-plus-manager
@@ -94,5 +87,8 @@ jobs:
         working-directory: apps/codex-plus-manager
         run: npm run vite:build
 
-      - name: Build release
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Check sherpa-onnx prebuilt cache
+        run: node scripts/prepare-sherpa-cache.mjs
+
+      - name: Build application
+        run: cargo build --locked --release -p codex-plus-manager

@@ -2,7 +2,7 @@ name: Release assets
 
 # 发版入口是推送 v* tag（本地用 `node scripts/release.mjs <版本号>`）：
 #   prepare  校验版本号文件与 tag 一致，从 CHANGELOG.md 截取说明，建草稿 Release
-#   构建     Windows / macOS 并行构建，附件传到草稿
+#   构建     Linux DEB / tar.gz 构建，附件传到草稿
 #   收尾     生成 SHA256SUMS.txt 与 latest.json，附件齐了才公开发布
 # 草稿期间用户看不到这一版，某个平台失败也不会让「检查更新」读到缺附件的 Latest。
 # 手动在网页上发布 Release 不再触发构建；补跑某个平台用 workflow_dispatch。
@@ -14,18 +14,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "已存在的版本标签，例如 v1.7.1"
+        description: "已存在的版本标签，例如 v2.6.10-linux.1"
         required: true
         type: string
-      platform:
-        description: "需要重新构建的平台"
-        default: all
-        type: choice
-        options:
-          - all
-          - windows
-          - macos
-          - linux
       publish:
         description: "Release 还是草稿时，附件与更新元数据齐备后公开发布"
         default: false
@@ -96,330 +87,8 @@ jobs:
               ;;
           esac
 
-  windows-installer:
-    needs: prepare
-    if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'windows'
-    runs-on: windows-latest
-    steps:
-      - name: Checkout release tag
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ env.RELEASE_TAG }}
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      # 只读复用 release-cache.yml 在 main 上预热的 release 依赖缓存（tag 运行能读默认分支的缓存）。
-      # shared-key 必须与 release-cache.yml 一致：rust-cache 默认把 job id 拼进键，两边 job 名不同就永远命中不了。
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: windows-release
-          save-if: false
-
-      - name: Install NSIS
-        shell: pwsh
-        run: |
-          $makensis = $null
-          for ($attempt = 1; $attempt -le 3; $attempt++) {
-            choco install nsis -y --no-progress
-            # Chocolatey 可能在下载失败后返回成功，必须实际验证编译器。
-            $candidates = @(
-              "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
-              "$env:ProgramFiles\NSIS\makensis.exe"
-            )
-            $makensis = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
-            if (-not $makensis) {
-              $command = Get-Command makensis.exe -ErrorAction SilentlyContinue
-              if ($command) { $makensis = $command.Source }
-            }
-            if ($makensis) {
-              & $makensis /VERSION
-              if ($LASTEXITCODE -eq 0) { break }
-            }
-            $makensis = $null
-            if ($attempt -lt 3) { Start-Sleep -Seconds (10 * $attempt) }
-          }
-          if (-not $makensis) { throw "NSIS 安装失败或编译器不可用，停止发布构建。" }
-
-      - name: Install frontend dependencies
-        working-directory: apps/codex-plus-manager
-        run: npm ci
-
-      - name: Build frontend
-        working-directory: apps/codex-plus-manager
-        run: npm run vite:build
-
-      - name: Build application
-        run: cargo build --release
-
-      - name: Stage Windows app files
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force dist/windows/app | Out-Null
-          Copy-Item target/release/codex-plus-plus.exe dist/windows/app/
-          if ((Get-ChildItem dist/windows/app -Filter *.exe).Count -ne 1) { throw "Windows 安装包必须只有一个应用程序。" }
-
-      - name: Build Windows zip asset
-        shell: pwsh
-        run: |
-          $version = ($env:RELEASE_TAG).TrimStart("v", "V")
-          New-Item -ItemType Directory -Force dist/windows | Out-Null
-          Compress-Archive -Path dist/windows/app/* -DestinationPath "dist/windows/CodexPlusPlus-$version-windows-x64.zip" -Force
-
-      - name: Build Windows installer
-        shell: pwsh
-        run: |
-          $version = ($env:RELEASE_TAG).TrimStart("v", "V")
-          # NSIS 的 64 位安装目录与 Chocolatey PATH 更新均需要兼容。
-          $candidates = @(
-            "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
-            "$env:ProgramFiles\NSIS\makensis.exe"
-          )
-          $makensis = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
-          if (-not $makensis) {
-            $command = Get-Command makensis.exe -ErrorAction SilentlyContinue
-            if ($command) { $makensis = $command.Source }
-          }
-          if (-not $makensis) {
-            throw "NSIS 编译器未找到，检查 Chocolatey 安装结果。"
-          }
-          Push-Location scripts/installer/windows
-          try {
-            & $makensis "/INPUTCHARSET" "UTF8" "/DVERSION=$version" CodexPlusPlus.nsi
-            if ($LASTEXITCODE -ne 0) { throw "NSIS 打包失败，退出码 $LASTEXITCODE" }
-          } finally {
-            Pop-Location
-          }
-
-      - name: Upload Windows installer
-        # Release（含草稿）已由 prepare 建好，这里只按 tag 上传。
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "$RELEASE_TAG" dist/windows/*.exe dist/windows/*.zip --clobber --repo "$GITHUB_REPOSITORY"
-
-  # 通用包的两个架构以前在同一台机器上先后编译（占发版总时长的大头），
-  # 现在各占一台 runner 并行编，产物交给 macos-dmg 合并、签名、公证。
-  macos-build:
-    needs: prepare
-    if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'macos'
-    name: macOS build (${{ matrix.target }})
-    runs-on: macos-15
-    strategy:
-      matrix:
-        target: [x86_64-apple-darwin, aarch64-apple-darwin]
-    env:
-      # 与 Info.plist 的 LSMinimumSystemVersion 一致，不随 runner 的 SDK 抬高 C 依赖的最低系统版本。
-      MACOSX_DEPLOYMENT_TARGET: "12.0"
-    steps:
-      - name: Checkout release tag
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ env.RELEASE_TAG }}
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      # 只读复用 release-cache.yml 按架构预热的 release 依赖缓存，shared-key 必须与它一致。
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: macos-release-${{ matrix.target }}
-          save-if: false
-
-      - name: Install frontend dependencies
-        working-directory: apps/codex-plus-manager
-        run: npm ci
-
-      # 统一应用会把前端 dist 嵌进二进制，所以每个架构都要先构建前端。
-      - name: Build frontend
-        working-directory: apps/codex-plus-manager
-        run: npm run vite:build
-
-      - name: Build ${{ matrix.target }}
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Upload binaries
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-bin-${{ matrix.target }}
-          path: |
-            target/${{ matrix.target }}/release/codex-plus-plus
-            target/${{ matrix.target }}/release/codex-plus-legacy-shim
-          if-no-files-found: error
-          retention-days: 1
-
-  macos-dmg:
-    needs: [prepare, macos-build]
-    if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'macos'
-    # 单个通用包（universal）同时支持 Intel 与 Apple Silicon，
-    # 用户不必再自己判断架构，Release 也只多一个而不是两个产物。
-    name: macOS DMG (universal)
-    # macos-14 镜像 2026-11-02 退役，期间还有计划性停机（任务分配 runner 前就被取消）。
-    runs-on: macos-15
-    env:
-      # 与 Info.plist 的 LSMinimumSystemVersion 一致，不随 runner 的 SDK 抬高 C 依赖的最低系统版本。
-      MACOSX_DEPLOYMENT_TARGET: "12.0"
-    steps:
-      - name: Checkout release tag
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ env.RELEASE_TAG }}
-
-      - name: Import Developer ID certificate
-        env:
-          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
-          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
-          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
-        run: |
-          set -euo pipefail
-          # 用临时钥匙串，不碰 runner 自带的，job 结束随机器销毁。
-          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
-          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
-
-          security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security set-keychain-settings -lut 3600 "$KEYCHAIN"
-          security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
-
-          # 少了这一步，codesign 会弹 GUI 授权框然后挂住直到超时。
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
-
-          # 必须把新钥匙串加进搜索列表，否则 codesign 找不到身份。
-          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
-
-          rm -f "$RUNNER_TEMP/cert.p12"
-
-      - name: Install Developer ID intermediate certificate
-        run: |
-          set -euo pipefail
-          # runner 的系统钥匙串里没有 Developer ID G2 中间证书，
-          # 缺了它身份会报 CSSMERR_TP_NOT_TRUSTED、find-identity 一条都列不出来。
-          curl -fsSL -o "$RUNNER_TEMP/DeveloperIDG2CA.cer" \
-            https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
-          security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" \
-            -k "$RUNNER_TEMP/signing.keychain-db" -T /usr/bin/codesign
-
-          security find-identity -v -p codesigning
-
-      - name: Store notarization credentials
-        env:
-          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
-          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
-        run: |
-          set -euo pipefail
-          KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
-          echo "$APPLE_API_KEY_P8" | base64 --decode > "$KEY_PATH"
-          chmod 600 "$KEY_PATH"
-
-          xcrun notarytool store-credentials "codexplusplus-notary" \
-            --key "$KEY_PATH" \
-            --key-id "$APPLE_API_KEY_ID" \
-            --issuer "$APPLE_API_ISSUER_ID"
-
-          rm -f "$KEY_PATH"
-
-      - name: Download x86_64 binaries
-        uses: actions/download-artifact@v4
-        with:
-          name: macos-bin-x86_64-apple-darwin
-          path: target/x86_64-apple-darwin/release
-
-      - name: Download arm64 binaries
-        uses: actions/download-artifact@v4
-        with:
-          name: macos-bin-aarch64-apple-darwin
-          path: target/aarch64-apple-darwin/release
-
-      - name: Restore executable bits
-        # artifact 打包会丢掉可执行位，build-universal.sh 会检查 -x。
-        run: chmod +x target/*-apple-darwin/release/codex-plus-plus target/*-apple-darwin/release/codex-plus-legacy-shim
-
-      - name: Build universal macOS DMG
-        env:
-          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
-          MACOS_NOTARY_PROFILE: codexplusplus-notary
-          # 两个架构已由 macos-build 并行编好，这里只 lipo 合并、签名、公证、打 DMG。
-          UNIVERSAL_SKIP_BUILD: "1"
-        run: |
-          # 发版流水线必须真的签名，凭据缺失就直接失败，不要静默退回 ad-hoc
-          # 然后发一个用户打不开的包出去。
-          if [ -z "${MACOS_SIGNING_IDENTITY:-}" ]; then
-            echo "error: MACOS_SIGNING_IDENTITY 未配置，拒绝产出未签名的发布包" >&2
-            exit 1
-          fi
-          VERSION="${RELEASE_TAG#v}"
-          VERSION="${VERSION#V}"
-          # 构建脚本 lipo 合并两个架构，再调 package-dmg.sh 签名、公证、打包。
-          bash scripts/installer/macos/build-universal.sh "$VERSION"
-
-      - name: Verify macOS bundle structure
-        env:
-          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
-        run: |
-          set -euo pipefail
-          test -L "dist/macos/stage/Applications"
-          test "$(readlink "dist/macos/stage/Applications")" = "/Applications"
-          apps=(dist/macos/stage/*.app)
-          test "${#apps[@]}" = "2"
-          test -f "dist/macos/stage/.hidden"
-          grep -qx "Codex++ 管理工具.app" "dist/macos/stage/.hidden"
-          for app in "dist/macos/stage/Codex++.app" "dist/macos/stage/Codex++ 管理工具.app"; do
-            test -f "$app/Contents/Info.plist"
-            test -f "$app/Contents/PkgInfo"
-            test -x "$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
-            if [[ "$app" == *"管理工具.app" ]]; then
-              test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = "com.bigpizzav3.codexplusplus.manager"
-              test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")" = "CodexPlusPlusManager"
-            else
-              test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = "com.bigpizzav3.codexplusplus"
-              test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")" = "CodexPlusPlus"
-            fi
-            test "$(/usr/libexec/PlistBuddy -c 'Print :CodexPlusUnifiedApp' "$app/Contents/Info.plist")" = "true"
-            plutil -lint "$app/Contents/Info.plist" >/dev/null
-            codesign -dv "$app" >/dev/null 2>&1
-            # 真签名时额外校验签名有效性与 Gatekeeper 判定，防止"签了但无效"混过去。
-            if [ -n "${MACOS_SIGNING_IDENTITY:-}" ]; then
-              codesign --verify --deep --strict "$app"
-              spctl --assess --type execute "$app"
-            fi
-            echo "verified: $app"
-          done
-
-      - name: Verify DMG notarization
-        # 不加 if 条件：Build macOS DMG 已在凭据缺失时直接失败，
-        # 能走到这里就必然签名并公证过。此前用 if: env.MACOS_SIGNING_IDENTITY
-        # 判断，但该变量只存在于上一步的 env 里，这一步读不到，会永远跳过。
-        run: |
-          set -euo pipefail
-          for dmg in dist/macos/*.dmg; do
-            xcrun stapler validate "$dmg"
-            echo "notarized: $dmg"
-          done
-
-      - name: Upload macOS DMG
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "$RELEASE_TAG" dist/macos/*.dmg --clobber --repo "$GITHUB_REPOSITORY"
-
-  # Linux .deb（#2820）。不参与发布门槛：失败只少这一个附件，Windows / macOS 照常发布。
   linux-deb:
     needs: prepare
-    if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'linux'
     name: Linux DEB (Ubuntu 24.04, amd64)
     runs-on: ubuntu-24.04
     steps:
@@ -450,7 +119,7 @@ jobs:
           pkgs="build-essential curl git pkg-config libssl-dev libsqlite3-dev \
             libdbus-1-dev libglib2.0-dev libgtk-3-dev \
             libayatana-appindicator3-dev libjavascriptcoregtk-4.1-dev \
-            libwebkit2gtk-4.1-dev libsoup-3.0-dev libz3-dev"
+            libwebkit2gtk-4.1-dev libsoup-3.0-dev libz3-dev libasound2-dev"
           apt="sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15"
           try_install() {
             timeout 480 bash -c "$apt update -qq && $apt install -y --no-install-recommends $pkgs"
@@ -478,34 +147,22 @@ jobs:
         working-directory: apps/codex-plus-manager
         run: npm ci
 
+      - name: Test frontend
+        working-directory: apps/codex-plus-manager
+        run: npm test
+
       - name: Build frontend
         working-directory: apps/codex-plus-manager
         run: npm run vite:build
 
-      # sherpa-onnx-sys 的构建脚本见到 target/sherpa-onnx-prebuilt/<包>/lib 目录就直接用，不再下载。
-      # v2.6.8 缓存键变化后恢复出的预编译目录缺静态库，链接时报找不到 sherpa-onnx-c-api。
-      # 构建前检查，缺库就清掉这个包的目录和压缩包，让构建脚本重新下载。
       - name: Check sherpa-onnx prebuilt cache
-        shell: bash
-        run: |
-          set -euo pipefail
-          root=target/sherpa-onnx-prebuilt
-          [ -d "$root" ] || { echo "没有预编译缓存，构建时会下载"; exit 0; }
-          ls -la "$root"
-          for extracted in "$root"/*/; do
-            extracted="${extracted%/}"
-            [ -d "$extracted" ] || continue
-            echo "== $extracted/lib"
-            ls -la "$extracted/lib" 2>/dev/null || echo "(lib 目录不存在)"
-            if [ ! -f "$extracted/lib/libsherpa-onnx-c-api.a" ]; then
-              echo "缺 libsherpa-onnx-c-api.a，清掉 $extracted 和对应压缩包，构建时重新下载"
-              rm -r -- "$extracted"
-              rm -f -- "$extracted.tar.bz2"
-            fi
-          done
+        run: node scripts/prepare-sherpa-cache.mjs
+
+      - name: Test core library
+        run: cargo test --locked -p codex-plus-core --lib
 
       - name: Build application
-        run: cargo build --release -p codex-plus-manager
+        run: cargo build --locked --release -p codex-plus-manager
 
       - name: Build DEB
         shell: bash
@@ -533,24 +190,27 @@ jobs:
           mkdir -p dist/release
           cp "$deb_file" "dist/release/CodexPlusPlus-${version}-linux-amd64.deb"
 
-      - name: Upload Linux DEB
+      - name: Build Linux tar archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#[vV]}"
+          mkdir -p dist/portable
+          dpkg-deb -x "dist/release/CodexPlusPlus-${version}-linux-amd64.deb" dist/portable
+          tar -C dist/portable/usr -czf "dist/release/CodexPlusPlus-${version}-linux-amd64.tar.gz" .
+
+      - name: Upload Linux assets
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "$RELEASE_TAG" dist/release/*.deb --clobber --repo "$GITHUB_REPOSITORY"
+        run: gh release upload "$RELEASE_TAG" dist/release/* --clobber --repo "$GITHUB_REPOSITORY"
 
   latest-json:
     name: Upload checksums, latest.json and publish
-    # 单平台补跑时另一个 job 会跳过；成功或跳过才允许更新元数据。
-    # macos-build 也要单独判：它失败时 macos-dmg 只会显示 skipped，光看 macos-dmg 会被当成「没跑这个平台」放行。
-    if: always() && needs.prepare.result == 'success' && (needs.windows-installer.result == 'success' || needs.windows-installer.result == 'skipped') && (needs.macos-build.result == 'success' || needs.macos-build.result == 'skipped') && (needs.macos-dmg.result == 'success' || needs.macos-dmg.result == 'skipped')
+    if: needs.prepare.result == 'success' && needs.linux-deb.result == 'success'
     runs-on: ubuntu-latest
     needs:
       - prepare
-      - windows-installer
-      - macos-build
-      - macos-dmg
-      # Linux 只等它跑完、不卡发布：它失败时 Windows / macOS 照常发布，事后用 platform=linux 补跑。
       - linux-deb
     steps:
       - name: Upload SHA256SUMS.txt
@@ -583,9 +243,9 @@ jobs:
           const tag = release.tagName || process.env.TAG;
           const version = tag.replace(/^v/i, "");
           const required = [
-            "CodexPlusPlus-" + version + "-windows-x64-setup.exe",
-            "CodexPlusPlus-" + version + "-windows-x64.zip",
-            "CodexPlusPlus-" + version + "-macos-universal.dmg"
+            "CodexPlusPlus-" + version + "-linux-amd64.deb",
+            "CodexPlusPlus-" + version + "-linux-amd64.tar.gz",
+            "SHA256SUMS.txt"
           ];
           for (const name of required) {
             if (!(release.assets || []).some((asset) => asset.name === name && asset.size > 0)) {
@@ -617,8 +277,8 @@ jobs:
         run: gh release upload "$TAG" latest.json --clobber --repo "$REPO"
 
       - name: Publish Release
-        # 推 tag 的发版自动发布；补跑只在勾了 publish 时发布。两个平台都得在这一轮成功。
-        if: needs.prepare.outputs.is_draft == 'true' && (github.event_name == 'push' || inputs.publish) && needs.windows-installer.result == 'success' && needs.macos-dmg.result == 'success'
+        # Linux 构建、安装核验和元数据全部成功后才公开发布。
+        if: needs.prepare.outputs.is_draft == 'true' && (github.event_name == 'push' || inputs.publish) && needs.linux-deb.result == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ env.RELEASE_TAG }}
