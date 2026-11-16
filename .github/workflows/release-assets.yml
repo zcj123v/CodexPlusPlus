@@ -4,8 +4,8 @@ name: Release assets
 #   prepare  校验版本号文件与 tag 一致，从 CHANGELOG.md 截取说明，建草稿 Release
 #   构建     Linux DEB / tar.gz 构建，附件传到草稿
 #   收尾     生成 SHA256SUMS.txt 与 latest.json，附件齐了才公开发布
-# 草稿期间用户看不到这一版，某个平台失败也不会让「检查更新」读到缺附件的 Latest。
-# 手动在网页上发布 Release 不再触发构建；补跑某个平台用 workflow_dispatch。
+# 草稿期间用户看不到这一版，Linux 构建失败也不会让「检查更新」读到缺附件的 Latest。
+# 手动在网页上发布 Release 不再触发构建；补跑 Linux 用 workflow_dispatch，并选择 linux-support 分支。
 
 on:
   push:
@@ -108,7 +108,7 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          key: linux
+          shared-key: linux-release
           save-if: false
 
       # 与 pr-build.yml 相同：默认 Azure 镜像不通时限时失败并换官方源重试。

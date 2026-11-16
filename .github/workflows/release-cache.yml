@@ -44,7 +44,7 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          key: linux
+          shared-key: linux-release
           save-if: ${{ github.ref == 'refs/heads/linux-support' }}
 
       # 与 pr-build.yml 相同：默认 Azure 镜像不通时限时失败并换官方源重试。
