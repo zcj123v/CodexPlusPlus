@@ -60,6 +60,7 @@ fn deepseek_input() -> ProviderInput {
         subscription_policy: None,
         strip_responses_image_detail: None,
         disable_tool_search: None,
+        custom_headers: None,
     }
 }
 
@@ -82,6 +83,7 @@ fn codex_metadata_disables_search_tool_for_kimi_and_auto_group() {
         subscription_policy: None,
         strip_responses_image_detail: None,
         disable_tool_search: None,
+        custom_headers: None,
     };
     create_provider(&ctx.gateway, &kimi, "preset:kimi", None).unwrap();
     std::fs::create_dir_all(&ctx.codex_home).unwrap();
@@ -1649,6 +1651,7 @@ fn codex_gateway_catalog_carries_display_names_reasoning_and_provider_groups() {
             subscription_policy: None,
             strip_responses_image_detail: None,
             disable_tool_search: None,
+            custom_headers: None,
         },
         "",
         None,
@@ -1848,6 +1851,7 @@ fn codex_group_offers_fast_only_when_every_member_supports_it() {
                 subscription_policy: None,
                 strip_responses_image_detail: None,
                 disable_tool_search: None,
+                custom_headers: None,
             },
             "",
             None,
@@ -2889,6 +2893,7 @@ fn providers_live_only_in_the_gateway_store() {
             ];
             binding.auto_review_model = "deepseek-2/deepseek-v4-pro".into();
             binding.title_model = "deepseek/deepseek-v4-flash".into();
+            binding.compaction_model = "deepseek-2/deepseek-v4-flash".into();
             Ok(())
         })
         .unwrap();
@@ -2904,6 +2909,7 @@ fn providers_live_only_in_the_gateway_store() {
     assert_eq!(binding.extra_models, vec!["deepseek/deepseek-v4-flash".to_string()]);
     assert_eq!(binding.auto_review_model, "");
     assert_eq!(binding.title_model, "deepseek/deepseek-v4-flash", "指向别家的不动");
+    assert_eq!(binding.compaction_model, "", "压缩模型指向它时清空，回到跟随当前模型");
     assert!(delete_provider(store, "deepseek-2").is_err());
 }
 
@@ -3680,6 +3686,271 @@ fn gateway_declared_fallback_keeps_model_capability_restrictions() {
         assert!(entry["codex_plus_group_id"].is_null(), "{entry}");
         assert!(entry["codex_plus_group"].is_null(), "{entry}");
     }
+}
+
+/// #3042：供应商池里声明的图片能力要一路带到 Codex 原生目录和注入层的 modelMetadata；
+/// 纯文本模型不能借通用模板宣称收图，多家共用的一项（自动组、模型组）取各家交集。
+#[test]
+fn gateway_catalog_forwards_declared_image_input_capability() {
+    let _state = crate::common::IsolatedTestState::new();
+    let fixture = fixture(57404);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    ctx.settings
+        .save(&BackendSettings {
+            relay_profiles_enabled: true,
+            ..BackendSettings::default()
+        })
+        .unwrap();
+    let deepseek = ctx.gateway.load().unwrap().providers[0].relay.id.clone();
+    let (_, ark) = create_provider(
+        &ctx.gateway,
+        &ProviderInput {
+            name: "Ark".into(),
+            model: "ark-vision".into(),
+            model_list: "ark-vision\nark-text\ndeepseek-v4-pro".into(),
+            ..deepseek_input()
+        },
+        "",
+        None,
+    )
+    .unwrap();
+    // DeepSeek 那家把内置标成纯文本的 deepseek-v4-flash 声明为收图；
+    // 方舟这家声明 ark-vision 收图、ark-text 纯文本，它的 deepseek-v4-pro 也收图。
+    set_provider_metadata(
+        &ctx.gateway,
+        &deepseek,
+        &json!({"deepseek-v4-flash": {"input_modalities": ["text", "image"]}}).to_string(),
+    )
+    .unwrap();
+    set_provider_metadata(
+        &ctx.gateway,
+        &ark,
+        &json!({
+            "ark-vision": {"input_modalities": ["text", "image"], "supports_image_detail_original": true},
+            "ark-text": {"input_modalities": ["text"], "supports_image_detail_original": false},
+            "deepseek-v4-pro": {"input_modalities": ["text", "image"]}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let (_, group) = save_group(
+        &ctx.gateway,
+        &GroupInput {
+            name: "Mixed".into(),
+            members: vec![
+                GroupMember { model: format!("{ark}/ark-vision"), weight: 1 },
+                GroupMember { model: format!("{ark}/ark-text"), weight: 1 },
+            ],
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+
+    let group_model = format!("group/{group}");
+    let ark_pro = format!("{ark}/deepseek-v4-pro");
+    let expected = [
+        ("ark-vision", json!(["text", "image"])),
+        ("ark-text", json!(["text"])),
+        ("deepseek-v4-flash", json!(["text", "image"])),
+        // 两家都有的裸名是自动切换入口：DeepSeek 内置纯文本，交集只剩 text。
+        ("deepseek-v4-pro", json!(["text"])),
+        (ark_pro.as_str(), json!(["text", "image"])),
+        (group_model.as_str(), json!(["text"])),
+    ];
+
+    let settings = ctx.settings.load().unwrap();
+    let profile = settings
+        .relay_profiles
+        .iter()
+        .find(|profile| profile.id == "codex-plus-gateway")
+        .unwrap();
+    let metadata: Value = serde_json::from_str(&profile.model_metadata).unwrap();
+    for (slug, modalities) in &expected {
+        assert_eq!(&metadata[*slug]["input_modalities"], modalities, "{slug}: {metadata}");
+    }
+    assert_eq!(metadata["ark-vision"]["supports_image_detail_original"], true);
+    assert_eq!(metadata["ark-text"]["supports_image_detail_original"], false);
+    // 模型组有一家不支持原图细节，整组就不支持。
+    assert_eq!(metadata[group_model.as_str()]["supports_image_detail_original"], false);
+
+    // 原生目录与注入层读的 modelMetadata（由目录条目经白名单生成）都要带上同一份声明。
+    let catalog = codex_catalog(ctx);
+    let models = catalog["models"].as_array().unwrap();
+    for (slug, modalities) in &expected {
+        let entry = models
+            .iter()
+            .find(|entry| entry["slug"] == *slug)
+            .unwrap_or_else(|| panic!("目录里缺少 {slug}"));
+        assert_eq!(&entry["input_modalities"], modalities, "{slug}: {entry}");
+        let ui = codex_plus_core::model_suffix::model_ui_metadata_with_override(slug, Some(entry))
+            .unwrap();
+        assert_eq!(&ui["inputModalities"], modalities, "{slug}: {ui}");
+        assert_eq!(&ui["input_modalities"], modalities, "{slug}: {ui}");
+    }
+}
+
+/// #3150：模型组指定了图像输入模型，带图片的请求只发给它，目录里这一组就该收图；
+/// 原图细节按图像输入模型算。没指定的组照旧取各成员交集。编辑组时不带这个字段保留原值。
+#[test]
+fn gateway_catalog_opens_image_input_for_groups_with_image_model() {
+    let _state = crate::common::IsolatedTestState::new();
+    let fixture = fixture(57437);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    ctx.settings
+        .save(&BackendSettings {
+            relay_profiles_enabled: true,
+            ..BackendSettings::default()
+        })
+        .unwrap();
+    let (_, ark) = create_provider(
+        &ctx.gateway,
+        &ProviderInput {
+            name: "Ark".into(),
+            model: "ark-vision".into(),
+            model_list: "ark-vision\nark-text\nark-text-2".into(),
+            ..deepseek_input()
+        },
+        "",
+        None,
+    )
+    .unwrap();
+    set_provider_metadata(
+        &ctx.gateway,
+        &ark,
+        &json!({
+            "ark-vision": {"input_modalities": ["text", "image"], "supports_image_detail_original": true},
+            "ark-text": {"input_modalities": ["text"], "supports_image_detail_original": false},
+            "ark-text-2": {"input_modalities": ["text"]}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let text_members = vec![
+        GroupMember { model: format!("{ark}/ark-text"), weight: 1 },
+        GroupMember { model: format!("{ark}/ark-text-2"), weight: 1 },
+    ];
+    let (_, plain) = save_group(
+        &ctx.gateway,
+        &GroupInput {
+            name: "Plain".into(),
+            members: text_members.clone(),
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    // 图像输入模型不是组成员（池里另一个收图的模型）也可以。
+    let (_, visual) = save_group(
+        &ctx.gateway,
+        &GroupInput {
+            name: "Visual".into(),
+            members: text_members.clone(),
+            image_input_model: Some(format!("{ark}/ark-vision")),
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+
+    let plain_model = format!("group/{plain}");
+    let visual_model = format!("group/{visual}");
+    let metadata = |ctx: &ApplyContext| -> Value {
+        let settings = ctx.settings.load().unwrap();
+        let profile = settings
+            .relay_profiles
+            .iter()
+            .find(|profile| profile.id == "codex-plus-gateway")
+            .unwrap()
+            .clone();
+        serde_json::from_str(&profile.model_metadata).unwrap()
+    };
+    let meta = metadata(ctx);
+    assert_eq!(meta[plain_model.as_str()]["input_modalities"], json!(["text"]), "{meta}");
+    assert_eq!(meta[plain_model.as_str()]["supports_image_detail_original"], false);
+    assert_eq!(meta[visual_model.as_str()]["input_modalities"], json!(["text", "image"]), "{meta}");
+    assert_eq!(meta[visual_model.as_str()]["supports_image_detail_original"], true);
+    let catalog = codex_catalog(ctx);
+    let entry = catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["slug"] == visual_model.as_str())
+        .cloned()
+        .unwrap();
+    assert_eq!(entry["input_modalities"], json!(["text", "image"]), "{entry}");
+
+    // 旧界面编辑组时不带 imageModel：保留原值；显式传空串才回到跟随默认。
+    save_group(
+        &ctx.gateway,
+        &GroupInput {
+            id: visual.clone(),
+            name: "Visual".into(),
+            members: text_members.clone(),
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        ctx.gateway.load().unwrap().group(&visual).unwrap().image_input_model,
+        format!("{ark}/ark-vision")
+    );
+    save_group(
+        &ctx.gateway,
+        &GroupInput {
+            id: visual.clone(),
+            name: "Visual".into(),
+            members: text_members.clone(),
+            image_input_model: Some(String::new()),
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(ctx.gateway.load().unwrap().group(&visual).unwrap().image_input_model, "");
+    // 不能把组自己设成图像输入模型。
+    assert!(
+        save_group(
+            &ctx.gateway,
+            &GroupInput {
+                id: visual.clone(),
+                name: "Visual".into(),
+                members: text_members.clone(),
+                image_input_model: Some(visual_model.clone()),
+                ..GroupInput::default()
+            },
+        )
+        .is_err()
+    );
+
+    // 图像输入模型指向的组被删掉：回到跟随默认。
+    save_group(
+        &ctx.gateway,
+        &GroupInput {
+            id: visual.clone(),
+            name: "Visual".into(),
+            members: text_members.clone(),
+            image_input_model: Some(plain_model.clone()),
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    delete_group(&ctx.gateway, &plain).unwrap();
+    assert_eq!(ctx.gateway.load().unwrap().group(&visual).unwrap().image_input_model, "");
+    // 图像输入模型所在的供应商被删掉：同样清掉。
+    save_group(
+        &ctx.gateway,
+        &GroupInput {
+            id: visual.clone(),
+            name: "Visual".into(),
+            members: vec![GroupMember { model: "deepseek-v4-pro".into(), weight: 1 }],
+            image_input_model: Some(format!("{ark}/ark-vision")),
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    delete_provider(&ctx.gateway, &ark).unwrap();
+    assert_eq!(ctx.gateway.load().unwrap().group(&visual).unwrap().image_input_model, "");
 }
 
 #[test]
@@ -4528,6 +4799,7 @@ fn unsigned_codex_gateway_declares_local_api_identity_for_native_fast() {
             subscription_policy: None,
             strip_responses_image_detail: None,
             disable_tool_search: None,
+            custom_headers: None,
         },
         "",
         None,
@@ -4844,4 +5116,65 @@ fn codex_disconnect_to_a_fallback_provider_only_fills_missing_user_root_settings
         "新供应商缺的键照样补回：{config}"
     );
     assert_eq!(config.matches("model_instructions_file =").count(), 1);
+}
+
+/// #3115：网关模式（activeRelayId = codex-plus-gateway）重写 Codex 配置时，用户直接在
+/// live config.toml 里给 MCP 加的 `tool_timeout_sec`、`env` 不能被顶掉。网关重写走
+/// `relay_switch`，读「切换时保留」开关；托管供应商的模板里没有 MCP，开关关着时也保留。
+#[test]
+fn gateway_rewrite_keeps_live_mcp_edits_with_or_without_preserve_setting() {
+    for (preserve, port) in [(true, 57411), (false, 57412)] {
+        let fixture = fixture(port);
+        let ctx = &fixture.ctx;
+        std::fs::create_dir_all(&ctx.codex_home).unwrap();
+        let mut direct = codex_plus_core::provider_import::pool_relay_profile(
+            "直连",
+            "https://api.direct.test/v1",
+            "sk-direct",
+            RelayProtocol::Responses,
+            "gpt-direct",
+            "gpt-direct",
+            &[],
+        )
+        .unwrap();
+        direct.id = "direct".into();
+        direct.relay_mode = RelayMode::PureApi;
+        codex_plus_core::relay_config::normalize_relay_profile_for_storage(&mut direct).unwrap();
+        let mut seeded = BackendSettings::default();
+        seeded.relay_profiles_enabled = true;
+        seeded.relay_profiles = vec![direct];
+        seeded.active_relay_id = "direct".into();
+        seeded.relay_preserve_nonprovider_settings = preserve;
+        seeded.relay_context_config_contents = "[mcp_servers.my_tool]\ncommand = \"my-tool\"\n".into();
+        codex_plus_core::relay_switch::switch_relay_profile_in_home(
+            &ctx.settings,
+            &ctx.codex_home,
+            seeded,
+            "",
+        )
+        .unwrap();
+        enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+        assert_eq!(ctx.settings.load().unwrap().active_relay_id, "codex-plus-gateway");
+
+        // 用户在 live 里给这条 MCP 加超时和环境变量。
+        let config_path = ctx.codex_home.join("config.toml");
+        let mut doc = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        doc["mcp_servers"]["my_tool"]["tool_timeout_sec"] = toml_edit::value(120);
+        doc["mcp_servers"]["my_tool"]["env"] = toml_edit::table();
+        doc["mcp_servers"]["my_tool"]["env"]["MY_TOKEN"] = toml_edit::value("live-token");
+        std::fs::write(&config_path, doc.to_string()).unwrap();
+
+        // 网关重写 Codex 配置（池变化、身份同步、重启时都走这里）。
+        refresh_enabled(ctx).unwrap();
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        assert!(config.contains("/gw/codex/v1"), "{config}");
+        assert!(
+            config.contains("tool_timeout_sec = 120") && config.contains("live-token"),
+            "preserve={preserve}：{config}"
+        );
+        assert!(config.contains("command = \"my-tool\""), "{config}");
+    }
 }

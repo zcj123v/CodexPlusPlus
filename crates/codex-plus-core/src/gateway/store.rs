@@ -122,6 +122,10 @@ pub struct GatewayProvider {
     /// 没单独写窗口的模型用的窗口；都不填就交给模型自带的资料。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// 自动压缩阈值（#3100）：窗口的百分比，与窗口并列按模型填。都不填时不写压缩上限，
+    /// Codex 按自己的默认压缩，行为与没有这项设置时完全一样；旧文件读进来是空的。
+    #[serde(default, skip_serializing_if = "ProviderAutoCompact::is_empty")]
+    pub auto_compact: ProviderAutoCompact,
     /// 这个供应商单独走的 HTTP 代理；空串表示不单独走代理（沿用系统代理）。
     /// 与直连模式的「供应商独立代理」互不相干。
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -161,6 +165,30 @@ pub struct GatewayProvider {
 
 fn is_zero(value: &u64) -> bool {
     *value == 0
+}
+
+/// 供应商的自动压缩阈值（#3100），单位是窗口的百分比（如 `85.0` 表示窗口的 85%）。
+/// 写进 Codex 模型目录时换算成 `auto_compact_token_limit = 窗口 × 百分比`。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAutoCompact {
+    /// 按模型的阈值：键是上游模型名（不带供应商前缀）。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, f64>,
+    /// 没单独写阈值的模型用的阈值；不填就交给 Codex 默认。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<f64>,
+}
+
+impl ProviderAutoCompact {
+    pub fn is_empty(&self) -> bool {
+        self.models.is_empty() && self.fallback.is_none()
+    }
+
+    /// 合法的百分比：大于等于 1、不超过 100 的有限数。
+    pub fn valid_percent(value: f64) -> bool {
+        value.is_finite() && (1.0..=100.0).contains(&value)
+    }
 }
 
 /// 从上游同步写入的模型资料记录（#2807），键是小写、去掉 `[1M]` 后缀的模型名。
@@ -237,6 +265,25 @@ impl GatewayProvider {
             .map(|(_, window)| *window)
             .or(self.context_window)
             .filter(|window| *window > 0)
+    }
+
+    /// 某个上游模型的自动压缩百分比：单独写的优先（忽略大小写和 `[1M]` 后缀），其次是这家的默认值；
+    /// 都没有（或值不合法）返回 None，交给 Codex 默认。
+    pub fn auto_compact_for(&self, model: &str) -> Option<f64> {
+        let (slug, _) = crate::model_suffix::parse_model_suffix(model.trim());
+        let slug = slug.trim();
+        self.auto_compact
+            .models
+            .iter()
+            .find(|(name, _)| {
+                crate::model_suffix::parse_model_suffix(name.trim())
+                    .0
+                    .trim()
+                    .eq_ignore_ascii_case(slug)
+            })
+            .map(|(_, percent)| *percent)
+            .or(self.auto_compact.fallback)
+            .filter(|percent| ProviderAutoCompact::valid_percent(*percent))
     }
 
     /// 上游配置里带的窗口（从直连模式导入的、或模型列表里写了 `[1M]` 后缀的）收进网关自己的
@@ -365,6 +412,11 @@ pub struct GatewayGroup {
     /// 手动模式下选中的成员（成员的模型名）；空串表示第一个成员。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pick: String,
+    /// 图像输入模型（#3150）：请求上下文里带图片时整次改发给它，没图片时照常按组路由。
+    /// 写法同成员（`<供应商 id>/<模型>`、裸模型名或 `group/<组 id>`），可以不是组里的成员。
+    /// 空串表示跟随默认：目录里组的图片能力取各成员交集，路由不看图片。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub image_input_model: String,
     /// 不认识的字段原样保留。
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -506,6 +558,15 @@ pub struct AgentBinding {
     /// 填了就把识别出的起名请求改发到这个模型（写法同审批模型）；空串表示不改，保持原有行为。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub title_model: String,
+    /// 压缩模型（#3142，目前只有 Codex 用）：Codex 的上下文压缩请求改发到这个模型（写法同审批模型），
+    /// 普通对话、工具调用仍用主模型。空串表示跟随当前模型，保持原有行为。
+    /// 只在能安全换模型的压缩形态生效；不可用、协议不兼容、窗口装不下或上游拒绝时回退原模型
+    /// （见 [`crate::gateway::compaction_model`]）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub compaction_model: String,
+    /// 改发到压缩模型时单独用的推理强度（如 low）；空串表示沿用原请求的推理强度。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub compaction_reasoning_effort: String,
     /// 写给 Agent 的上下文窗口（Claude Code 的 `CLAUDE_CODE_MAX_CONTEXT_TOKENS`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
@@ -541,6 +602,8 @@ impl Default for AgentBinding {
             unknown_model: UnknownModelPolicy::default(),
             auto_review_model: String::new(),
             title_model: String::new(),
+            compaction_model: String::new(),
+            compaction_reasoning_effort: String::new(),
             context_window: None,
             claude_enable_effort: false,
             pool_exclude: Vec::new(),
@@ -656,6 +719,12 @@ pub struct GatewaySettings {
     /// 开着时供应商页提示可以导入。默认关（opt-in）：关着时不读这些登录文件。
     #[serde(default)]
     pub local_login_discovery: bool,
+    /// Codex 与 Codex++（直连本地代理和网关）之间用 Responses WebSocket（2.7.0 起支持）。
+    /// 默认关（opt-in）：握手阶段回 426，Codex 改走 HTTP/SSE，与 2.6 一致。WS 续接依赖上游保留
+    /// 连接内状态：第三方中转接受了升级却不保留状态时续接请求会丢推理和上下文（#3175），
+    /// 闲置后上游断开也会让续接失败（#3169）。需要更低延迟、上游确实支持时在网关选项里打开。
+    #[serde(default)]
+    pub responses_websocket: bool,
     /// 自动组上改过的设置（键是小写模型名）。没改过的自动组不落盘，跟着供应商池自动变化。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub auto_groups: BTreeMap<String, AutoGroupSettings>,
@@ -707,6 +776,7 @@ impl Default for GatewaySettings {
             auto_models: true,
             model_suffix: true,
             local_login_discovery: false,
+            responses_websocket: false,
             auto_groups: BTreeMap::new(),
             favorite_models: Vec::new(),
             image_models: BTreeMap::new(),
@@ -887,6 +957,7 @@ impl GatewaySettings {
                 newapi_access: None,
                 subscription_policy: None,
                 upstream_meta: Default::default(),
+                auto_compact: Default::default(),
                 relay,
                 extra: Map::new(),
             };
@@ -1394,6 +1465,7 @@ mod tests {
             newapi_access: None,
             subscription_policy: None,
             upstream_meta: Default::default(),
+            auto_compact: Default::default(),
             relay: RelayProfile {
                 id: "deepseek".to_string(),
                 ..RelayProfile::default()
@@ -1529,6 +1601,31 @@ mod tests {
         );
         std::fs::write(&store.path, r#"{"subagentModelFollowRequest":true}"#).unwrap();
         assert!(store.load().unwrap().subagent_model_follow_request);
+    }
+
+    /// #3150：旧文件的组没有 imageInputModel，读成跟随默认；没设时不落键，设了能原样读回。
+    #[test]
+    fn group_image_model_is_optional_and_round_trips() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = GatewayStore::at(temp.path().join("gateway.json"));
+        std::fs::write(
+            &store.path,
+            r#"{"groups":[{"id":"g","name":"G","members":[{"model":"a/m"}]}]}"#,
+        )
+        .unwrap();
+        let mut settings = store.load().unwrap();
+        assert_eq!(settings.groups[0].image_input_model, "");
+        store.save(&settings).unwrap();
+        let text = fs::read_to_string(&store.path).unwrap();
+        assert!(!text.contains("imageInputModel"), "默认值不落键：{text}");
+
+        settings.groups[0].image_input_model = "vision/gpt-6-vision".into();
+        store.save(&settings).unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&fs::read_to_string(&store.path).unwrap()).unwrap();
+        assert_eq!(saved["groups"][0]["imageInputModel"], "vision/gpt-6-vision");
+        let again = store.load().unwrap();
+        assert_eq!(again.groups[0].image_input_model, "vision/gpt-6-vision");
+        assert!(again.groups[0].extra.is_empty(), "认识的字段不进未知字段");
     }
 
     #[test]
